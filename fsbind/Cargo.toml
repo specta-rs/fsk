@@ -11,7 +11,7 @@ documentation = "https://docs.rs/fsbind/latest/fsbind"
 readme = "../README.md"
 keywords = ["filesystem", "virtual-filesystem", "fuse", "fskit", "projfs"]
 categories = ["api-bindings", "filesystem"]
-include = ["/src", "/macos/rust", "/Cargo.toml"]
+include = ["/src", "/macos/rust", "/benches", "/Cargo.toml"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -38,6 +38,16 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bench]]
+name = "throughput"
+harness = false
+test = false
+
+[[bench]]
+name = "raw_overhead"
+harness = false
+test = false
 
 [lints]
 workspace = true

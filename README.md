@@ -101,6 +101,8 @@ cargo run -p fsbind-memory-backend -- /path/to/mount
 Control-C performs an orderly unmount. The same executable builds against the
 native adapter selected by its target OS.
 
+See [`examples/README.md`](examples/README.md) for the complete example catalog.
+
 ## Network filesystems and downloaded files
 
 ```rust
@@ -239,15 +241,17 @@ The hot paths avoid serialization frameworks and per-item calls:
 - stable directory cookies and mutation verifiers;
 - no raw-event allocation or virtual call unless its operation is enabled.
 
-The storage-engine figures below measure the example implementation, not a
-policy imposed by `fsbind`. Benchmarks were run on an Apple M1 Pro using
-release builds:
+These figures use a benchmark-only immutable `Filesystem` with no inode index,
+cache, locking, consistency policy, or storage engine. They measure trait
+dispatch, caller-owned buffers, directory sinks, and raw-hook plumbing rather
+than either example implementation. Benchmarks were run on an Apple M1 Pro
+using release builds:
 
 | Benchmark | Observed result |
 |---|---:|
-| In-memory lookup | 17.2 million operations/s median |
-| 128 KiB reads | 49.5 GiB/s median |
-| 10,001-entry directory | 403 million entries/s median |
+| Trait-object lookup | 435 million operations/s median |
+| 128 KiB caller-buffer reads | 54.8 GiB/s median |
+| 10,001-entry directory sink | 466 million entries/s median |
 | Raw hooks disabled | Within run-to-run noise of direct dispatch |
 | Authenticated macOS IPC lookup | 188 thousand round trips/s median |
 
@@ -259,8 +263,8 @@ authenticated lookup result from a 162–169k baseline to 182–196k round trips
 Run the same benchmarks locally:
 
 ```sh
-cargo run --release -p fsbind-memory-backend --example throughput
-cargo run --release -p fsbind-memory-backend --example raw_overhead
+cargo bench -p fsbind --bench throughput
+cargo bench -p fsbind --bench raw_overhead
 cargo test --release -p fsbind \
   ipc::tests::benchmark_authenticated_ipc_lookup_roundtrip \
   -- --ignored --nocapture

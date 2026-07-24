@@ -1,12 +1,11 @@
-#[path = "../src/fs.rs"]
-mod fs;
+mod support;
 
-use fs::MemoryFileSystem;
-use fsbind::{DirectoryEntry, DirectorySink, FileType, Filesystem, ROOT_INODE};
+use fsbind::{DirectoryEntry, DirectorySink, Filesystem, ROOT_INODE};
 use std::{
     hint::black_box,
     time::{Duration, Instant},
 };
+use support::BenchmarkFilesystem;
 
 struct CountingSink(u32);
 
@@ -28,30 +27,24 @@ fn timed(iterations: u32, mut operation: impl FnMut()) -> (Duration, f64) {
 }
 
 fn main() {
-    let filesystem = MemoryFileSystem::new();
-    let payload = vec![0x5a; 128 * 1024];
-    let data_inode = filesystem
-        .create(ROOT_INODE, b"payload", FileType::File, 0o644)
-        .unwrap();
-    filesystem.write(data_inode, 0, &payload).unwrap();
-    for index in 0..10_000 {
-        filesystem
-            .create(
-                ROOT_INODE,
-                format!("entry-{index:05}").as_bytes(),
-                FileType::File,
-                0o644,
-            )
-            .unwrap();
-    }
+    let fixture = BenchmarkFilesystem::new(10_001, 128 * 1024, false);
+    let filesystem: &dyn Filesystem = black_box(&fixture);
 
     let (lookup_time, lookups_per_second) = timed(1_000_000, || {
-        black_box(filesystem.lookup(ROOT_INODE, b"entry-05000").unwrap());
+        black_box(
+            filesystem
+                .lookup(black_box(ROOT_INODE), black_box(b"entry-05000"))
+                .unwrap(),
+        );
     });
 
-    let mut read_buffer = vec![0; payload.len()];
+    let mut read_buffer = vec![0; 128 * 1024];
     let (read_time, reads_per_second) = timed(4_096, || {
-        black_box(filesystem.read(data_inode, 0, &mut read_buffer).unwrap());
+        black_box(
+            filesystem
+                .read(black_box(2), black_box(0), black_box(&mut read_buffer))
+                .unwrap(),
+        );
     });
     let gib_per_second = reads_per_second * f64::from(u32::try_from(read_buffer.len()).unwrap())
         / (1024.0 * 1024.0 * 1024.0);
