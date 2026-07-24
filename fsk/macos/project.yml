@@ -25,6 +25,7 @@ targets:
         MARKETING_VERSION: "0.1"
         CURRENT_PROJECT_VERSION: "1"
         PROVISIONING_PROFILE_SPECIFIER: "$(FSK_APP_PROFILE)"
+        ENABLE_HARDENED_RUNTIME: YES
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
         CODE_SIGN_ENTITLEMENTS: FSKApp/FSKApp.entitlements
@@ -45,6 +46,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: dev.specta.fsk.extension
         PRODUCT_NAME: FSKExtension
         PROVISIONING_PROFILE_SPECIFIER: "$(FSK_EXTENSION_PROFILE)"
+        ENABLE_HARDENED_RUNTIME: YES
         INFOPLIST_FILE: FSKExtension/Info.plist
         CODE_SIGN_ENTITLEMENTS: FSKExtension/FSKExtension.entitlements
         SKIP_INSTALL: YES
