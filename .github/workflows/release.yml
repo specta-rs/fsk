@@ -121,6 +121,27 @@ jobs:
             -exportPath "$RUNNER_TEMP/export" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
 
+      - name: Verify exported application
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/export/FSK.app"
+          extension="$app/Contents/Extensions/FSKExtension.appex"
+          expected_version="${GITHUB_REF_NAME#v}"
+          expected_build="${expected_version##*.}"
+          test "$(defaults read "$app/Contents/Info" CFBundleShortVersionString)" = "$expected_version"
+          test "$(defaults read "$app/Contents/Info" CFBundleVersion)" = "$expected_build"
+          test "$(defaults read "$extension/Contents/Info" CFBundleShortVersionString)" = "$expected_version"
+          test "$(defaults read "$extension/Contents/Info" CFBundleVersion)" = "$expected_build"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -d --xml --entitlements - "$extension" \
+            > "$RUNNER_TEMP/extension-entitlements.plist"
+          test "$(/usr/libexec/PlistBuddy -c \
+            'Print :com.apple.security.app-sandbox' \
+            "$RUNNER_TEMP/extension-entitlements.plist")" = "true"
+          test "$(/usr/libexec/PlistBuddy -c \
+            'Print :com.apple.developer.fskit.fsmodule' \
+            "$RUNNER_TEMP/extension-entitlements.plist")" = "true"
+
       - name: Notarize and staple
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
