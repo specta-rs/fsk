@@ -1,0 +1,18 @@
+[package]
+name = "fsbind"
+version = "0.1.0"
+description = "Fast Rust backends for macOS FSKit extensions"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dashmap = "6.1"
+parking_lot = "0.12"
+
+[dev-dependencies]
+proptest = "1.7"
+
+[lints]
+workspace = true
+
