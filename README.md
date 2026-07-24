@@ -3,7 +3,9 @@
 FSBind is a working macOS FSKit extension whose filesystem implementation lives
 in Rust. It provides:
 
-- a small Rust `FileSystem` trait for downstream backends;
+- a small Rust `Filesystem` trait for downstream backends;
+- a `NetworkFilesystem: Filesystem` trait for lazy remote volumes and
+  backend-owned downloaded files;
 - a stable, versioned C ABI with opaque volume handles;
 - a Swift adapter that maps FSKit operations onto that ABI;
 - a concurrent in-memory backend that is useful as a starter implementation;
@@ -72,7 +74,7 @@ The quickest route is to replace the factory in
 backend for each loaded volume:
 
 ```rust
-use fsbind::{FileSystem, FileType, MemoryFileSystem, ROOT_INODE};
+use fsbind::{FileType, Filesystem, MemoryFileSystem, ROOT_INODE};
 
 fn filesystem() -> MemoryFileSystem {
     let fs = MemoryFileSystem::new();
@@ -87,7 +89,7 @@ fsbind::export_filesystem!(filesystem);
 ```
 
 For a database, remote service, archive, or content-addressed store, implement
-`fsbind::FileSystem` on your own `Send + Sync` type. Read-only backends only
+`fsbind::Filesystem` on your own `Send + Sync` type. Read-only backends only
 need to implement `statfs`, `metadata`, `lookup`, `read_directory`, and `read`;
 mutating methods default to `ENOTSUP`. Names are byte slices rather than UTF-8
 strings because FSKit filenames are not guaranteed to be valid UTF-8.
@@ -96,6 +98,68 @@ Build the downstream crate as a `staticlib`, invoke
 `fsbind::export_filesystem!(your_factory)`, and change the two library names in
 `project.yml` from `fsbind_memory_backend` to the resulting static library.
 The generated C symbols stay fixed, so no Swift source changes are needed.
+
+### Network filesystems
+
+Network backends implement the parent trait and then opt into network behavior:
+
+```rust
+use fsbind::{
+    Filesystem, LocalFile, Mount, NetworkFile, NetworkFilesystem, Result,
+};
+
+struct MyCoolFilesystem {
+    // remote client, metadata cache, download manager, ...
+}
+
+impl Filesystem for MyCoolFilesystem {
+    // statfs, metadata, lookup, read_directory and read are resolved lazily.
+    // Implement the required methods here.
+    # fn statfs(&self) -> Result<fsbind::StatFs> { unimplemented!() }
+    # fn metadata(&self, _: u64) -> Result<fsbind::Metadata> { unimplemented!() }
+    # fn lookup(&self, _: u64, _: &[u8]) -> Result<(u64, fsbind::FileType)> { unimplemented!() }
+    # fn read_directory(&self, _: u64, _: u64, _: u64, _: &mut dyn fsbind::DirectorySink) -> Result<fsbind::ReadDirectoryResult> { unimplemented!() }
+    # fn read(&self, _: u64, _: u64, _: &mut [u8]) -> Result<usize> { unimplemented!() }
+}
+
+impl NetworkFilesystem for MyCoolFilesystem {
+    fn open_file(&self, inode: u64, _writable: bool) -> Result<NetworkFile> {
+        if let Some(download) = self.downloaded_file(inode) {
+            // The path remains owned by this backend.
+            return Ok(NetworkFile::Local(LocalFile::new(
+                download.path,
+                download.generation,
+            )));
+        }
+        Ok(NetworkFile::Remote)
+    }
+
+    fn close_file(&self, inode: u64, file: NetworkFile) -> Result<()> {
+        // Swift has closed its descriptor. Update last-access state or schedule
+        // removal according to your own cache policy.
+        self.download_manager.file_closed(inode, file);
+        Ok(())
+    }
+}
+
+fn filesystem(mount: &Mount) -> Result<MyCoolFilesystem> {
+    let url = mount
+        .resource_url()
+        .map_err(|_| fsbind::Error::INVALID)?;
+    MyCoolFilesystem::connect(url)
+}
+
+fsbind::export_network_filesystem!(filesystem);
+```
+
+`open_file` does not implicitly download anything. A backend returns
+`NetworkFile::Local` only when its own download manager has explicitly
+materialized that inode; otherwise `Filesystem::read` remains the lazy remote
+path. The local file is leased until `close_file`. Swift closes its descriptor
+before that callback, so the backend remains responsible for last-access
+tracking and eviction.
+
+See [the complete network example](examples/network-backend/src/lib.rs).
 
 Run `xcodegen generate` after changing `project.yml`. The build phase maps
 Xcode's `arm64` and `x86_64` architectures to their Rust target triples and
@@ -107,7 +171,7 @@ places the correct library in an architecture-specific directory.
 flowchart LR
     K["macOS VFS / FSKit"] --> S["Swift FSVolume adapter"]
     S --> C["Versioned C ABI"]
-    C --> R["Rust FileSystem trait object"]
+    C --> R["Rust Filesystem trait object"]
     R --> M["Memory, database, remote, or custom backend"]
 ```
 
@@ -156,3 +220,41 @@ FSKit currently requires a host app and explicit user approval for the
 extension. Unit tests therefore validate the Rust core and the actual Swift/C
 boundary without attempting to automate System Settings or a privileged mount.
 
+## Signed GitHub releases
+
+Pushing a tag matching `v*` runs
+[the release workflow](.github/workflows/release.yml). It builds a universal
+Developer ID application, notarizes it, staples the notarization ticket, and
+publishes the resulting ZIP to GitHub Releases.
+
+Configure these GitHub Actions secrets:
+
+- `BUILD_CERTIFICATE_BASE64`: base64-encoded Developer ID Application `.p12`
+  containing its private key.
+- `P12_PASSWORD`: password used when exporting that `.p12`.
+- `KEYCHAIN_PASSWORD`: a random password used only for the temporary CI
+  keychain.
+- `APP_PROVISIONING_PROFILE_BASE64`: base64-encoded Developer ID provisioning
+  profile for `com.specta.fsbind`.
+- `EXTENSION_PROVISIONING_PROFILE_BASE64`: base64-encoded Developer ID
+  provisioning profile for `com.specta.fsbind.extension`, including the FSKit
+  module entitlement.
+- `APPLE_TEAM_ID`: Apple Developer team identifier.
+- `APPLE_ID`: Apple account used by `notarytool`.
+- `APPLE_APP_SPECIFIC_PASSWORD`: app-specific password for that Apple account.
+
+The workflow uses GitHub's automatic `GITHUB_TOKEN` to create the release; no
+additional GitHub token is required.
+
+## Why there is an app
+
+FSKit discovers this code as an ExtensionKit app extension. The `.appex` must
+be code-signed, embedded in a containing `.app`, installed, and approved by the
+user. A Mach-O command-line executable can't directly contain and register that
+extension.
+
+A CLI can still be the primary interface: ship the signed `FSBind.app`
+alongside it, make the app UI-less if desired, and have the CLI open or install
+that companion. The distributable boundary remains an app bundle because its
+nested extension, provisioning profile, entitlements, and signatures must
+retain their bundle structure.
