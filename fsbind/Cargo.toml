@@ -1,6 +1,6 @@
 [package]
 name = "fsbind"
-version = "0.1.0"
+version = "0.0.1"
 description = "High-performance virtual and network filesystems for macOS, Linux, and Windows"
 authors = ["Oscar Beaumont <oscar@otbeaumont.me>"]
 edition.workspace = true
