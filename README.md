@@ -6,14 +6,14 @@ in Rust. It provides:
 - a small Rust `Filesystem` trait for downstream backends;
 - a `NetworkFilesystem: Filesystem` trait for lazy remote volumes and
   backend-owned downloaded files;
-- a stable, versioned C ABI with opaque volume handles;
-- a Swift adapter that maps FSKit operations onto that ABI;
+- a stable, versioned binary protocol over authenticated Unix sockets;
+- a reusable Swift adapter that can serve any number of Rust processes;
 - a concurrent in-memory backend that is useful as a starter implementation;
 - a host app and ExtensionKit extension generated with XcodeGen;
 - Rust and Swift cross-language tests.
 
-The checked-in example mounts a writable memory filesystem containing
-`hello.txt`.
+The Swift app is built and approved once. Each Rust CLI then owns its filesystem
+implementation and mount lifetime independently.
 
 ## Requirements
 
@@ -45,47 +45,51 @@ xcodebuild \
 Or run `scripts/check.sh`. Code-signing is intentionally disabled for CI tests;
 mounting requires a normally signed build from Xcode.
 
-## Mount the example
+## Install the bridge and mount the example
 
 1. Open `FSBind.xcodeproj`, select a development team for both the app and
    extension, then build and run `FSBindApp`.
 2. In **System Settings > General > Login Items & Extensions > File System
    Extensions**, enable **FSBind virtual file system**.
-3. Create source and mount directories, then mount the filesystem:
+3. Build and run the Rust example:
 
 ```sh
-mkdir -p /tmp/fsbind-source "$HOME/fsbind-mount"
-mount -t fsbind /tmp/fsbind-source "$HOME/fsbind-mount"
+mkdir -p "$HOME/fsbind-mount"
+cargo run -p fsbind-memory-backend -- "$HOME/fsbind-mount"
+```
+
+In another terminal:
+
+```sh
 ls -la "$HOME/fsbind-mount"
 cat "$HOME/fsbind-mount/hello.txt"
 ```
 
-The source path is only the resource FSKit uses to identify this mount; the
-example backend does not read it. Unmount with:
-
-```sh
-diskutil unmount "$HOME/fsbind-mount"
-```
+Press Control-C in the first terminal to unmount. `MountSession` owns the
+registration: dropping it unmounts the path, stops its IPC service, closes
+backend leases, and removes the private socket.
 
 ## Create a downstream filesystem
 
-The quickest route is to replace the factory in
-`examples/memory-backend/src/lib.rs`. The factory returns one independent
-backend for each loaded volume:
+Implement `Filesystem`, then keep a `MountSession` alive in your CLI:
 
 ```rust
-use fsbind::{FileType, Filesystem, MemoryFileSystem, ROOT_INODE};
+use fsbind::{Filesystem, MountSession};
 
-fn filesystem() -> MemoryFileSystem {
-    let fs = MemoryFileSystem::new();
-    let inode = fs
-        .create(ROOT_INODE, b"status", FileType::File, 0o444)
-        .unwrap();
-    fs.write(inode, 0, b"ready\n").unwrap();
-    fs
+struct MyCoolFilesystem;
+
+impl Filesystem for MyCoolFilesystem {
+    // Implement the required operations.
+    # fn statfs(&self) -> fsbind::Result<fsbind::StatFs> { unimplemented!() }
+    # fn metadata(&self, _: u64) -> fsbind::Result<fsbind::Metadata> { unimplemented!() }
+    # fn lookup(&self, _: u64, _: &[u8]) -> fsbind::Result<(u64, fsbind::FileType)> { unimplemented!() }
+    # fn read_directory(&self, _: u64, _: u64, _: u64, _: &mut dyn fsbind::DirectorySink) -> fsbind::Result<fsbind::ReadDirectoryResult> { unimplemented!() }
+    # fn read(&self, _: u64, _: u64, _: &mut [u8]) -> fsbind::Result<usize> { unimplemented!() }
 }
 
-fsbind::export_filesystem!(filesystem);
+let mount = MountSession::mount(MyCoolFilesystem, "/Volumes/MyCoolFilesystem")?;
+// Run the CLI. Dropping `mount` unmounts it.
+# Ok::<(), std::io::Error>(())
 ```
 
 For a database, remote service, archive, or content-addressed store, implement
@@ -94,10 +98,8 @@ need to implement `statfs`, `metadata`, `lookup`, `read_directory`, and `read`;
 mutating methods default to `ENOTSUP`. Names are byte slices rather than UTF-8
 strings because FSKit filenames are not guaranteed to be valid UTF-8.
 
-Build the downstream crate as a `staticlib`, invoke
-`fsbind::export_filesystem!(your_factory)`, and change the two library names in
-`project.yml` from `fsbind_memory_backend` to the resulting static library.
-The generated C symbols stay fixed, so no Swift source changes are needed.
+No Rust code is linked into the app or extension. Multiple CLIs can mount
+different implementations simultaneously through the same installed bridge.
 
 ### Network filesystems
 
@@ -142,14 +144,11 @@ impl NetworkFilesystem for MyCoolFilesystem {
     }
 }
 
-fn filesystem(mount: &Mount) -> Result<MyCoolFilesystem> {
-    let url = mount
-        .resource_url()
-        .map_err(|_| fsbind::Error::INVALID)?;
-    MyCoolFilesystem::connect(url)
-}
-
-fsbind::export_network_filesystem!(filesystem);
+let mount = fsbind::MountSession::mount_network(
+    MyCoolFilesystem::connect()?,
+    "/Volumes/MyNetworkFilesystem",
+)?;
+# Ok::<(), std::io::Error>(())
 ```
 
 `open_file` does not implicitly download anything. A backend returns
@@ -161,31 +160,57 @@ tracking and eviction.
 
 See [the complete network example](examples/network-backend/src/lib.rs).
 
-Run `xcodegen generate` after changing `project.yml`. The build phase maps
-Xcode's `arm64` and `x86_64` architectures to their Rust target triples and
-places the correct library in an architecture-specific directory.
+### Permission checks
+
+The CLI can ask the Swift app for FSKit's authoritative enabled state and open
+the authorization guide when needed:
+
+```rust
+match fsbind::authorization_status()? {
+    fsbind::AuthorizationStatus::Authorized => {}
+    fsbind::AuthorizationStatus::NeedsApproval => {
+        fsbind::open_authorization_app()?;
+    }
+    fsbind::AuthorizationStatus::NotInstalled => {
+        eprintln!("Install FSBind.app in /Applications");
+    }
+}
+# Ok::<(), std::io::Error>(())
+```
+
+Set `FSBIND_APP_PATH` to an app bundle outside `/Applications` during
+development. The app uses `FSClient` rather than guessing from process or
+filesystem state, and embeds macOS's own extension authorization control.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     K["macOS VFS / FSKit"] --> S["Swift FSVolume adapter"]
-    S --> C["Versioned C ABI"]
-    C --> R["Rust Filesystem trait object"]
+    S --> P["Pooled authenticated Unix sockets"]
+    P --> R["Rust CLI / Filesystem trait object"]
     R --> M["Memory, database, remote, or custom backend"]
 ```
 
-The ABI has one opaque handle per volume. Rust panics are caught at every
-exported operation and become `EIO`, so unwinding never crosses into Swift.
-All other failures use positive Darwin `errno` values.
+Each mount gets a cryptographically random capability and a mode-0600 socket in
+the FSBind application-group container. The capability is carried in the
+private FSKit resource URL and authenticated once per pooled connection. Rust
+panics are caught at the dispatch boundary and become `EIO`.
 
 ## Performance design
 
 - File reads write directly into FSKit's `FSMutableFileDataBuffer`.
 - File writes borrow Foundation `Data`; neither hot path creates an
   intermediate Swift byte array.
-- One `readdir` FFI call fills an array of fixed-size entry records and a packed
-  byte arena for names. There is no FFI call or allocation per directory entry.
+- One `readdir` response fills an array of fixed-size entry records and a packed
+  byte arena for names. There is no IPC round-trip or allocation per entry.
+- The extension maintains up to one persistent connection per active CPU
+  (bounded at 32), so unrelated FSKit callbacks execute concurrently without a
+  connect, authentication, or global-request lock on the hot path.
+- Frames use fixed little-endian headers and bounded binary payloads; there is
+  no JSON, Codable, string conversion, or dynamic symbol lookup.
+- Explicitly downloaded network files still use `pread` directly in the
+  extension and do not send file contents through IPC.
 - The memory backend uses a sharded inode map and per-node reader/writer locks,
   so unrelated reads and writes proceed concurrently.
 - Namespace changes take one short mutex, making cross-directory rename atomic
@@ -217,8 +242,8 @@ they can be added to the ABI without changing existing records by incrementing
 `FSB_ABI_VERSION`.
 
 FSKit currently requires a host app and explicit user approval for the
-extension. Unit tests therefore validate the Rust core and the actual Swift/C
-boundary without attempting to automate System Settings or a privileged mount.
+extension. Unit tests validate the Rust dispatcher, authentication and Swift
+codec without attempting to automate System Settings or a privileged mount.
 
 ## Signed GitHub releases
 
@@ -245,6 +270,11 @@ Configure these GitHub Actions secrets:
 
 The workflow uses GitHub's automatic `GITHUB_TOKEN` to create the release; no
 additional GitHub token is required.
+
+Both App IDs and provisioning profiles must include the
+`group.com.specta.fsbind` App Group. It is the only directory shared by the
+extension and unsandboxed Rust CLIs, and holds short-lived mode-0600 sockets
+only.
 
 ## Why there is an app
 
