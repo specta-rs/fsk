@@ -339,7 +339,7 @@ publish the matching `ufsi` crate through crates.io Trusted Publishing.
 Configure a crates.io trusted publisher for:
 
 - GitHub owner: `specta-rs`
-- repository: `ufsi`
+- repository: `fsk`
 - workflow: `release.yml`
 - environment: none
 
@@ -358,7 +358,7 @@ For macOS signing, configure:
 - `APPLE_APP_SPECIFIC_PASSWORD`
 
 Both App IDs and profiles must include the
-`group.dev.specta.ufsi` App Group.
+`group.dev.specta.fsk` App Group.
 
 FSKit still requires its `.appex` inside a signed `.app`; a CLI cannot contain
 the extension as a raw executable. The companion app is installed once and can

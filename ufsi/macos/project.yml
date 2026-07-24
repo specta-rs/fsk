@@ -20,7 +20,7 @@ targets:
       - UFSIApp
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.specta.ufsi
+        PRODUCT_BUNDLE_IDENTIFIER: dev.specta.fsk
         PRODUCT_NAME: UFSI
         MARKETING_VERSION: "0.1"
         CURRENT_PROJECT_VERSION: "1"
@@ -42,7 +42,7 @@ targets:
       - UFSIExtension
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.specta.ufsi.extension
+        PRODUCT_BUNDLE_IDENTIFIER: dev.specta.fsk.extension
         PRODUCT_NAME: UFSIExtension
         PROVISIONING_PROFILE_SPECIFIER: "$(UFSI_EXTENSION_PROFILE)"
         INFOPLIST_FILE: UFSIExtension/Info.plist
@@ -61,7 +61,7 @@ targets:
         buildPhase: sources
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.specta.ufsi.tests
+        PRODUCT_BUNDLE_IDENTIFIER: dev.specta.fsk.tests
         GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: ""
         BUNDLE_LOADER: ""
