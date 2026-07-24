@@ -225,6 +225,9 @@ impl FileSystem for MemoryFileSystem {
         let node = self.node(inode)?;
         let mut state = node.state.write();
         if let Some(size) = update.size {
+            if size > self.capacity {
+                return Err(Error(errno::ENOSPC));
+            }
             let old_allocated = state.metadata.allocated_size;
             let NodeData::File(data) = &mut state.data else {
                 return Err(Error(errno::EISDIR));
@@ -420,6 +423,43 @@ impl FileSystem for MemoryFileSystem {
         let _namespace = self.namespace.lock();
         let source_node = self.node(source_parent)?;
         let destination_node = self.node(destination_parent)?;
+        let source_entry = {
+            let source_state = source_node.state.read();
+            let NodeData::Directory(source_directory) = &source_state.data else {
+                return Err(Error(errno::ENOTDIR));
+            };
+            let source_slot = *source_directory
+                .by_name
+                .get(source_name)
+                .ok_or(Error(errno::ENOENT))?;
+            source_directory.slots[source_slot]
+                .clone()
+                .ok_or(Error(errno::ENOENT))?
+        };
+        if source_entry.kind == FileType::Directory
+            && self.is_descendant_of(destination_parent, source_entry.inode)?
+        {
+            return Err(Error(errno::EINVAL));
+        }
+        if let Some(replaced) = replaced_inode {
+            let replacement = self.node(replaced)?;
+            let replacement_state = replacement.state.read();
+            if source_entry.kind == FileType::Directory
+                && replacement_state.metadata.kind != FileType::Directory
+            {
+                return Err(Error(errno::ENOTDIR));
+            }
+            if source_entry.kind != FileType::Directory
+                && replacement_state.metadata.kind == FileType::Directory
+            {
+                return Err(Error(errno::EISDIR));
+            }
+            if let NodeData::Directory(directory) = &replacement_state.data
+                && !directory.by_name.is_empty()
+            {
+                return Err(Error(errno::ENOTEMPTY));
+            }
+        }
 
         if source_parent == destination_parent {
             let mut state = source_node.state.write();
@@ -476,6 +516,21 @@ impl FileSystem for MemoryFileSystem {
             }
         }
         Ok(())
+    }
+}
+
+impl MemoryFileSystem {
+    fn is_descendant_of(&self, mut candidate: u64, ancestor: u64) -> Result<bool> {
+        for _ in 0..self.nodes.len().saturating_add(1) {
+            if candidate == ancestor {
+                return Ok(true);
+            }
+            if candidate == ROOT_INODE {
+                return Ok(false);
+            }
+            candidate = self.node(candidate)?.state.read().metadata.parent;
+        }
+        Err(Error(errno::EINVAL))
     }
 }
 
@@ -707,6 +762,50 @@ mod tests {
                 .unwrap_err(),
             Error(errno::ENOTEMPTY)
         );
+    }
+
+    #[test]
+    fn directory_cannot_be_moved_inside_itself() {
+        let filesystem = MemoryFileSystem::new();
+        let parent = filesystem
+            .create(ROOT_INODE, b"parent", FileType::Directory, 0o755)
+            .unwrap();
+        let child = filesystem
+            .create(parent, b"child", FileType::Directory, 0o755)
+            .unwrap();
+        assert_eq!(
+            filesystem
+                .rename(ROOT_INODE, b"parent", child, b"cycle", None)
+                .unwrap_err(),
+            Error(errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn rename_cannot_replace_a_nonempty_directory() {
+        let filesystem = MemoryFileSystem::new();
+        let source = filesystem
+            .create(ROOT_INODE, b"source", FileType::Directory, 0o755)
+            .unwrap();
+        let destination = filesystem
+            .create(ROOT_INODE, b"destination", FileType::Directory, 0o755)
+            .unwrap();
+        filesystem
+            .create(destination, b"child", FileType::File, 0o644)
+            .unwrap();
+        assert_eq!(
+            filesystem
+                .rename(
+                    ROOT_INODE,
+                    b"source",
+                    ROOT_INODE,
+                    b"destination",
+                    Some(destination),
+                )
+                .unwrap_err(),
+            Error(errno::ENOTEMPTY)
+        );
+        assert_eq!(filesystem.lookup(ROOT_INODE, b"source").unwrap().0, source);
     }
 
     #[test]

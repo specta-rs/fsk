@@ -1,0 +1,602 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		188C3A488610FEBCD82AEDA3 /* FSBindExtension.appex in Embed ExtensionKit Extensions */ = {isa = PBXBuildFile; fileRef = D37FEE763C2CAF87B175A333 /* FSBindExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		2C0D2D193909922ADCAC779A /* RustBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CD2DBE67FA791DFB59771B9 /* RustBackend.swift */; };
+		487A62F559DF914F542B3D09 /* RustBackendTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F86BB1F7D048E3A4D102EEE /* RustBackendTests.swift */; };
+		4E3B1D1C853E6D6F2BD59D99 /* FSBindFileSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 423DFD0A6619E0E070C6A1F1 /* FSBindFileSystem.swift */; };
+		545FB733D42D680D0526411A /* FSBindItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBDE431B6133C3A049812DA1 /* FSBindItem.swift */; };
+		990389077570A37E53F592F1 /* RustBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CD2DBE67FA791DFB59771B9 /* RustBackend.swift */; };
+		D1EF6FED5156FE690EE88BC0 /* FSBindExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59464E5F5CBD448AEE06DC3F /* FSBindExtension.swift */; };
+		F8874D48E957C9D2CB22BEFA /* FSBindVolume.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3496B138DD357629671D5C30 /* FSBindVolume.swift */; };
+		FAEF522E087F1F768B51D3DD /* FSBindApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3AD4E3B9A60B4B9B2AB85FCB /* FSBindApp.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		F4F6918F4736EEFE150EAC4E /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 72BEF071F9B9C33931629DE4 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 3B9DF517A85293B8C0FA753E;
+			remoteInfo = FSBindExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		201F8290E047DAB35C79F7CB /* Embed ExtensionKit Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "$(EXTENSIONS_FOLDER_PATH)";
+			dstSubfolderSpec = 16;
+			files = (
+				188C3A488610FEBCD82AEDA3 /* FSBindExtension.appex in Embed ExtensionKit Extensions */,
+			);
+			name = "Embed ExtensionKit Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		275200EE1AF7A731B7A49611 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		3496B138DD357629671D5C30 /* FSBindVolume.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FSBindVolume.swift; sourceTree = "<group>"; };
+		3AD4E3B9A60B4B9B2AB85FCB /* FSBindApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FSBindApp.swift; sourceTree = "<group>"; };
+		423DFD0A6619E0E070C6A1F1 /* FSBindFileSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FSBindFileSystem.swift; sourceTree = "<group>"; };
+		433E2A7A7C8C902BF17FEF31 /* FSBindExtensionTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FSBindExtensionTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		4CD2DBE67FA791DFB59771B9 /* RustBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustBackend.swift; sourceTree = "<group>"; };
+		548CBF1B0489B400945B3FAD /* FSBindApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FSBindApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		59464E5F5CBD448AEE06DC3F /* FSBindExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FSBindExtension.swift; sourceTree = "<group>"; };
+		6F86BB1F7D048E3A4D102EEE /* RustBackendTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustBackendTests.swift; sourceTree = "<group>"; };
+		85208C0606D2C9FEF039DEE6 /* FSBindExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FSBindExtension.entitlements; sourceTree = "<group>"; };
+		8B8EE1E96C360C80EB402F45 /* FSBindExtension-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "FSBindExtension-Bridging-Header.h"; sourceTree = "<group>"; };
+		B3D3D9D05A0FE8D900C6A987 /* FSBindApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FSBindApp.entitlements; sourceTree = "<group>"; };
+		D37FEE763C2CAF87B175A333 /* FSBindExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.extensionkit-extension"; includeInIndex = 0; path = FSBindExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		DBDE431B6133C3A049812DA1 /* FSBindItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FSBindItem.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		0BF4ADF793CF11BDA4F055F6 = {
+			isa = PBXGroup;
+			children = (
+				620FCCDA5D7E465597B64273 /* FSBindApp */,
+				7C7D103D5717B49C0DDD71AC /* FSBindExtension */,
+				62496015DFA2F876DF6DFF3B /* FSBindExtensionTests */,
+				CEFBC5A052D16F141D2D18D0 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		620FCCDA5D7E465597B64273 /* FSBindApp */ = {
+			isa = PBXGroup;
+			children = (
+				B3D3D9D05A0FE8D900C6A987 /* FSBindApp.entitlements */,
+				3AD4E3B9A60B4B9B2AB85FCB /* FSBindApp.swift */,
+			);
+			path = FSBindApp;
+			sourceTree = "<group>";
+		};
+		62496015DFA2F876DF6DFF3B /* FSBindExtensionTests */ = {
+			isa = PBXGroup;
+			children = (
+				6F86BB1F7D048E3A4D102EEE /* RustBackendTests.swift */,
+			);
+			path = FSBindExtensionTests;
+			sourceTree = "<group>";
+		};
+		7C7D103D5717B49C0DDD71AC /* FSBindExtension */ = {
+			isa = PBXGroup;
+			children = (
+				8B8EE1E96C360C80EB402F45 /* FSBindExtension-Bridging-Header.h */,
+				85208C0606D2C9FEF039DEE6 /* FSBindExtension.entitlements */,
+				59464E5F5CBD448AEE06DC3F /* FSBindExtension.swift */,
+				423DFD0A6619E0E070C6A1F1 /* FSBindFileSystem.swift */,
+				DBDE431B6133C3A049812DA1 /* FSBindItem.swift */,
+				3496B138DD357629671D5C30 /* FSBindVolume.swift */,
+				275200EE1AF7A731B7A49611 /* Info.plist */,
+				4CD2DBE67FA791DFB59771B9 /* RustBackend.swift */,
+			);
+			path = FSBindExtension;
+			sourceTree = "<group>";
+		};
+		CEFBC5A052D16F141D2D18D0 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				548CBF1B0489B400945B3FAD /* FSBindApp.app */,
+				D37FEE763C2CAF87B175A333 /* FSBindExtension.appex */,
+				433E2A7A7C8C902BF17FEF31 /* FSBindExtensionTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		2F4D64E476A9AE629A43EB65 /* FSBindApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 687E5232F28DB29A23079F02 /* Build configuration list for PBXNativeTarget "FSBindApp" */;
+			buildPhases = (
+				7327455264B2DC4EF2C2E4E5 /* Sources */,
+				201F8290E047DAB35C79F7CB /* Embed ExtensionKit Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				56CAA1E6DF3E911406A77178 /* PBXTargetDependency */,
+			);
+			name = FSBindApp;
+			packageProductDependencies = (
+			);
+			productName = FSBindApp;
+			productReference = 548CBF1B0489B400945B3FAD /* FSBindApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+		3B9DF517A85293B8C0FA753E /* FSBindExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B9F1A2974B562FF486A0E03B /* Build configuration list for PBXNativeTarget "FSBindExtension" */;
+			buildPhases = (
+				0ECCFCED72F62948D3B8E34D /* Build Rust backend */,
+				85B3E995CD3BB3320B2606BD /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = FSBindExtension;
+			packageProductDependencies = (
+			);
+			productName = FSBindExtension;
+			productReference = D37FEE763C2CAF87B175A333 /* FSBindExtension.appex */;
+			productType = "com.apple.product-type.extensionkit-extension";
+		};
+		F4E26587B2EE6C929D3AC465 /* FSBindExtensionTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 228B52B863EFAA4D69CC5789 /* Build configuration list for PBXNativeTarget "FSBindExtensionTests" */;
+			buildPhases = (
+				9B58B8AE8D851C4CDCB2C754 /* Build Rust backend */,
+				2E63EF084928414937D63A2A /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = FSBindExtensionTests;
+			packageProductDependencies = (
+			);
+			productName = FSBindExtensionTests;
+			productReference = 433E2A7A7C8C902BF17FEF31 /* FSBindExtensionTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		72BEF071F9B9C33931629DE4 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 2600;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = D967D70701DE1E016562A31D /* Build configuration list for PBXProject "FSBind" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 0BF4ADF793CF11BDA4F055F6;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = CEFBC5A052D16F141D2D18D0 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				2F4D64E476A9AE629A43EB65 /* FSBindApp */,
+				3B9DF517A85293B8C0FA753E /* FSBindExtension */,
+				F4E26587B2EE6C929D3AC465 /* FSBindExtensionTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		0ECCFCED72F62948D3B8E34D /* Build Rust backend */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust backend";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT\"\nbuild_arch=\"$CURRENT_ARCH\"\nif [ \"$build_arch\" = \"undefined_arch\" ]; then build_arch=\"$NATIVE_ARCH_ACTUAL\"; fi\ncase \"$build_arch\" in\n  arm64) rust_target=\"aarch64-apple-darwin\" ;;\n  x86_64) rust_target=\"x86_64-apple-darwin\" ;;\n  *) echo \"Unsupported architecture: $build_arch\" >&2; exit 1 ;;\nesac\ncargo build --release -p fsbind-memory-backend --target \"$rust_target\"\noutput_dir=\"$SRCROOT/target/xcode/$build_arch\"\nmkdir -p \"$output_dir\"\ncp \"$SRCROOT/target/$rust_target/release/libfsbind_memory_backend.a\" \"$output_dir/\"\n";
+		};
+		9B58B8AE8D851C4CDCB2C754 /* Build Rust backend */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust backend";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT\"\nbuild_arch=\"$CURRENT_ARCH\"\nif [ \"$build_arch\" = \"undefined_arch\" ]; then build_arch=\"$NATIVE_ARCH_ACTUAL\"; fi\ncase \"$build_arch\" in\n  arm64) rust_target=\"aarch64-apple-darwin\" ;;\n  x86_64) rust_target=\"x86_64-apple-darwin\" ;;\n  *) echo \"Unsupported architecture: $build_arch\" >&2; exit 1 ;;\nesac\ncargo build --release -p fsbind-memory-backend --target \"$rust_target\"\noutput_dir=\"$SRCROOT/target/xcode/$build_arch\"\nmkdir -p \"$output_dir\"\ncp \"$SRCROOT/target/$rust_target/release/libfsbind_memory_backend.a\" \"$output_dir/\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		2E63EF084928414937D63A2A /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				990389077570A37E53F592F1 /* RustBackend.swift in Sources */,
+				487A62F559DF914F542B3D09 /* RustBackendTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7327455264B2DC4EF2C2E4E5 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				FAEF522E087F1F768B51D3DD /* FSBindApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		85B3E995CD3BB3320B2606BD /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D1EF6FED5156FE690EE88BC0 /* FSBindExtension.swift in Sources */,
+				4E3B1D1C853E6D6F2BD59D99 /* FSBindFileSystem.swift in Sources */,
+				545FB733D42D680D0526411A /* FSBindItem.swift in Sources */,
+				F8874D48E957C9D2CB22BEFA /* FSBindVolume.swift in Sources */,
+				2C0D2D193909922ADCAC779A /* RustBackend.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		56CAA1E6DF3E911406A77178 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 3B9DF517A85293B8C0FA753E /* FSBindExtension */;
+			targetProxy = F4F6918F4736EEFE150EAC4E /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		0966F28034AC7B67EA59ADFB /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "";
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/include",
+				);
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/target/xcode/$(CURRENT_ARCH)",
+				);
+				OTHER_LDFLAGS = (
+					"-lfsbind_memory_backend",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.fsbind.tests;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "FSBindExtension/FSBindExtension-Bridging-Header.h";
+				TEST_HOST = "";
+			};
+			name = Release;
+		};
+		09730FF7042867C7BBB2553D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = FSBindExtension/FSBindExtension.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/include",
+				);
+				INFOPLIST_FILE = FSBindExtension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/target/xcode/$(CURRENT_ARCH)",
+				);
+				OTHER_LDFLAGS = (
+					"-lfsbind_memory_backend",
+					"-Wl,-dead_strip",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.fsbind.host.extension;
+				PRODUCT_NAME = FSBindExtension;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "FSBindExtension/FSBindExtension-Bridging-Header.h";
+			};
+			name = Release;
+		};
+		0CD1FD2F3308BE39077C370F /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = FSBindApp/FSBindApp.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.fsbind.host;
+				PRODUCT_NAME = FSBind;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		30286AFB705F1B3C66868850 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = FSBindApp/FSBindApp.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.fsbind.host;
+				PRODUCT_NAME = FSBind;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		5BD1CD5A22EAFE112E1565A4 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = FSBindExtension/FSBindExtension.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/include",
+				);
+				INFOPLIST_FILE = FSBindExtension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/target/xcode/$(CURRENT_ARCH)",
+				);
+				OTHER_LDFLAGS = (
+					"-lfsbind_memory_backend",
+					"-Wl,-dead_strip",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.fsbind.host.extension;
+				PRODUCT_NAME = FSBindExtension;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "FSBindExtension/FSBindExtension-Bridging-Header.h";
+			};
+			name = Debug;
+		};
+		71E87A3230A322BE7977507C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "";
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/include",
+				);
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/target/xcode/$(CURRENT_ARCH)",
+				);
+				OTHER_LDFLAGS = (
+					"-lfsbind_memory_backend",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.fsbind.tests;
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "FSBindExtension/FSBindExtension-Bridging-Header.h";
+				TEST_HOST = "";
+			};
+			name = Debug;
+		};
+		74C40DA3DB68F026FE86EC83 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		FE840918DE6C6A43B2A04850 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		228B52B863EFAA4D69CC5789 /* Build configuration list for PBXNativeTarget "FSBindExtensionTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				71E87A3230A322BE7977507C /* Debug */,
+				0966F28034AC7B67EA59ADFB /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		687E5232F28DB29A23079F02 /* Build configuration list for PBXNativeTarget "FSBindApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				30286AFB705F1B3C66868850 /* Debug */,
+				0CD1FD2F3308BE39077C370F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		B9F1A2974B562FF486A0E03B /* Build configuration list for PBXNativeTarget "FSBindExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5BD1CD5A22EAFE112E1565A4 /* Debug */,
+				09730FF7042867C7BBB2553D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		D967D70701DE1E016562A31D /* Build configuration list for PBXProject "FSBind" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				74C40DA3DB68F026FE86EC83 /* Debug */,
+				FE840918DE6C6A43B2A04850 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 72BEF071F9B9C33931629DE4 /* Project object */;
+}

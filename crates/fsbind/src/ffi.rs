@@ -1,6 +1,6 @@
 use crate::{
-    DirectoryEntry, DirectorySink, Error, FileSystem, FileType, Metadata, ReadDirectoryResult,
-    SetMetadata, StatFs,
+    ABI_VERSION, DirectoryEntry, DirectorySink, Error, FileSystem, FileType, Metadata,
+    ReadDirectoryResult, SetMetadata, StatFs,
 };
 use std::{
     ffi::c_void,
@@ -75,6 +75,11 @@ pub fn create_volume(filesystem: impl FileSystem) -> *mut c_void {
         filesystem: Box::new(filesystem),
     }))
     .cast()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fsb_abi_version() -> u32 {
+    ABI_VERSION
 }
 
 unsafe fn volume<'a>(pointer: *mut c_void) -> Result<&'a dyn FileSystem, Error> {

@@ -10,6 +10,8 @@ extern "C" {
 
 typedef void *FSBVolumeRef;
 
+#define FSB_ABI_VERSION 1u
+
 enum {
     FSB_KIND_FILE = 1,
     FSB_KIND_DIRECTORY = 2,
@@ -72,6 +74,7 @@ typedef struct {
 } FSBDirEntry;
 
 FSBVolumeRef fsb_volume_create(void);
+uint32_t fsb_abi_version(void);
 void fsb_volume_destroy(FSBVolumeRef volume);
 int32_t fsb_statfs(FSBVolumeRef volume, FSBStatFS *output);
 int32_t fsb_getattr(FSBVolumeRef volume, uint64_t inode, FSBAttributes *output);

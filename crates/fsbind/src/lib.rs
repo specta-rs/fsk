@@ -11,6 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub use ffi::{FsbAttributes, FsbDirEntry, FsbSetAttributes, FsbStatFs};
 pub use memory::MemoryFileSystem;
 
+/// Version of the C ABI implemented by this crate.
+pub const ABI_VERSION: u32 = 1;
+
 /// The root inode. `FSKit` treats inode values as opaque, except that zero is invalid.
 pub const ROOT_INODE: u64 = 1;
 
@@ -21,6 +24,7 @@ pub struct Error(pub i32);
 impl Error {
     pub const IO: Self = Self(libc_errno::EIO);
     pub const INVALID: Self = Self(libc_errno::EINVAL);
+    pub const NOT_SUPPORTED: Self = Self(libc_errno::ENOTSUP);
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -107,7 +111,9 @@ pub struct ReadDirectoryResult {
 pub trait FileSystem: Send + Sync + 'static {
     fn statfs(&self) -> Result<StatFs>;
     fn metadata(&self, inode: u64) -> Result<Metadata>;
-    fn set_metadata(&self, inode: u64, update: SetMetadata) -> Result<Metadata>;
+    fn set_metadata(&self, _inode: u64, _update: SetMetadata) -> Result<Metadata> {
+        Err(Error::NOT_SUPPORTED)
+    }
     fn lookup(&self, parent: u64, name: &[u8]) -> Result<(u64, FileType)>;
     fn read_directory(
         &self,
@@ -117,19 +123,37 @@ pub trait FileSystem: Send + Sync + 'static {
         sink: &mut dyn DirectorySink,
     ) -> Result<ReadDirectoryResult>;
     fn read(&self, inode: u64, offset: u64, output: &mut [u8]) -> Result<usize>;
-    fn write(&self, inode: u64, offset: u64, input: &[u8]) -> Result<usize>;
-    fn create(&self, parent: u64, name: &[u8], kind: FileType, mode: u32) -> Result<u64>;
-    fn create_symlink(&self, parent: u64, name: &[u8], target: &[u8], mode: u32) -> Result<u64>;
-    fn read_symlink(&self, inode: u64, output: &mut [u8]) -> Result<usize>;
-    fn remove(&self, parent: u64, name: &[u8], inode: u64) -> Result<()>;
+    fn write(&self, _inode: u64, _offset: u64, _input: &[u8]) -> Result<usize> {
+        Err(Error::NOT_SUPPORTED)
+    }
+    fn create(&self, _parent: u64, _name: &[u8], _kind: FileType, _mode: u32) -> Result<u64> {
+        Err(Error::NOT_SUPPORTED)
+    }
+    fn create_symlink(
+        &self,
+        _parent: u64,
+        _name: &[u8],
+        _target: &[u8],
+        _mode: u32,
+    ) -> Result<u64> {
+        Err(Error::NOT_SUPPORTED)
+    }
+    fn read_symlink(&self, _inode: u64, _output: &mut [u8]) -> Result<usize> {
+        Err(Error::NOT_SUPPORTED)
+    }
+    fn remove(&self, _parent: u64, _name: &[u8], _inode: u64) -> Result<()> {
+        Err(Error::NOT_SUPPORTED)
+    }
     fn rename(
         &self,
-        source_parent: u64,
-        source_name: &[u8],
-        destination_parent: u64,
-        destination_name: &[u8],
-        replaced_inode: Option<u64>,
-    ) -> Result<()>;
+        _source_parent: u64,
+        _source_name: &[u8],
+        _destination_parent: u64,
+        _destination_name: &[u8],
+        _replaced_inode: Option<u64>,
+    ) -> Result<()> {
+        Err(Error::NOT_SUPPORTED)
+    }
     fn synchronize(&self) -> Result<()> {
         Ok(())
     }
@@ -178,4 +202,5 @@ pub mod __private {
 mod libc_errno {
     pub const EIO: i32 = 5;
     pub const EINVAL: i32 = 22;
+    pub const ENOTSUP: i32 = 45;
 }
