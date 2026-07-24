@@ -26,6 +26,7 @@ jobs:
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Generate Xcode project
+        working-directory: fsbind/macos
         run: xcodegen generate
 
       - name: Install signing certificate and provisioning profiles
@@ -74,7 +75,7 @@ jobs:
         run: |
           set -euo pipefail
           xcodebuild \
-            -project FSBind.xcodeproj \
+            -project fsbind/macos/FSBind.xcodeproj \
             -scheme FSBindApp \
             -configuration Release \
             -archivePath "$RUNNER_TEMP/FSBind.xcarchive" \

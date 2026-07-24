@@ -294,8 +294,8 @@ macOS additionally requires Xcode 26, XcodeGen, and an Apple team capable of
 signing `com.apple.developer.fskit.fsmodule`.
 
 ```sh
-xcodegen generate
-./scripts/check.sh
+(cd fsbind/macos && xcodegen generate)
+./fsbind/macos/check.sh
 ```
 
 Install `FSBind.app`, then enable it under **System Settings → General → Login

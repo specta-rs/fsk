@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/fsbind",
+    "fsbind",
     "examples/memory-backend",
     "examples/network-backend",
 ]
