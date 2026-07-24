@@ -694,8 +694,8 @@ impl From<FsbSetAttributes> for SetMetadata {
 mod tests {
     use super::*;
     use crate::{
-        FileType, KernelCachePolicy, LocalFile, MemoryFileSystem, NetworkConfiguration, ROOT_INODE,
-        ReadDirectoryResult,
+        FileType, KernelCachePolicy, LocalFile, NetworkConfiguration, ROOT_INODE,
+        ReadDirectoryResult, test_support::TestFilesystem,
     };
     use std::sync::{
         Arc,
@@ -703,7 +703,7 @@ mod tests {
     };
 
     struct TestNetworkFilesystem {
-        inner: MemoryFileSystem,
+        inner: TestFilesystem,
         local_path: std::path::PathBuf,
         closes: Arc<AtomicUsize>,
     }
@@ -765,7 +765,7 @@ mod tests {
         std::fs::write(&local_path, b"cached").unwrap();
         let closes = Arc::new(AtomicUsize::new(0));
         let pointer = create_network_volume(TestNetworkFilesystem {
-            inner: MemoryFileSystem::new(),
+            inner: TestFilesystem::default(),
             local_path: local_path.clone(),
             closes: Arc::clone(&closes),
         });

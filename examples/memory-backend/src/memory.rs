@@ -1,8 +1,8 @@
-use crate::{
+use dashmap::DashMap;
+use fsbind::{
     DirectoryEntry, DirectorySink, Error, FileType, Filesystem, Metadata, ROOT_INODE,
     ReadDirectoryResult, Result, SetMetadata, StatFs, now_ns,
 };
-use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use std::{
     collections::HashMap,
@@ -635,7 +635,7 @@ mod errno {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DirectorySink;
+    use fsbind::DirectorySink;
     use std::sync::Arc;
 
     #[derive(Default)]

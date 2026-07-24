@@ -1,4 +1,7 @@
-use fsbind::{FileType, Filesystem, MemoryFileSystem, ROOT_INODE};
+mod memory;
+
+use fsbind::{FileType, Filesystem, ROOT_INODE};
+pub use memory::MemoryFileSystem;
 
 /// Build the example volume.
 ///

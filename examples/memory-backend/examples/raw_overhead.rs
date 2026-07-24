@@ -1,8 +1,8 @@
 use fsbind::{
-    DirectorySink, FileType, Filesystem, MemoryFileSystem, Metadata, ROOT_INODE,
-    ReadDirectoryResult, Result, StatFs,
+    DirectorySink, FileType, Filesystem, Metadata, ROOT_INODE, ReadDirectoryResult, Result, StatFs,
     raw::{Caller, NativeRequest, Operation, Platform, RawEvent, RawEventMask, RawOutcome},
 };
+use fsbind_memory_backend::MemoryFileSystem;
 use std::{
     hint::black_box,
     sync::atomic::{AtomicU64, Ordering},

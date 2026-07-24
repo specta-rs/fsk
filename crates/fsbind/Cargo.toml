@@ -11,7 +11,7 @@ documentation = "https://docs.rs/fsbind/latest/fsbind"
 readme = "../../README.md"
 keywords = ["filesystem", "virtual-filesystem", "fuse", "fskit", "projfs"]
 categories = ["api-bindings", "filesystem"]
-include = ["/src", "/examples", "/Cargo.toml"]
+include = ["/src", "/Cargo.toml"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -20,8 +20,9 @@ default-target = "x86_64-unknown-linux-gnu"
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
 
 [dependencies]
-dashmap = "6.1"
 parking_lot = "0.12"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -36,7 +37,6 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-proptest = "1.7"
 tempfile = "3"
 
 [lints]

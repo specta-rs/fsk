@@ -585,12 +585,12 @@ fn invalid_frame(_: Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FileType, MemoryFileSystem, ROOT_INODE};
+    use crate::{FileType, ROOT_INODE, test_support::TestFilesystem};
     use std::os::unix::net::UnixStream;
 
     #[test]
     fn authenticated_connection_serves_metadata() {
-        let filesystem = MemoryFileSystem::new();
+        let filesystem = TestFilesystem::default();
         let token = [7; 32];
         let service = Arc::new(Service::local(filesystem, token));
         let (mut client, server) = UnixStream::pair().unwrap();
@@ -612,7 +612,7 @@ mod tests {
 
     #[test]
     fn incorrect_capability_is_rejected_before_dispatch() {
-        let service = Arc::new(Service::local(MemoryFileSystem::new(), [7; 32]));
+        let service = Arc::new(Service::local(TestFilesystem::default(), [7; 32]));
         let (mut client, server) = UnixStream::pair().unwrap();
         let worker = std::thread::spawn(move || {
             assert!(service.serve_connection(server).is_err());
@@ -625,10 +625,7 @@ mod tests {
     #[test]
     #[ignore = "microbenchmark; run explicitly with --release --ignored --nocapture"]
     fn benchmark_authenticated_ipc_lookup_roundtrip() {
-        let filesystem = MemoryFileSystem::new();
-        filesystem
-            .create(ROOT_INODE, b"entry", FileType::File, 0o644)
-            .unwrap();
+        let filesystem = TestFilesystem::with_entry();
         let token = [7; 32];
         let service = Arc::new(Service::local(filesystem, token));
         let (mut client, server) = UnixStream::pair().unwrap();

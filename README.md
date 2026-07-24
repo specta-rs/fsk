@@ -15,6 +15,12 @@ read directly into caller-provided buffers. Names are arbitrary bytes on Unix
 and WTF-8 on Windows, preserving Windows UTF-16 names including unpaired
 surrogates.
 
+The published `fsbind` crate deliberately implements neither `Filesystem` nor
+`NetworkFilesystem`. It does not choose an inode index, cache, locking model,
+transaction boundary, consistency policy, or storage engine for downstream
+users. The workspace's memory and network backends are examples only; copy
+their ideas or replace them entirely.
+
 ## Platform support
 
 | Platform | Native layer | Model | Installation |
@@ -85,7 +91,8 @@ The required methods are sufficient for a read-only filesystem. Mutation
 methods default to `ENOTSUP`. Methods can run concurrently, so implementations
 must be `Send + Sync`.
 
-The memory example is a complete CLI:
+The workspace's memory example is a complete CLI and a deliberately separate
+implementation:
 
 ```sh
 cargo run -p fsbind-memory-backend -- /path/to/mount
@@ -230,10 +237,11 @@ The hot paths avoid serialization frameworks and per-item calls:
 - fixed little-endian IPC frames rather than JSON or Codable;
 - `writev` for macOS response headers and payloads;
 - stable directory cookies and mutation verifiers;
-- sharded inode storage with per-node reader/writer locks;
 - no raw-event allocation or virtual call unless its operation is enabled.
 
-Benchmarks on an Apple M1 Pro, using release builds:
+The storage-engine figures below measure the example implementation, not a
+policy imposed by `fsbind`. Benchmarks were run on an Apple M1 Pro using
+release builds:
 
 | Benchmark | Observed result |
 |---|---:|
@@ -251,8 +259,8 @@ authenticated lookup result from a 162–169k baseline to 182–196k round trips
 Run the same benchmarks locally:
 
 ```sh
-cargo run --release -p fsbind --example throughput
-cargo run --release -p fsbind --example raw_overhead
+cargo run --release -p fsbind-memory-backend --example throughput
+cargo run --release -p fsbind-memory-backend --example raw_overhead
 cargo test --release -p fsbind \
   ipc::tests::benchmark_authenticated_ipc_lookup_roundtrip \
   -- --ignored --nocapture

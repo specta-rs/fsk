@@ -1,7 +1,8 @@
 use fsbind::{
-    DirectorySink, FileType, Filesystem, LocalFile, MemoryFileSystem, Metadata, NetworkFile,
-    NetworkFilesystem, ROOT_INODE, ReadDirectoryResult, Result, StatFs,
+    DirectorySink, FileType, Filesystem, LocalFile, Metadata, NetworkFile, NetworkFilesystem,
+    ROOT_INODE, ReadDirectoryResult, Result, StatFs,
 };
+use fsbind_memory_backend::MemoryFileSystem;
 use std::path::PathBuf;
 
 pub struct ExampleNetworkFilesystem {

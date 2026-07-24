@@ -4,6 +4,10 @@
 //! portable data model. Platform adapters use `FSKit` on macOS, `FUSE` on Linux, and `ProjFS`
 //! on Windows. Opt-in [`raw`] events expose native requests without adding allocations
 //! to the default path.
+//!
+//! This crate provides no filesystem implementation or storage policy. Inode
+//! indexing, caching, synchronization, consistency, and persistence belong to
+//! the downstream type implementing [`Filesystem`].
 
 #[cfg(target_os = "macos")]
 mod authorization;
@@ -14,7 +18,6 @@ mod ffi;
 mod ipc;
 #[cfg(target_os = "linux")]
 mod linux;
-mod memory;
 #[cfg(target_os = "macos")]
 mod mount;
 mod network;
@@ -32,7 +35,6 @@ pub use core::{
 pub use ffi::{FsbAttributes, FsbDirEntry, FsbSetAttributes, FsbStatFs};
 #[cfg(target_os = "linux")]
 pub use linux::{MountOptions, MountSession};
-pub use memory::MemoryFileSystem;
 #[cfg(target_os = "macos")]
 pub use mount::{MountOptions, MountSession};
 pub use network::{
@@ -43,6 +45,92 @@ pub use windows::{MountOptions, MountSession};
 
 /// Version of the C ABI implemented by this crate.
 pub const ABI_VERSION: u32 = 2;
+
+#[cfg(all(test, target_os = "macos"))]
+mod test_support {
+    use crate::{
+        DirectorySink, Error, FileType, Filesystem, Metadata, ROOT_INODE, ReadDirectoryResult,
+        Result, StatFs,
+    };
+
+    #[derive(Default)]
+    pub(crate) struct TestFilesystem {
+        entry: bool,
+    }
+
+    impl TestFilesystem {
+        pub(crate) const fn with_entry() -> Self {
+            Self { entry: true }
+        }
+    }
+
+    impl Filesystem for TestFilesystem {
+        fn statfs(&self) -> Result<StatFs> {
+            Ok(StatFs {
+                block_size: 4096,
+                io_size: 131_072,
+                total_bytes: 4096,
+                free_bytes: 4096,
+                available_bytes: 4096,
+                files: 2,
+                free_files: u64::MAX - 2,
+            })
+        }
+
+        fn metadata(&self, inode: u64) -> Result<Metadata> {
+            let kind = match inode {
+                ROOT_INODE => FileType::Directory,
+                2 if self.entry => FileType::File,
+                _ => return Err(Error(2)),
+            };
+            Ok(Metadata {
+                inode,
+                parent: ROOT_INODE,
+                size: 0,
+                allocated_size: 0,
+                generation: 1,
+                created_ns: 0,
+                modified_ns: 0,
+                accessed_ns: 0,
+                mode: if kind == FileType::Directory {
+                    0o755
+                } else {
+                    0o644
+                },
+                uid: 0,
+                gid: 0,
+                link_count: 1,
+                kind,
+            })
+        }
+
+        fn lookup(&self, parent: u64, name: &[u8]) -> Result<(u64, FileType)> {
+            if self.entry && parent == ROOT_INODE && name == b"entry" {
+                Ok((2, FileType::File))
+            } else {
+                Err(Error(2))
+            }
+        }
+
+        fn read_directory(
+            &self,
+            _inode: u64,
+            _cookie: u64,
+            _verifier: u64,
+            _sink: &mut dyn DirectorySink,
+        ) -> Result<ReadDirectoryResult> {
+            Ok(ReadDirectoryResult {
+                verifier: 1,
+                next_cookie: 0,
+                eof: true,
+            })
+        }
+
+        fn read(&self, _inode: u64, _offset: u64, _output: &mut [u8]) -> Result<usize> {
+            Ok(0)
+        }
+    }
+}
 
 /// Exports a backend factory using the ABI expected by `FSBindExtension`.
 ///

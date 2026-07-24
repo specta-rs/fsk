@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 fsbind = { path = "../../crates/fsbind" }
+fsbind-memory-backend = { path = "../memory-backend" }
 
 [lints]
 workspace = true
