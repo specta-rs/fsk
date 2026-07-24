@@ -152,6 +152,7 @@ jobs:
     name: Publish fsk to crates.io
     needs: release
     runs-on: ubuntu-24.04
+    environment: production
     timeout-minutes: 15
     permissions:
       contents: read
