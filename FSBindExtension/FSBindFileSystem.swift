@@ -7,7 +7,9 @@ final class FSBindFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         resource: FSResource,
         replyHandler: @escaping (FSProbeResult?, (any Error)?) -> Void
     ) {
-        guard resource is FSPathURLResource || resource is FSGenericURLResource else {
+        guard let resource = resource as? FSGenericURLResource,
+              resource.url.scheme?.lowercased() == "fsbind"
+        else {
             replyHandler(nil, POSIXError(.ENODEV))
             return
         }
@@ -21,16 +23,10 @@ final class FSBindFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         replyHandler: @escaping (FSVolume?, (any Error)?) -> Void
     ) {
         let resourceURL: URL
-        if let pathResource = resource as? FSPathURLResource {
-            resourceURL = pathResource.url
-        } else if let genericResource = resource as? FSGenericURLResource {
+        if let genericResource = resource as? FSGenericURLResource {
             resourceURL = genericResource.url
         } else {
             replyHandler(nil, POSIXError(.EINVAL))
-            return
-        }
-        if options.taskOptions.contains(where: { $0.contains("-f") }) {
-            replyHandler(nil, POSIXError(.ENOTSUP))
             return
         }
         do {

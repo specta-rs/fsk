@@ -139,7 +139,6 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = B9F1A2974B562FF486A0E03B /* Build configuration list for PBXNativeTarget "FSBindExtension" */;
 			buildPhases = (
-				0ECCFCED72F62948D3B8E34D /* Build Rust backend */,
 				85B3E995CD3BB3320B2606BD /* Sources */,
 			);
 			buildRules = (
@@ -157,7 +156,6 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 228B52B863EFAA4D69CC5789 /* Build configuration list for PBXNativeTarget "FSBindExtensionTests" */;
 			buildPhases = (
-				9B58B8AE8D851C4CDCB2C754 /* Build Rust backend */,
 				2E63EF084928414937D63A2A /* Sources */,
 			);
 			buildRules = (
@@ -202,47 +200,6 @@
 			);
 		};
 /* End PBXProject section */
-
-/* Begin PBXShellScriptBuildPhase section */
-		0ECCFCED72F62948D3B8E34D /* Build Rust backend */ = {
-			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-			);
-			name = "Build Rust backend";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\ncd \"$SRCROOT\"\nbuild_archs=\"$CURRENT_ARCH\"\nif [ \"$build_archs\" = \"undefined_arch\" ]; then\n  build_archs=\"${ARCHS:-$NATIVE_ARCH_ACTUAL}\"\nfi\nfor build_arch in $build_archs; do\n  case \"$build_arch\" in\n    arm64) rust_target=\"aarch64-apple-darwin\" ;;\n    x86_64) rust_target=\"x86_64-apple-darwin\" ;;\n    *) echo \"Unsupported architecture: $build_arch\" >&2; exit 1 ;;\n  esac\n  cargo build --release -p fsbind-memory-backend --target \"$rust_target\"\n  output_dir=\"$SRCROOT/target/xcode/$build_arch\"\n  mkdir -p \"$output_dir\"\n  cp \"$SRCROOT/target/$rust_target/release/libfsbind_memory_backend.a\" \"$output_dir/\"\ndone\n";
-		};
-		9B58B8AE8D851C4CDCB2C754 /* Build Rust backend */ = {
-			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-			);
-			name = "Build Rust backend";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\ncd \"$SRCROOT\"\nbuild_archs=\"$CURRENT_ARCH\"\nif [ \"$build_archs\" = \"undefined_arch\" ]; then\n  build_archs=\"${ARCHS:-$NATIVE_ARCH_ACTUAL}\"\nfi\nfor build_arch in $build_archs; do\n  case \"$build_arch\" in\n    arm64) rust_target=\"aarch64-apple-darwin\" ;;\n    x86_64) rust_target=\"x86_64-apple-darwin\" ;;\n    *) echo \"Unsupported architecture: $build_arch\" >&2; exit 1 ;;\n  esac\n  cargo build --release -p fsbind-memory-backend --target \"$rust_target\"\n  output_dir=\"$SRCROOT/target/xcode/$build_arch\"\n  mkdir -p \"$output_dir\"\n  cp \"$SRCROOT/target/$rust_target/release/libfsbind_memory_backend.a\" \"$output_dir/\"\ndone\n";
-		};
-/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		2E63EF084928414937D63A2A /* Sources */ = {
@@ -292,23 +249,13 @@
 				BUNDLE_LOADER = "";
 				COMBINE_HIDPI_IMAGES = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				HEADER_SEARCH_PATHS = (
-					"$(SRCROOT)/include",
-				);
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 					"@loader_path/../Frameworks",
 				);
-				LIBRARY_SEARCH_PATHS = (
-					"$(SRCROOT)/target/xcode/$(CURRENT_ARCH)",
-				);
-				OTHER_LDFLAGS = (
-					"-lfsbind_memory_backend",
-				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.specta.fsbind.tests;
 				SDKROOT = macosx;
-				SWIFT_OBJC_BRIDGING_HEADER = "FSBindExtension/FSBindExtension-Bridging-Header.h";
 				TEST_HOST = "";
 			};
 			name = Release;
@@ -319,27 +266,16 @@
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_ENTITLEMENTS = FSBindExtension/FSBindExtension.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
-				HEADER_SEARCH_PATHS = (
-					"$(SRCROOT)/include",
-				);
 				INFOPLIST_FILE = FSBindExtension/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
-				);
-				LIBRARY_SEARCH_PATHS = (
-					"$(SRCROOT)/target/xcode/$(CURRENT_ARCH)",
-				);
-				OTHER_LDFLAGS = (
-					"-lfsbind_memory_backend",
-					"-Wl,-dead_strip",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.specta.fsbind.extension;
 				PRODUCT_NAME = FSBindExtension;
 				PROVISIONING_PROFILE_SPECIFIER = "$(FSBIND_EXTENSION_PROFILE)";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
-				SWIFT_OBJC_BRIDGING_HEADER = "FSBindExtension/FSBindExtension-Bridging-Header.h";
 			};
 			name = Release;
 		};
@@ -391,27 +327,16 @@
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_ENTITLEMENTS = FSBindExtension/FSBindExtension.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
-				HEADER_SEARCH_PATHS = (
-					"$(SRCROOT)/include",
-				);
 				INFOPLIST_FILE = FSBindExtension/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
-				);
-				LIBRARY_SEARCH_PATHS = (
-					"$(SRCROOT)/target/xcode/$(CURRENT_ARCH)",
-				);
-				OTHER_LDFLAGS = (
-					"-lfsbind_memory_backend",
-					"-Wl,-dead_strip",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.specta.fsbind.extension;
 				PRODUCT_NAME = FSBindExtension;
 				PROVISIONING_PROFILE_SPECIFIER = "$(FSBIND_EXTENSION_PROFILE)";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
-				SWIFT_OBJC_BRIDGING_HEADER = "FSBindExtension/FSBindExtension-Bridging-Header.h";
 			};
 			name = Debug;
 		};
@@ -421,23 +346,13 @@
 				BUNDLE_LOADER = "";
 				COMBINE_HIDPI_IMAGES = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				HEADER_SEARCH_PATHS = (
-					"$(SRCROOT)/include",
-				);
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 					"@loader_path/../Frameworks",
 				);
-				LIBRARY_SEARCH_PATHS = (
-					"$(SRCROOT)/target/xcode/$(CURRENT_ARCH)",
-				);
-				OTHER_LDFLAGS = (
-					"-lfsbind_memory_backend",
-				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.specta.fsbind.tests;
 				SDKROOT = macosx;
-				SWIFT_OBJC_BRIDGING_HEADER = "FSBindExtension/FSBindExtension-Bridging-Header.h";
 				TEST_HOST = "";
 			};
 			name = Debug;

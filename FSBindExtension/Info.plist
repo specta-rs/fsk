@@ -40,12 +40,11 @@
         <key>FSSupportedSchemes</key>
         <array>
             <string>fsbind</string>
-            <string>https</string>
         </array>
         <key>FSSupportsBlockResources</key>
         <false/>
         <key>FSSupportsPathURLs</key>
-        <true/>
+        <false/>
     </dict>
 </dict>
 </plist>

@@ -39,27 +39,6 @@ targets:
     platform: macOS
     sources:
       - FSBindExtension
-    preBuildScripts:
-      - name: Build Rust backend
-        script: |
-          set -euo pipefail
-          cd "$SRCROOT"
-          build_archs="$CURRENT_ARCH"
-          if [ "$build_archs" = "undefined_arch" ]; then
-            build_archs="${ARCHS:-$NATIVE_ARCH_ACTUAL}"
-          fi
-          for build_arch in $build_archs; do
-            case "$build_arch" in
-              arm64) rust_target="aarch64-apple-darwin" ;;
-              x86_64) rust_target="x86_64-apple-darwin" ;;
-              *) echo "Unsupported architecture: $build_arch" >&2; exit 1 ;;
-            esac
-            cargo build --release -p fsbind-memory-backend --target "$rust_target"
-            output_dir="$SRCROOT/target/xcode/$build_arch"
-            mkdir -p "$output_dir"
-            cp "$SRCROOT/target/$rust_target/release/libfsbind_memory_backend.a" "$output_dir/"
-          done
-        basedOnDependencyAnalysis: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.specta.fsbind.extension
@@ -67,14 +46,6 @@ targets:
         PROVISIONING_PROFILE_SPECIFIER: "$(FSBIND_EXTENSION_PROFILE)"
         INFOPLIST_FILE: FSBindExtension/Info.plist
         CODE_SIGN_ENTITLEMENTS: FSBindExtension/FSBindExtension.entitlements
-        SWIFT_OBJC_BRIDGING_HEADER: FSBindExtension/FSBindExtension-Bridging-Header.h
-        HEADER_SEARCH_PATHS:
-          - "$(SRCROOT)/include"
-        LIBRARY_SEARCH_PATHS:
-          - "$(SRCROOT)/target/xcode/$(CURRENT_ARCH)"
-        OTHER_LDFLAGS:
-          - "-lfsbind_memory_backend"
-          - "-Wl,-dead_strip"
         SKIP_INSTALL: YES
         APPLICATION_EXTENSION_API_ONLY: YES
 
@@ -87,37 +58,9 @@ targets:
         buildPhase: sources
       - path: FSBindExtension/FSBindItem.swift
         buildPhase: sources
-    preBuildScripts:
-      - name: Build Rust backend
-        script: |
-          set -euo pipefail
-          cd "$SRCROOT"
-          build_archs="$CURRENT_ARCH"
-          if [ "$build_archs" = "undefined_arch" ]; then
-            build_archs="${ARCHS:-$NATIVE_ARCH_ACTUAL}"
-          fi
-          for build_arch in $build_archs; do
-            case "$build_arch" in
-              arm64) rust_target="aarch64-apple-darwin" ;;
-              x86_64) rust_target="x86_64-apple-darwin" ;;
-              *) echo "Unsupported architecture: $build_arch" >&2; exit 1 ;;
-            esac
-            cargo build --release -p fsbind-memory-backend --target "$rust_target"
-            output_dir="$SRCROOT/target/xcode/$build_arch"
-            mkdir -p "$output_dir"
-            cp "$SRCROOT/target/$rust_target/release/libfsbind_memory_backend.a" "$output_dir/"
-          done
-        basedOnDependencyAnalysis: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.specta.fsbind.tests
         GENERATE_INFOPLIST_FILE: YES
-        SWIFT_OBJC_BRIDGING_HEADER: FSBindExtension/FSBindExtension-Bridging-Header.h
-        HEADER_SEARCH_PATHS:
-          - "$(SRCROOT)/include"
-        LIBRARY_SEARCH_PATHS:
-          - "$(SRCROOT)/target/xcode/$(CURRENT_ARCH)"
-        OTHER_LDFLAGS:
-          - "-lfsbind_memory_backend"
         TEST_HOST: ""
         BUNDLE_LOADER: ""

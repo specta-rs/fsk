@@ -1,16 +1,21 @@
-//! A small, allocation-conscious interface for implementing macOS `FSKit` volumes in Rust.
+//! An allocation-conscious interface for implementing macOS `FSKit` volumes in Rust.
 //!
-//! Backends implement [`Filesystem`]. The [`export_filesystem!`] macro turns a factory
-//! into the stable C ABI consumed by the Swift `FSKit` extension.
+//! Backends implement [`Filesystem`] and create a [`MountSession`]. One installed Swift
+//! extension can serve any number of Rust processes over private local IPC.
 
+mod authorization;
 mod ffi;
+mod ipc;
 mod memory;
+mod mount;
 mod network;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use authorization::{AuthorizationStatus, authorization_status, open_authorization_app};
 pub use ffi::{FsbAttributes, FsbDirEntry, FsbSetAttributes, FsbStatFs};
 pub use memory::MemoryFileSystem;
+pub use mount::{MountOptions, MountSession};
 pub use network::{
     KernelCachePolicy, LocalFile, Mount, NetworkConfiguration, NetworkFile, NetworkFilesystem,
 };
