@@ -450,8 +450,7 @@ private final class IPCConnection {
         header.append(requestID)
         header.append(UInt32(body.count))
         header.append(UInt32(0))
-        try writeAll(header.data)
-        try writeAll(body)
+        try writePair(header.data, body)
 
         let responseHeader = try readExactly(ipcHeaderLength)
         var decoder = IPCDecoder(responseHeader)
@@ -473,6 +472,16 @@ private final class IPCConnection {
     }
 
     private func connect(path: String) throws {
+        var noSignal: Int32 = 1
+        guard setsockopt(
+            descriptor,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            &noSignal,
+            socklen_t(MemoryLayout<Int32>.size)
+        ) == 0 else {
+            throw RustBackendError.posix(errno)
+        }
         let bytes = Array(path.utf8CString)
         guard bytes.count <= MemoryLayout.size(ofValue: sockaddr_un().sun_path) else {
             throw RustBackendError.posix(ENAMETOOLONG)
@@ -503,6 +512,45 @@ private final class IPCConnection {
                 if count < 0 && errno == EINTR { continue }
                 guard count > 0 else { throw RustBackendError.posix(errno == 0 ? EPIPE : errno) }
                 offset += count
+            }
+        }
+    }
+
+    private func writePair(_ header: Data, _ body: Data) throws {
+        if body.isEmpty {
+            try writeAll(header)
+            return
+        }
+        try header.withUnsafeBytes { headerBytes in
+            try body.withUnsafeBytes { bodyBytes in
+                var vectors = [
+                    iovec(
+                        iov_base: UnsafeMutableRawPointer(mutating: headerBytes.baseAddress),
+                        iov_len: headerBytes.count
+                    ),
+                    iovec(
+                        iov_base: UnsafeMutableRawPointer(mutating: bodyBytes.baseAddress),
+                        iov_len: bodyBytes.count
+                    ),
+                ]
+                let count = Darwin.writev(descriptor, &vectors, 2)
+                if count < 0 && errno == EINTR {
+                    try writeAll(header)
+                    try writeAll(body)
+                    return
+                }
+                guard count > 0 else {
+                    throw RustBackendError.posix(errno == 0 ? EPIPE : errno)
+                }
+                if count < headerBytes.count {
+                    try writeAll(header.subdata(in: count..<headerBytes.count))
+                    try writeAll(body)
+                } else {
+                    let bodyOffset = count - headerBytes.count
+                    if bodyOffset < bodyBytes.count {
+                        try writeAll(body.subdata(in: bodyOffset..<bodyBytes.count))
+                    }
+                }
             }
         }
     }

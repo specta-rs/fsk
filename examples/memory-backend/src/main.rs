@@ -1,4 +1,6 @@
-use fsbind::{AuthorizationStatus, MountSession, authorization_status, open_authorization_app};
+use fsbind::MountSession;
+#[cfg(target_os = "macos")]
+use fsbind::{AuthorizationStatus, authorization_status, open_authorization_app};
 use std::{
     env, io,
     sync::{
@@ -17,22 +19,7 @@ fn main() -> io::Result<()> {
         )
     })?;
 
-    match authorization_status()? {
-        AuthorizationStatus::Authorized => {}
-        AuthorizationStatus::NeedsApproval => {
-            open_authorization_app()?;
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "enable FSBind in the window that opened, then run this command again",
-            ));
-        }
-        AuthorizationStatus::NotInstalled => {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "install FSBind.app in /Applications before mounting",
-            ));
-        }
-    }
+    check_platform_authorization()?;
 
     let session = MountSession::mount(fsbind_memory_backend::filesystem(), &mount_path)?;
     println!(
@@ -50,5 +37,29 @@ fn main() -> io::Result<()> {
 
     // MountSession's Drop implementation unmounts and removes its socket.
     drop(session);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn check_platform_authorization() -> io::Result<()> {
+    match authorization_status()? {
+        AuthorizationStatus::Authorized => Ok(()),
+        AuthorizationStatus::NeedsApproval => {
+            open_authorization_app()?;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "enable FSBind in the window that opened, then run this command again",
+            ))
+        }
+        AuthorizationStatus::NotInstalled => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "install FSBind.app in /Applications before mounting",
+        )),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)]
+fn check_platform_authorization() -> io::Result<()> {
     Ok(())
 }

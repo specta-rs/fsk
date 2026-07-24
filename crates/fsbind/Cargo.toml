@@ -1,7 +1,7 @@
 [package]
 name = "fsbind"
 version = "0.1.0"
-description = "Build high-performance local and network filesystems with macOS FSKit and Rust"
+description = "High-performance virtual and network filesystems for macOS, Linux, and Windows"
 authors = ["Oscar Beaumont <oscar@otbeaumont.me>"]
 edition.workspace = true
 license.workspace = true
@@ -9,18 +9,31 @@ rust-version.workspace = true
 repository = "https://github.com/specta-rs/fsbind"
 documentation = "https://docs.rs/fsbind/latest/fsbind"
 readme = "../../README.md"
-keywords = ["fskit", "filesystem", "macos", "ffi", "network"]
-categories = ["api-bindings", "filesystem", "os::macos-apis"]
+keywords = ["filesystem", "virtual-filesystem", "fuse", "fskit", "projfs"]
+categories = ["api-bindings", "filesystem"]
 include = ["/src", "/examples", "/Cargo.toml"]
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
 
 [dependencies]
 dashmap = "6.1"
 parking_lot = "0.12"
 libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.17", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_ProjectedFileSystem",
+    "Win32_System_Com",
+    "Win32_System_IO",
+] }
 
 [dev-dependencies]
 proptest = "1.7"

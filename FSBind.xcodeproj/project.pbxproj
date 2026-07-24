@@ -54,7 +54,6 @@
 		59464E5F5CBD448AEE06DC3F /* FSBindExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FSBindExtension.swift; sourceTree = "<group>"; };
 		6F86BB1F7D048E3A4D102EEE /* RustBackendTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustBackendTests.swift; sourceTree = "<group>"; };
 		85208C0606D2C9FEF039DEE6 /* FSBindExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FSBindExtension.entitlements; sourceTree = "<group>"; };
-		8B8EE1E96C360C80EB402F45 /* FSBindExtension-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "FSBindExtension-Bridging-Header.h"; sourceTree = "<group>"; };
 		B3D3D9D05A0FE8D900C6A987 /* FSBindApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FSBindApp.entitlements; sourceTree = "<group>"; };
 		D37FEE763C2CAF87B175A333 /* FSBindExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.extensionkit-extension"; includeInIndex = 0; path = FSBindExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		DBDE431B6133C3A049812DA1 /* FSBindItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FSBindItem.swift; sourceTree = "<group>"; };
@@ -91,7 +90,6 @@
 		7C7D103D5717B49C0DDD71AC /* FSBindExtension */ = {
 			isa = PBXGroup;
 			children = (
-				8B8EE1E96C360C80EB402F45 /* FSBindExtension-Bridging-Header.h */,
 				85208C0606D2C9FEF039DEE6 /* FSBindExtension.entitlements */,
 				59464E5F5CBD448AEE06DC3F /* FSBindExtension.swift */,
 				423DFD0A6619E0E070C6A1F1 /* FSBindFileSystem.swift */,

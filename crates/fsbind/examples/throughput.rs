@@ -52,12 +52,19 @@ fn main() {
     let gib_per_second = reads_per_second * f64::from(u32::try_from(read_buffer.len()).unwrap())
         / (1024.0 * 1024.0 * 1024.0);
 
-    let start = Instant::now();
     let mut sink = CountingSink(0);
-    let result = filesystem
-        .read_directory(ROOT_INODE, 0, 0, &mut sink)
-        .unwrap();
+    let directory_iterations = 1_000;
+    let start = Instant::now();
+    let mut result = None;
+    for _ in 0..directory_iterations {
+        result = Some(
+            filesystem
+                .read_directory(ROOT_INODE, 0, 0, &mut sink)
+                .unwrap(),
+        );
+    }
     let directory_time = start.elapsed();
+    let result = result.unwrap();
 
     println!("lookup: {lookups_per_second:.0} ops/s ({lookup_time:?} for 1,000,000)");
     println!("read:   {gib_per_second:.2} GiB/s ({read_time:?} for 512 MiB)");

@@ -8,6 +8,7 @@ pub struct Mount {
 }
 
 impl Mount {
+    #[cfg(target_os = "macos")]
     pub(crate) fn new(resource_url: Vec<u8>) -> Self {
         Self { resource_url }
     }

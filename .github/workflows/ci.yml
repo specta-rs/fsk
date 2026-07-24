@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  macos:
     runs-on: macos-26
     timeout-minutes: 30
 
@@ -32,3 +32,26 @@ jobs:
 
       - name: Verify crate package
         run: cargo package -p fsbind
+
+  rust-platforms:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+          - name: Windows
+            os: windows-2025
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Test
+        run: cargo test --workspace --all-targets
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings

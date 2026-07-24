@@ -1,6 +1,7 @@
 use crate::{
     DirectoryEntry, DirectorySink, Error, FileType, Filesystem, NetworkFile, NetworkFilesystem,
     ReadDirectoryResult, SetMetadata,
+    raw::{Caller, NativeRequest, Operation, Platform, RawEvent, RawEventMask, RawOutcome},
 };
 use parking_lot::Mutex;
 use std::{
@@ -62,24 +63,29 @@ impl ServiceBackend {
 pub(crate) struct Service {
     backend: ServiceBackend,
     token: [u8; 32],
+    raw_mask: RawEventMask,
     leases: Mutex<HashMap<u64, (u64, NetworkFile)>>,
     next_lease: AtomicU64,
 }
 
 impl Service {
     pub(crate) fn local(filesystem: impl Filesystem, token: [u8; 32]) -> Self {
+        let raw_mask = filesystem.raw_event_mask();
         Self {
             backend: ServiceBackend::Local(Arc::new(filesystem)),
             token,
+            raw_mask,
             leases: Mutex::new(HashMap::new()),
             next_lease: AtomicU64::new(1),
         }
     }
 
     pub(crate) fn network(filesystem: impl NetworkFilesystem, token: [u8; 32]) -> Self {
+        let raw_mask = filesystem.raw_event_mask();
         Self {
             backend: ServiceBackend::Network(Arc::new(filesystem)),
             token,
+            raw_mask,
             leases: Mutex::new(HashMap::new()),
             next_lease: AtomicU64::new(1),
         }
@@ -112,7 +118,7 @@ impl Service {
                 Err(error) => return Err(error),
             };
             let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.dispatch(operation, &payload)
+                self.dispatch(request_id, operation, &payload)
             }))
             .unwrap_or(Err(Error::IO));
             match response {
@@ -123,8 +129,31 @@ impl Service {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn dispatch(&self, operation: u16, payload: &[u8]) -> crate::Result<Vec<u8>> {
+    fn dispatch(&self, request_id: u64, operation: u16, payload: &[u8]) -> crate::Result<Vec<u8>> {
         let fs = self.backend.filesystem();
+        if let Some(raw_operation) = raw_operation(operation)
+            && self.raw_mask.contains(raw_operation)
+        {
+            let item_id = payload
+                .get(..8)
+                .and_then(|value| value.try_into().ok())
+                .map_or(0, u64::from_le_bytes);
+            let event = RawEvent {
+                platform: Platform::MacOS,
+                operation: raw_operation,
+                caller: Caller::default(),
+                native: NativeRequest::MacOS {
+                    request_id,
+                    item_id,
+                    flags: 0,
+                    payload,
+                },
+                buffer: None,
+            };
+            if let RawOutcome::Reject(error) = fs.raw_event(event) {
+                return Err(error);
+            }
+        }
         let mut input = Decoder::new(payload);
         match operation {
             opcode::CONFIGURATION => {
@@ -305,6 +334,27 @@ impl Service {
     }
 }
 
+fn raw_operation(operation: u16) -> Option<Operation> {
+    Some(match operation {
+        opcode::STATFS => Operation::StatFs,
+        opcode::GETATTR => Operation::Metadata,
+        opcode::SETATTR => Operation::SetMetadata,
+        opcode::LOOKUP => Operation::Lookup,
+        opcode::READDIR => Operation::ReadDirectory,
+        opcode::READ => Operation::Read,
+        opcode::WRITE => Operation::Write,
+        opcode::CREATE => Operation::Create,
+        opcode::SYMLINK => Operation::Symlink,
+        opcode::READLINK => Operation::ReadLink,
+        opcode::REMOVE => Operation::Remove,
+        opcode::RENAME => Operation::Rename,
+        opcode::SYNC => Operation::Synchronize,
+        opcode::OPEN => Operation::Open,
+        opcode::CLOSE => Operation::Close,
+        _ => return None,
+    })
+}
+
 impl Drop for Service {
     fn drop(&mut self) {
         let Some(network) = self.backend.network() else {
@@ -439,8 +489,15 @@ fn write_response(
             "response exceeds protocol limit",
         )
     })?);
-    stream.write_all(&header.finish())?;
-    stream.write_all(payload)
+    let header = header.finish();
+    let slices = [io::IoSlice::new(&header), io::IoSlice::new(payload)];
+    let written = stream.write_vectored(&slices)?;
+    if written < header.len() {
+        stream.write_all(&header[written..])?;
+        stream.write_all(payload)
+    } else {
+        stream.write_all(&payload[written - header.len()..])
+    }
 }
 
 pub(crate) struct Encoder(Vec<u8>);
@@ -562,6 +619,40 @@ mod tests {
         });
         send_request(&mut client, 1, opcode::HELLO, &[8; 32]);
         assert_eq!(read_test_response(&mut client).0, libc::EACCES);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --release --ignored --nocapture"]
+    fn benchmark_authenticated_ipc_lookup_roundtrip() {
+        let filesystem = MemoryFileSystem::new();
+        filesystem
+            .create(ROOT_INODE, b"entry", FileType::File, 0o644)
+            .unwrap();
+        let token = [7; 32];
+        let service = Arc::new(Service::local(filesystem, token));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || service.serve_connection(server).unwrap());
+        send_request(&mut client, 1, opcode::HELLO, &token);
+        assert_eq!(read_test_response(&mut client).0, 0);
+
+        let mut request = Encoder::with_capacity(13);
+        request.u64(ROOT_INODE);
+        request.bytes(b"entry");
+        let request = request.finish();
+        let iterations = 100_000_u32;
+        let start = std::time::Instant::now();
+        for index in 0..iterations {
+            send_request(&mut client, u64::from(index) + 2, opcode::LOOKUP, &request);
+            assert_eq!(read_test_response(&mut client).0, 0);
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "authenticated IPC lookup: {:.0} roundtrips/s ({:.1} µs/roundtrip)",
+            f64::from(iterations) / elapsed.as_secs_f64(),
+            elapsed.as_secs_f64() * 1_000_000.0 / f64::from(iterations)
+        );
+        drop(client);
         worker.join().unwrap();
     }
 

@@ -1,77 +1,38 @@
 # FSBind
 
-FSBind is a working macOS FSKit extension whose filesystem implementation lives
-in Rust. It provides:
+FSBind is a high-performance Rust library for building virtual and network
+filesystems on macOS, Linux, and Windows from one data model.
 
-- a small Rust `Filesystem` trait for downstream backends;
-- a `NetworkFilesystem: Filesystem` trait for lazy remote volumes and
-  backend-owned downloaded files;
-- a stable, versioned binary protocol over authenticated Unix sockets;
-- a reusable Swift adapter that can serve any number of Rust processes;
-- a concurrent in-memory backend that is useful as a starter implementation;
-- a host app and ExtensionKit extension generated with XcodeGen;
-- Rust and Swift cross-language tests.
+- macOS: FSKit extension with an install-once Swift bridge.
+- Linux: multithreaded kernel FUSE adapter.
+- Windows: native ProjFS provider for lazy virtual and network trees.
+- Rust: `Filesystem` and `NetworkFilesystem: Filesystem` traits.
+- Native access: opt-in borrowed FSKit, FUSE, and Windows event contexts.
 
-The Swift app is built and approved once. Each Rust CLI then owns its filesystem
-implementation and mount lifetime independently.
+The common API stays deliberately small. Backends identify items with stable
+64-bit inode values, stream directory entries into a caller-owned sink, and
+read directly into caller-provided buffers. Names are arbitrary bytes on Unix
+and WTF-8 on Windows, preserving Windows UTF-16 names including unpaired
+surrogates.
 
-## Requirements
+## Platform support
 
-- macOS 26 or later
-- Xcode 26 with the macOS 26 SDK
-- Rust 1.85 or later with the target for the build architecture
-- XcodeGen 2.45 or later
-- an Apple development team that can sign the
-  `com.apple.developer.fskit.fsmodule` entitlement
+| Platform | Native layer | Model | Installation |
+|---|---|---|---|
+| macOS 26+ | FSKit | Full virtual filesystem; lazy network support | Install and authorize `FSBind.app` once |
+| Linux | FUSE kernel protocol through `fuser` | Full virtual filesystem; lazy network support | FUSE must be available |
+| Windows 10 1809+ | ProjFS | Lazy projected tree with Windows-managed local cache | Enable the Projected File System optional component |
 
-The macOS 26 requirement comes from the path-URL resource used to mount a
-resource-independent virtual filesystem. The Rust crate itself has no Apple
-framework dependency.
+ProjFS intentionally merges projected entries with local files. Writes and
+hydrated content live in its virtualization root, while providers receive
+native notifications through the raw hook. This is a particularly good fit for
+source-control, cloud, content-addressed, and other network-backed trees. A
+fully synthetic Windows filesystem with provider-owned write semantics would
+use WinFsp; FSBind exposes the Windows-native callback context in a form that
+does not prevent a WinFsp adapter from being added without changing the common
+model.
 
-## Build and test
-
-```sh
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
-xcodegen generate
-xcodebuild \
-  -project FSBind.xcodeproj \
-  -scheme FSBindApp \
-  -derivedDataPath DerivedData \
-  CODE_SIGNING_ALLOWED=NO \
-  test
-```
-
-Or run `scripts/check.sh`. Code-signing is intentionally disabled for CI tests;
-mounting requires a normally signed build from Xcode.
-
-## Install the bridge and mount the example
-
-1. Open `FSBind.xcodeproj`, select a development team for both the app and
-   extension, then build and run `FSBindApp`.
-2. In **System Settings > General > Login Items & Extensions > File System
-   Extensions**, enable **FSBind virtual file system**.
-3. Build and run the Rust example:
-
-```sh
-mkdir -p "$HOME/fsbind-mount"
-cargo run -p fsbind-memory-backend -- "$HOME/fsbind-mount"
-```
-
-In another terminal:
-
-```sh
-ls -la "$HOME/fsbind-mount"
-cat "$HOME/fsbind-mount/hello.txt"
-```
-
-Press Control-C in the first terminal to unmount. `MountSession` owns the
-registration: dropping it unmounts the path, stops its IPC service, closes
-backend leases, and removes the private socket.
-
-## Create a downstream filesystem
-
-Implement `Filesystem`, then keep a `MountSession` alive in your CLI:
+## Implement a filesystem
 
 ```rust
 use fsbind::{Filesystem, MountSession};
@@ -79,55 +40,72 @@ use fsbind::{Filesystem, MountSession};
 struct MyCoolFilesystem;
 
 impl Filesystem for MyCoolFilesystem {
-    // Implement the required operations.
-    # fn statfs(&self) -> fsbind::Result<fsbind::StatFs> { unimplemented!() }
-    # fn metadata(&self, _: u64) -> fsbind::Result<fsbind::Metadata> { unimplemented!() }
-    # fn lookup(&self, _: u64, _: &[u8]) -> fsbind::Result<(u64, fsbind::FileType)> { unimplemented!() }
-    # fn read_directory(&self, _: u64, _: u64, _: u64, _: &mut dyn fsbind::DirectorySink) -> fsbind::Result<fsbind::ReadDirectoryResult> { unimplemented!() }
-    # fn read(&self, _: u64, _: u64, _: &mut [u8]) -> fsbind::Result<usize> { unimplemented!() }
+    fn statfs(&self) -> fsbind::Result<fsbind::StatFs> {
+        todo!()
+    }
+
+    fn metadata(&self, inode: u64) -> fsbind::Result<fsbind::Metadata> {
+        todo!()
+    }
+
+    fn lookup(
+        &self,
+        parent: u64,
+        name: &[u8],
+    ) -> fsbind::Result<(u64, fsbind::FileType)> {
+        todo!()
+    }
+
+    fn read_directory(
+        &self,
+        inode: u64,
+        cookie: u64,
+        verifier: u64,
+        sink: &mut dyn fsbind::DirectorySink,
+    ) -> fsbind::Result<fsbind::ReadDirectoryResult> {
+        todo!()
+    }
+
+    fn read(
+        &self,
+        inode: u64,
+        offset: u64,
+        output: &mut [u8],
+    ) -> fsbind::Result<usize> {
+        todo!()
+    }
 }
 
-let mount = MountSession::mount(MyCoolFilesystem, "/Volumes/MyCoolFilesystem")?;
-// Run the CLI. Dropping `mount` unmounts it.
+let mount = MountSession::mount(MyCoolFilesystem, "/path/to/mount")?;
+// Keep `mount` alive. Dropping it unregisters/unmounts the filesystem.
 # Ok::<(), std::io::Error>(())
 ```
 
-For a database, remote service, archive, or content-addressed store, implement
-`fsbind::Filesystem` on your own `Send + Sync` type. Read-only backends only
-need to implement `statfs`, `metadata`, `lookup`, `read_directory`, and `read`;
-mutating methods default to `ENOTSUP`. Names are byte slices rather than UTF-8
-strings because FSKit filenames are not guaranteed to be valid UTF-8.
+The required methods are sufficient for a read-only filesystem. Mutation
+methods default to `ENOTSUP`. Methods can run concurrently, so implementations
+must be `Send + Sync`.
 
-No Rust code is linked into the app or extension. Multiple CLIs can mount
-different implementations simultaneously through the same installed bridge.
+The memory example is a complete CLI:
 
-### Network filesystems
+```sh
+cargo run -p fsbind-memory-backend -- /path/to/mount
+```
 
-Network backends implement the parent trait and then opt into network behavior:
+Control-C performs an orderly unmount. The same executable builds against the
+native adapter selected by its target OS.
+
+## Network filesystems and downloaded files
 
 ```rust
-use fsbind::{
-    Filesystem, LocalFile, Mount, NetworkFile, NetworkFilesystem, Result,
-};
-
-struct MyCoolFilesystem {
-    // remote client, metadata cache, download manager, ...
-}
-
-impl Filesystem for MyCoolFilesystem {
-    // statfs, metadata, lookup, read_directory and read are resolved lazily.
-    // Implement the required methods here.
-    # fn statfs(&self) -> Result<fsbind::StatFs> { unimplemented!() }
-    # fn metadata(&self, _: u64) -> Result<fsbind::Metadata> { unimplemented!() }
-    # fn lookup(&self, _: u64, _: &[u8]) -> Result<(u64, fsbind::FileType)> { unimplemented!() }
-    # fn read_directory(&self, _: u64, _: u64, _: u64, _: &mut dyn fsbind::DirectorySink) -> Result<fsbind::ReadDirectoryResult> { unimplemented!() }
-    # fn read(&self, _: u64, _: u64, _: &mut [u8]) -> Result<usize> { unimplemented!() }
-}
+use fsbind::{LocalFile, NetworkFile, NetworkFilesystem};
 
 impl NetworkFilesystem for MyCoolFilesystem {
-    fn open_file(&self, inode: u64, _writable: bool) -> Result<NetworkFile> {
+    fn open_file(
+        &self,
+        inode: u64,
+        _writable: bool,
+    ) -> fsbind::Result<NetworkFile> {
         if let Some(download) = self.downloaded_file(inode) {
-            // The path remains owned by this backend.
             return Ok(NetworkFile::Local(LocalFile::new(
                 download.path,
                 download.generation,
@@ -136,9 +114,11 @@ impl NetworkFilesystem for MyCoolFilesystem {
         Ok(NetworkFile::Remote)
     }
 
-    fn close_file(&self, inode: u64, file: NetworkFile) -> Result<()> {
-        // Swift has closed its descriptor. Update last-access state or schedule
-        // removal according to your own cache policy.
+    fn close_file(
+        &self,
+        inode: u64,
+        file: NetworkFile,
+    ) -> fsbind::Result<()> {
         self.download_manager.file_closed(inode, file);
         Ok(())
     }
@@ -146,24 +126,173 @@ impl NetworkFilesystem for MyCoolFilesystem {
 
 let mount = fsbind::MountSession::mount_network(
     MyCoolFilesystem::connect()?,
-    "/Volumes/MyNetworkFilesystem",
+    "/path/to/mount",
 )?;
 # Ok::<(), std::io::Error>(())
 ```
 
-`open_file` does not implicitly download anything. A backend returns
-`NetworkFile::Local` only when its own download manager has explicitly
-materialized that inode; otherwise `Filesystem::read` remains the lazy remote
-path. The local file is leased until `close_file`. Swift closes its descriptor
-before that callback, so the backend remains responsible for last-access
-tracking and eviction.
+`NetworkFile::Remote` keeps reads lazy through `Filesystem::read`.
+`NetworkFile::Local` leases an explicitly downloaded file until `close_file`,
+letting the backend track activity and perform its own eviction.
 
-See [the complete network example](examples/network-backend/src/lib.rs).
+- macOS reads leased local files with `pread`, bypassing IPC.
+- Linux reads the local descriptor directly on its FUSE worker.
+- Windows ProjFS manages its virtualization root as the local hydration cache.
 
-### Permission checks
+## Native requests without default overhead
 
-The CLI can ask the Swift app for FSKit's authoritative enabled state and open
-the authorization guide when needed:
+Implementers can inspect platform-specific events without forcing every
+filesystem through an allocation-heavy universal request object:
+
+```rust
+use fsbind::raw::{
+    NativeRequest, Operation, RawEvent, RawEventMask, RawOutcome,
+};
+
+impl Filesystem for MyCoolFilesystem {
+    // common methods...
+
+    fn raw_event_mask(&self) -> RawEventMask {
+        RawEventMask::operation(Operation::Open)
+            .union(RawEventMask::operation(Operation::Write))
+    }
+
+    fn raw_event(&self, event: RawEvent<'_>) -> RawOutcome {
+        match event.native {
+            NativeRequest::Linux {
+                request,
+                unique,
+                file_handle,
+                flags,
+            } => {
+                // `request` points to the borrowed fuser::Request.
+            }
+            NativeRequest::Windows {
+                callback_data,
+                namespace_context,
+                command_id,
+                flags,
+            } => {
+                // Live PRJ_CALLBACK_DATA and virtualization context.
+            }
+            NativeRequest::MacOS {
+                request_id,
+                item_id,
+                flags,
+                payload,
+            } => {
+                // Exact borrowed bridge payload and stable FSKit identifiers.
+            }
+        }
+        RawOutcome::Continue
+    }
+}
+```
+
+The mask is fetched once when mounting. When it is empty, adapters take one
+predictable bit test and do not construct an event or call the hook. Buffers
+are borrowed in place:
+
+- Linux exposes the live `fuser::Request` and read/write buffer.
+- Windows exposes `PRJ_CALLBACK_DATA`, namespace context, command ID, and
+  ProjFS-aligned hydration buffer.
+- macOS exposes exact bridge payloads, request/item identifiers, and flags.
+  FSKit Objective-C pointers cannot be validly exposed to a separate Rust
+  process, so the bridge never presents unsafe cross-process pointer values.
+
+Raw pointers and buffers are valid only for the synchronous hook call.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    C["Filesystem / NetworkFilesystem"] --> A["Platform adapter"]
+    A --> L["Linux FUSE"]
+    A --> W["Windows ProjFS"]
+    A --> M["macOS FSKit IPC"]
+    M --> S["Install-once Swift extension"]
+```
+
+macOS mounts use a mode-0600 Unix socket in the FSBind App Group container and
+a random per-mount capability. The extension pools up to one persistent
+connection per active CPU. Linux uses multiple FUSE event loops and
+`FUSE_DEV_IOC_CLONE` where available. Windows lets ProjFS select or configure
+native callback workers.
+
+## Performance
+
+The hot paths avoid serialization frameworks and per-item calls:
+
+- caller-owned read buffers and borrowed write buffers;
+- packed directory batches on macOS;
+- reusable thread-local FUSE read buffers on Linux;
+- ProjFS-aligned buffers written directly with `PrjWriteFileData` on Windows;
+- fixed little-endian IPC frames rather than JSON or Codable;
+- `writev` for macOS response headers and payloads;
+- stable directory cookies and mutation verifiers;
+- sharded inode storage with per-node reader/writer locks;
+- no raw-event allocation or virtual call unless its operation is enabled.
+
+Benchmarks on an Apple M1 Pro, using release builds:
+
+| Benchmark | Observed result |
+|---|---:|
+| In-memory lookup | 17.2 million operations/s median |
+| 128 KiB reads | 49.5 GiB/s median |
+| 10,001-entry directory | 403 million entries/s median |
+| Raw hooks disabled | Within run-to-run noise of direct dispatch |
+| Authenticated macOS IPC lookup | 188 thousand round trips/s median |
+
+Changing macOS response writes from two syscalls to vectored I/O improved the
+authenticated lookup result from a 162–169k baseline to 182–196k round trips/s
+(roughly 12–15% by median, depending on the run). A round trip is about
+5.1–5.5 µs on this machine.
+
+Run the same benchmarks locally:
+
+```sh
+cargo run --release -p fsbind --example throughput
+cargo run --release -p fsbind --example raw_overhead
+cargo test --release -p fsbind \
+  ipc::tests::benchmark_authenticated_ipc_lookup_roundtrip \
+  -- --ignored --nocapture
+```
+
+These isolate backend and dispatch costs. Mounted performance also includes the
+host kernel, FUSE/FSKit/ProjFS, cache state, and the downstream backend; use
+`fio`, Instruments, `fs_usage`, or platform equivalents for deployment-specific
+measurements.
+
+## Building and testing
+
+Rust requires version 1.85 or later.
+
+```sh
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+
+cargo check --workspace --all-targets \
+  --target x86_64-unknown-linux-gnu
+cargo check --workspace --all-targets \
+  --target x86_64-pc-windows-msvc
+```
+
+The CI matrix runs native Rust tests on macOS, Ubuntu, and Windows. The macOS
+job also generates the Xcode project and runs the Swift bridge tests.
+
+### macOS bridge
+
+macOS additionally requires Xcode 26, XcodeGen, and an Apple team capable of
+signing `com.apple.developer.fskit.fsmodule`.
+
+```sh
+xcodegen generate
+./scripts/check.sh
+```
+
+Install `FSBind.app`, then enable it under **System Settings → General → Login
+Items & Extensions → File System Extensions**. A CLI can query and open the
+authorization guide:
 
 ```rust
 match fsbind::authorization_status()? {
@@ -178,113 +307,36 @@ match fsbind::authorization_status()? {
 # Ok::<(), std::io::Error>(())
 ```
 
-Set `FSBIND_APP_PATH` to an app bundle outside `/Applications` during
-development. The app uses `FSClient` rather than guessing from process or
-filesystem state, and embeds macOS's own extension authorization control.
+Set `FSBIND_APP_PATH` while testing an app outside `/Applications`.
 
-## Architecture
+### Windows
 
-```mermaid
-flowchart LR
-    K["macOS VFS / FSKit"] --> S["Swift FSVolume adapter"]
-    S --> P["Pooled authenticated Unix sockets"]
-    P --> R["Rust CLI / Filesystem trait object"]
-    R --> M["Memory, database, remote, or custom backend"]
+Enable **Projected File System** in “Turn Windows features on or off”, or with
+an administrator shell:
+
+```powershell
+Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
 ```
 
-Each mount gets a cryptographically random capability and a mode-0600 socket in
-the FSBind application-group container. The capability is carried in the
-private FSKit resource URL and authenticated once per pooled connection. Rust
-panics are caught at the dispatch boundary and become `EIO`.
+ProjFS requires an empty or previously initialized virtualization root.
 
-## Performance design
+## Signed macOS releases
 
-- File reads write directly into FSKit's `FSMutableFileDataBuffer`.
-- File writes borrow Foundation `Data`; neither hot path creates an
-  intermediate Swift byte array.
-- One `readdir` response fills an array of fixed-size entry records and a packed
-  byte arena for names. There is no IPC round-trip or allocation per entry.
-- The extension maintains up to one persistent connection per active CPU
-  (bounded at 32), so unrelated FSKit callbacks execute concurrently without a
-  connect, authentication, or global-request lock on the hot path.
-- Frames use fixed little-endian headers and bounded binary payloads; there is
-  no JSON, Codable, string conversion, or dynamic symbol lookup.
-- Explicitly downloaded network files still use `pread` directly in the
-  extension and do not send file contents through IPC.
-- The memory backend uses a sharded inode map and per-node reader/writer locks,
-  so unrelated reads and writes proceed concurrently.
-- Namespace changes take one short mutex, making cross-directory rename atomic
-  without serializing ordinary lookup or I/O.
-- Directory lookup is hashed. Enumeration cookies are stable slot indices, so
-  a resumed enumeration does not scan from the beginning.
-- Each directory has a mutation verifier. A changed directory fails an old
-  enumeration with `ESTALE` instead of returning an inconsistent snapshot.
-- FSKit item objects are cached behind an unfair lock and reclaimed when FSKit
-  releases them.
-- Release builds use dead stripping and the Rust release profile.
+Tags matching `v*` build, sign, notarize, staple, and upload `FSBind.app`.
+Configure:
 
-For a quick machine-local baseline:
+- `BUILD_CERTIFICATE_BASE64`
+- `P12_PASSWORD`
+- `KEYCHAIN_PASSWORD`
+- `APP_PROVISIONING_PROFILE_BASE64`
+- `EXTENSION_PROVISIONING_PROFILE_BASE64`
+- `APPLE_TEAM_ID`
+- `APPLE_ID`
+- `APPLE_APP_SPECIFIC_PASSWORD`
 
-```sh
-cargo run --release -p fsbind --example throughput
-```
+Both App IDs and profiles must include the
+`group.com.specta.fsbind` App Group.
 
-This is a microbenchmark of the Rust memory backend, not a mounted-filesystem
-guarantee. Run Instruments or `fs_usage` against the signed extension for
-end-to-end measurements of a real backend.
-
-## Scope
-
-The adapter supports attributes, lookup, batched enumeration, create, remove,
-rename, symbolic links, sparse reads/writes, synchronization, and volume
-statistics. Hard links and extended attributes deliberately return `ENOTSUP`;
-they can be added to the ABI without changing existing records by incrementing
-`FSB_ABI_VERSION`.
-
-FSKit currently requires a host app and explicit user approval for the
-extension. Unit tests validate the Rust dispatcher, authentication and Swift
-codec without attempting to automate System Settings or a privileged mount.
-
-## Signed GitHub releases
-
-Pushing a tag matching `v*` runs
-[the release workflow](.github/workflows/release.yml). It builds a universal
-Developer ID application, notarizes it, staples the notarization ticket, and
-publishes the resulting ZIP to GitHub Releases.
-
-Configure these GitHub Actions secrets:
-
-- `BUILD_CERTIFICATE_BASE64`: base64-encoded Developer ID Application `.p12`
-  containing its private key.
-- `P12_PASSWORD`: password used when exporting that `.p12`.
-- `KEYCHAIN_PASSWORD`: a random password used only for the temporary CI
-  keychain.
-- `APP_PROVISIONING_PROFILE_BASE64`: base64-encoded Developer ID provisioning
-  profile for `com.specta.fsbind`.
-- `EXTENSION_PROVISIONING_PROFILE_BASE64`: base64-encoded Developer ID
-  provisioning profile for `com.specta.fsbind.extension`, including the FSKit
-  module entitlement.
-- `APPLE_TEAM_ID`: Apple Developer team identifier.
-- `APPLE_ID`: Apple account used by `notarytool`.
-- `APPLE_APP_SPECIFIC_PASSWORD`: app-specific password for that Apple account.
-
-The workflow uses GitHub's automatic `GITHUB_TOKEN` to create the release; no
-additional GitHub token is required.
-
-Both App IDs and provisioning profiles must include the
-`group.com.specta.fsbind` App Group. It is the only directory shared by the
-extension and unsandboxed Rust CLIs, and holds short-lived mode-0600 sockets
-only.
-
-## Why there is an app
-
-FSKit discovers this code as an ExtensionKit app extension. The `.appex` must
-be code-signed, embedded in a containing `.app`, installed, and approved by the
-user. A Mach-O command-line executable can't directly contain and register that
-extension.
-
-A CLI can still be the primary interface: ship the signed `FSBind.app`
-alongside it, make the app UI-less if desired, and have the CLI open or install
-that companion. The distributable boundary remains an app bundle because its
-nested extension, provisioning profile, entitlements, and signatures must
-retain their bundle structure.
+FSKit still requires its `.appex` inside a signed `.app`; a CLI cannot contain
+the extension as a raw executable. The companion app is installed once and can
+serve any number of independent Rust mount processes.

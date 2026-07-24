@@ -1,10 +1,10 @@
 use fsbind::{
-    DirectorySink, FileType, Filesystem, LocalFile, MemoryFileSystem, Metadata, Mount, NetworkFile,
+    DirectorySink, FileType, Filesystem, LocalFile, MemoryFileSystem, Metadata, NetworkFile,
     NetworkFilesystem, ROOT_INODE, ReadDirectoryResult, Result, StatFs,
 };
 use std::path::PathBuf;
 
-struct ExampleNetworkFilesystem {
+pub struct ExampleNetworkFilesystem {
     inner: MemoryFileSystem,
     downloaded_inode: u64,
     downloaded_path: PathBuf,
@@ -56,10 +56,15 @@ impl NetworkFilesystem for ExampleNetworkFilesystem {
     }
 }
 
-fn filesystem(mount: &Mount) -> Result<ExampleNetworkFilesystem> {
+/// Create the example network backend.
+///
+/// # Errors
+///
+/// Returns an error if its starter files cannot be created.
+pub fn filesystem(resource: &[u8]) -> Result<ExampleNetworkFilesystem> {
     let inner = MemoryFileSystem::new();
     let remote = inner.create(ROOT_INODE, b"origin.txt", FileType::File, 0o444)?;
-    inner.write(remote, 0, mount.resource_url_bytes())?;
+    inner.write(remote, 0, resource)?;
 
     let downloaded_inode = inner.create(ROOT_INODE, b"downloaded.txt", FileType::File, 0o444)?;
     let downloaded_path = std::env::temp_dir().join("fsbind-downloaded-example.txt");
@@ -72,5 +77,3 @@ fn filesystem(mount: &Mount) -> Result<ExampleNetworkFilesystem> {
         downloaded_path,
     })
 }
-
-fsbind::export_network_filesystem!(filesystem);
