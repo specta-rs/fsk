@@ -4,7 +4,7 @@ import FSKit
 // UFSI's install-once macOS authorization application.
 import SwiftUI
 
-private let extensionIdentifier = "com.specta.ufsi.extension"
+private let extensionIdentifier = "dev.specta.ufsi.extension"
 
 @main
 struct UFSIApp: App {

@@ -106,9 +106,9 @@ jobs:
             <string>$APPLE_TEAM_ID</string>
             <key>provisioningProfiles</key>
             <dict>
-              <key>com.specta.ufsi</key>
+              <key>dev.specta.ufsi</key>
               <string>$APP_PROFILE_UUID</string>
-              <key>com.specta.ufsi.extension</key>
+              <key>dev.specta.ufsi.extension</key>
               <string>$EXTENSION_PROFILE_UUID</string>
             </dict>
           </dict>

@@ -235,7 +235,7 @@ fn socket_path() -> io::Result<PathBuf> {
         )
     })?;
     Ok(PathBuf::from(home)
-        .join("Library/Group Containers/group.com.specta.ufsi/Runtime")
+        .join("Library/Group Containers/group.dev.specta.ufsi/Runtime")
         .join(format!("{}-{id}.sock", std::process::id())))
 }
 

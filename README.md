@@ -358,7 +358,7 @@ For macOS signing, configure:
 - `APPLE_APP_SPECIFIC_PASSWORD`
 
 Both App IDs and profiles must include the
-`group.com.specta.ufsi` App Group.
+`group.dev.specta.ufsi` App Group.
 
 FSKit still requires its `.appex` inside a signed `.app`; a CLI cannot contain
 the extension as a raw executable. The companion app is installed once and can
