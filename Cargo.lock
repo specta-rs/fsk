@@ -101,35 +101,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
-name = "fsbind"
-version = "0.0.1"
-dependencies = [
- "fuser",
- "libc",
- "parking_lot",
- "tempfile",
- "windows-sys",
-]
-
-[[package]]
-name = "fsbind-memory-backend"
-version = "0.1.0"
-dependencies = [
- "ctrlc",
- "dashmap",
- "fsbind",
- "parking_lot",
-]
-
-[[package]]
-name = "fsbind-network-backend"
-version = "0.1.0"
-dependencies = [
- "ctrlc",
- "fsbind",
-]
-
-[[package]]
 name = "fuser"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -507,6 +478,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
  "winnow",
+]
+
+[[package]]
+name = "ufsi"
+version = "0.0.1"
+dependencies = [
+ "fuser",
+ "libc",
+ "parking_lot",
+ "tempfile",
+ "windows-sys",
+]
+
+[[package]]
+name = "ufsi-memory-backend"
+version = "0.1.0"
+dependencies = [
+ "ctrlc",
+ "dashmap",
+ "parking_lot",
+ "ufsi",
+]
+
+[[package]]
+name = "ufsi-network-backend"
+version = "0.1.0"
+dependencies = [
+ "ctrlc",
+ "ufsi",
 ]
 
 [[package]]

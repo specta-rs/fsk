@@ -1,6 +1,6 @@
-# FSBind
+# UFSI
 
-FSBind is a high-performance Rust library for building virtual and network
+UFSI is a high-performance Rust library for building virtual and network
 filesystems on macOS, Linux, and Windows from one data model.
 
 - macOS: FSKit extension with an install-once Swift bridge.
@@ -15,7 +15,7 @@ read directly into caller-provided buffers. Names are arbitrary bytes on Unix
 and WTF-8 on Windows, preserving Windows UTF-16 names including unpaired
 surrogates.
 
-The published `fsbind` crate deliberately implements neither `Filesystem` nor
+The published `ufsi` crate deliberately implements neither `Filesystem` nor
 `NetworkFilesystem`. It does not choose an inode index, cache, locking model,
 transaction boundary, consistency policy, or storage engine for downstream
 users. The workspace's memory and network backends are examples only; copy
@@ -25,7 +25,7 @@ their ideas or replace them entirely.
 
 | Platform | Native layer | Model | Installation |
 |---|---|---|---|
-| macOS 26+ | FSKit | Full virtual filesystem; lazy network support | Install and authorize `FSBind.app` once |
+| macOS 26+ | FSKit | Full virtual filesystem; lazy network support | Install and authorize `UFSI.app` once |
 | Linux | FUSE kernel protocol through `fuser` | Full virtual filesystem; lazy network support | FUSE must be available |
 | Windows 10 1809+ | ProjFS | Lazy projected tree with Windows-managed local cache | Enable the Projected File System optional component |
 
@@ -34,23 +34,23 @@ hydrated content live in its virtualization root, while providers receive
 native notifications through the raw hook. This is a particularly good fit for
 source-control, cloud, content-addressed, and other network-backed trees. A
 fully synthetic Windows filesystem with provider-owned write semantics would
-use WinFsp; FSBind exposes the Windows-native callback context in a form that
+use WinFsp; UFSI exposes the Windows-native callback context in a form that
 does not prevent a WinFsp adapter from being added without changing the common
 model.
 
 ## Implement a filesystem
 
 ```rust
-use fsbind::{Filesystem, MountSession};
+use ufsi::{Filesystem, MountSession};
 
 struct MyCoolFilesystem;
 
 impl Filesystem for MyCoolFilesystem {
-    fn statfs(&self) -> fsbind::Result<fsbind::StatFs> {
+    fn statfs(&self) -> ufsi::Result<ufsi::StatFs> {
         todo!()
     }
 
-    fn metadata(&self, inode: u64) -> fsbind::Result<fsbind::Metadata> {
+    fn metadata(&self, inode: u64) -> ufsi::Result<ufsi::Metadata> {
         todo!()
     }
 
@@ -58,7 +58,7 @@ impl Filesystem for MyCoolFilesystem {
         &self,
         parent: u64,
         name: &[u8],
-    ) -> fsbind::Result<(u64, fsbind::FileType)> {
+    ) -> ufsi::Result<(u64, ufsi::FileType)> {
         todo!()
     }
 
@@ -67,8 +67,8 @@ impl Filesystem for MyCoolFilesystem {
         inode: u64,
         cookie: u64,
         verifier: u64,
-        sink: &mut dyn fsbind::DirectorySink,
-    ) -> fsbind::Result<fsbind::ReadDirectoryResult> {
+        sink: &mut dyn ufsi::DirectorySink,
+    ) -> ufsi::Result<ufsi::ReadDirectoryResult> {
         todo!()
     }
 
@@ -77,7 +77,7 @@ impl Filesystem for MyCoolFilesystem {
         inode: u64,
         offset: u64,
         output: &mut [u8],
-    ) -> fsbind::Result<usize> {
+    ) -> ufsi::Result<usize> {
         todo!()
     }
 }
@@ -95,7 +95,7 @@ The workspace's memory example is a complete CLI and a deliberately separate
 implementation:
 
 ```sh
-cargo run -p fsbind-memory-backend -- /path/to/mount
+cargo run -p ufsi-memory-backend -- /path/to/mount
 ```
 
 Control-C performs an orderly unmount. The same executable builds against the
@@ -106,14 +106,14 @@ See [`examples/README.md`](examples/README.md) for the complete example catalog.
 ## Network filesystems and downloaded files
 
 ```rust
-use fsbind::{LocalFile, NetworkFile, NetworkFilesystem};
+use ufsi::{LocalFile, NetworkFile, NetworkFilesystem};
 
 impl NetworkFilesystem for MyCoolFilesystem {
     fn open_file(
         &self,
         inode: u64,
         _writable: bool,
-    ) -> fsbind::Result<NetworkFile> {
+    ) -> ufsi::Result<NetworkFile> {
         if let Some(download) = self.downloaded_file(inode) {
             return Ok(NetworkFile::Local(LocalFile::new(
                 download.path,
@@ -127,13 +127,13 @@ impl NetworkFilesystem for MyCoolFilesystem {
         &self,
         inode: u64,
         file: NetworkFile,
-    ) -> fsbind::Result<()> {
+    ) -> ufsi::Result<()> {
         self.download_manager.file_closed(inode, file);
         Ok(())
     }
 }
 
-let mount = fsbind::MountSession::mount_network(
+let mount = ufsi::MountSession::mount_network(
     MyCoolFilesystem::connect()?,
     "/path/to/mount",
 )?;
@@ -154,7 +154,7 @@ Implementers can inspect platform-specific events without forcing every
 filesystem through an allocation-heavy universal request object:
 
 ```rust
-use fsbind::raw::{
+use ufsi::raw::{
     NativeRequest, Operation, RawEvent, RawEventMask, RawOutcome,
 };
 
@@ -222,7 +222,7 @@ flowchart LR
     M --> S["Install-once Swift extension"]
 ```
 
-macOS mounts use a mode-0600 Unix socket in the FSBind App Group container and
+macOS mounts use a mode-0600 Unix socket in the UFSI App Group container and
 a random per-mount capability. The extension pools up to one persistent
 connection per active CPU. Linux uses multiple FUSE event loops and
 `FUSE_DEV_IOC_CLONE` where available. Windows lets ProjFS select or configure
@@ -263,9 +263,9 @@ authenticated lookup result from a 162–169k baseline to 182–196k round trips
 Run the same benchmarks locally:
 
 ```sh
-cargo bench -p fsbind --bench throughput
-cargo bench -p fsbind --bench raw_overhead
-cargo test --release -p fsbind \
+cargo bench -p ufsi --bench throughput
+cargo bench -p ufsi --bench raw_overhead
+cargo test --release -p ufsi \
   ipc::tests::benchmark_authenticated_ipc_lookup_roundtrip \
   -- --ignored --nocapture
 ```
@@ -298,28 +298,28 @@ macOS additionally requires Xcode 26, XcodeGen, and an Apple team capable of
 signing `com.apple.developer.fskit.fsmodule`.
 
 ```sh
-(cd fsbind/macos && xcodegen generate)
-./fsbind/macos/check.sh
+(cd ufsi/macos && xcodegen generate)
+./ufsi/macos/check.sh
 ```
 
-Install `FSBind.app`, then enable it under **System Settings → General → Login
+Install `UFSI.app`, then enable it under **System Settings → General → Login
 Items & Extensions → File System Extensions**. A CLI can query and open the
 authorization guide:
 
 ```rust
-match fsbind::authorization_status()? {
-    fsbind::AuthorizationStatus::Authorized => {}
-    fsbind::AuthorizationStatus::NeedsApproval => {
-        fsbind::open_authorization_app()?;
+match ufsi::authorization_status()? {
+    ufsi::AuthorizationStatus::Authorized => {}
+    ufsi::AuthorizationStatus::NeedsApproval => {
+        ufsi::open_authorization_app()?;
     }
-    fsbind::AuthorizationStatus::NotInstalled => {
-        eprintln!("Install FSBind.app in /Applications");
+    ufsi::AuthorizationStatus::NotInstalled => {
+        eprintln!("Install UFSI.app in /Applications");
     }
 }
 # Ok::<(), std::io::Error>(())
 ```
 
-Set `FSBIND_APP_PATH` while testing an app outside `/Applications`.
+Set `UFSI_APP_PATH` while testing an app outside `/Applications`.
 
 ### Windows
 
@@ -334,13 +334,13 @@ ProjFS requires an empty or previously initialized virtualization root.
 
 ## Releases
 
-Tags matching `v*` build, sign, notarize, staple, and upload `FSBind.app`, then
-publish the matching `fsbind` crate through crates.io Trusted Publishing.
+Tags matching `v*` build, sign, notarize, staple, and upload `UFSI.app`, then
+publish the matching `ufsi` crate through crates.io Trusted Publishing.
 
 Configure a crates.io trusted publisher for:
 
 - GitHub owner: `specta-rs`
-- repository: `fsbind`
+- repository: `ufsi`
 - workflow: `release.yml`
 - environment: none
 
@@ -359,7 +359,7 @@ For macOS signing, configure:
 - `APPLE_APP_SPECIFIC_PASSWORD`
 
 Both App IDs and profiles must include the
-`group.com.specta.fsbind` App Group.
+`group.com.specta.ufsi` App Group.
 
 FSKit still requires its `.appex` inside a signed `.app`; a CLI cannot contain
 the extension as a raw executable. The companion app is installed once and can

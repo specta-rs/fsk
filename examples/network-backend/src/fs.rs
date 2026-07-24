@@ -1,8 +1,8 @@
-use fsbind::{
+use std::path::PathBuf;
+use ufsi::{
     DirectoryEntry, DirectorySink, Error, FileType, Filesystem, LocalFile, Metadata, NetworkFile,
     NetworkFilesystem, ROOT_INODE, ReadDirectoryResult, Result, StatFs,
 };
-use std::path::PathBuf;
 
 pub struct ExampleNetworkFilesystem {
     remote: Vec<u8>,
@@ -142,9 +142,9 @@ impl NetworkFilesystem for ExampleNetworkFilesystem {
 /// Returns an error if its starter files cannot be created.
 pub fn filesystem(resource: &[u8]) -> Result<ExampleNetworkFilesystem> {
     let downloaded = b"This file is read locally.\n".to_vec();
-    let downloaded_path = std::env::temp_dir().join("fsbind-downloaded-example.txt");
+    let downloaded_path = std::env::temp_dir().join("ufsi-downloaded-example.txt");
     std::fs::write(&downloaded_path, &downloaded)
-        .map_err(|error| fsbind::Error(error.raw_os_error().unwrap_or(5)))?;
+        .map_err(|error| ufsi::Error(error.raw_os_error().unwrap_or(5)))?;
 
     Ok(ExampleNetworkFilesystem {
         remote: resource.to_vec(),

@@ -1,5 +1,5 @@
 [package]
-name = "fsbind-network-backend"
+name = "ufsi-network-backend"
 version = "0.1.0"
 publish = false
 edition.workspace = true
@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 ctrlc = "3.4"
-fsbind = { path = "../../fsbind" }
+ufsi = { path = "../../ufsi" }
 
 [lints]
 workspace = true

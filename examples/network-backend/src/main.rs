@@ -1,8 +1,5 @@
 mod fs;
 
-use fsbind::MountSession;
-#[cfg(target_os = "macos")]
-use fsbind::{AuthorizationStatus, authorization_status, open_authorization_app};
 use std::{
     env, io,
     sync::{
@@ -12,13 +9,16 @@ use std::{
     thread,
     time::Duration,
 };
+use ufsi::MountSession;
+#[cfg(target_os = "macos")]
+use ufsi::{AuthorizationStatus, authorization_status, open_authorization_app};
 
 fn main() -> io::Result<()> {
     let mut arguments = env::args_os().skip(1);
     let mount_path = arguments.next().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: fsbind-network-backend <mount-path> [remote-content]",
+            "usage: ufsi-network-backend <mount-path> [remote-content]",
         )
     })?;
     let resource = arguments.next().map_or_else(
@@ -55,12 +55,12 @@ fn check_platform_authorization() -> io::Result<()> {
             open_authorization_app()?;
             Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "enable FSBind in the window that opened, then run this command again",
+                "enable UFSI in the window that opened, then run this command again",
             ))
         }
         AuthorizationStatus::NotInstalled => Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "install FSBind.app in /Applications before mounting",
+            "install UFSI.app in /Applications before mounting",
         )),
     }
 }

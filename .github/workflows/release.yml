@@ -25,7 +25,7 @@ jobs:
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Generate Xcode project
-        working-directory: fsbind/macos
+        working-directory: ufsi/macos
         run: xcodegen generate
 
       - name: Install signing certificate and provisioning profiles
@@ -40,7 +40,7 @@ jobs:
           certificate_path="$RUNNER_TEMP/developer-id.p12"
           app_profile_path="$RUNNER_TEMP/app.provisionprofile"
           extension_profile_path="$RUNNER_TEMP/extension.provisionprofile"
-          keychain_path="$RUNNER_TEMP/fsbind-signing.keychain-db"
+          keychain_path="$RUNNER_TEMP/ufsi-signing.keychain-db"
 
           printf '%s' "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$certificate_path"
           printf '%s' "$APP_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$app_profile_path"
@@ -74,16 +74,16 @@ jobs:
         run: |
           set -euo pipefail
           xcodebuild \
-            -project fsbind/macos/FSBind.xcodeproj \
-            -scheme FSBindApp \
+            -project ufsi/macos/UFSI.xcodeproj \
+            -scheme UFSIApp \
             -configuration Release \
-            -archivePath "$RUNNER_TEMP/FSBind.xcarchive" \
+            -archivePath "$RUNNER_TEMP/UFSI.xcarchive" \
             ARCHS="arm64 x86_64" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Developer ID Application" \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-            FSBIND_APP_PROFILE="$APP_PROFILE_UUID" \
-            FSBIND_EXTENSION_PROFILE="$EXTENSION_PROFILE_UUID" \
+            UFSI_APP_PROFILE="$APP_PROFILE_UUID" \
+            UFSI_EXTENSION_PROFILE="$EXTENSION_PROFILE_UUID" \
             archive
 
       - name: Export signed application
@@ -106,9 +106,9 @@ jobs:
             <string>$APPLE_TEAM_ID</string>
             <key>provisioningProfiles</key>
             <dict>
-              <key>com.specta.fsbind</key>
+              <key>com.specta.ufsi</key>
               <string>$APP_PROFILE_UUID</string>
-              <key>com.specta.fsbind.extension</key>
+              <key>com.specta.ufsi.extension</key>
               <string>$EXTENSION_PROFILE_UUID</string>
             </dict>
           </dict>
@@ -117,7 +117,7 @@ jobs:
 
           xcodebuild \
             -exportArchive \
-            -archivePath "$RUNNER_TEMP/FSBind.xcarchive" \
+            -archivePath "$RUNNER_TEMP/UFSI.xcarchive" \
             -exportPath "$RUNNER_TEMP/export" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
 
@@ -128,28 +128,28 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          ditto -c -k --keepParent "$RUNNER_TEMP/export/FSBind.app" "$RUNNER_TEMP/notarization.zip"
+          ditto -c -k --keepParent "$RUNNER_TEMP/export/UFSI.app" "$RUNNER_TEMP/notarization.zip"
           xcrun notarytool submit "$RUNNER_TEMP/notarization.zip" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
-          xcrun stapler staple "$RUNNER_TEMP/export/FSBind.app"
-          ditto -c -k --keepParent "$RUNNER_TEMP/export/FSBind.app" \
-            "$RUNNER_TEMP/FSBind-${GITHUB_REF_NAME}.zip"
+          xcrun stapler staple "$RUNNER_TEMP/export/UFSI.app"
+          ditto -c -k --keepParent "$RUNNER_TEMP/export/UFSI.app" \
+            "$RUNNER_TEMP/UFSI-${GITHUB_REF_NAME}.zip"
 
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            "$RUNNER_TEMP/FSBind-${GITHUB_REF_NAME}.zip" \
-            --title "FSBind $GITHUB_REF_NAME" \
+            "$RUNNER_TEMP/UFSI-${GITHUB_REF_NAME}.zip" \
+            --title "UFSI $GITHUB_REF_NAME" \
             --generate-notes \
             --verify-tag
 
   publish-crate:
-    name: Publish fsbind to crates.io
+    name: Publish ufsi to crates.io
     needs: release
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -168,7 +168,7 @@ jobs:
         run: |
           set -euo pipefail
           crate_version=$(cargo metadata --no-deps --format-version 1 |
-            jq -r '.packages[] | select(.name == "fsbind") | .version')
+            jq -r '.packages[] | select(.name == "ufsi") | .version')
           test "$GITHUB_REF_NAME" = "v$crate_version"
 
       - name: Authenticate with crates.io
@@ -176,6 +176,6 @@ jobs:
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish crate
-        run: cargo publish -p fsbind --locked
+        run: cargo publish -p ufsi --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}

@@ -1,5 +1,5 @@
 [package]
-name = "fsbind-memory-backend"
+name = "ufsi-memory-backend"
 version = "0.1.0"
 publish = false
 edition.workspace = true
@@ -9,7 +9,7 @@ rust-version.workspace = true
 [dependencies]
 ctrlc = "3.4"
 dashmap = "6.1"
-fsbind = { path = "../../fsbind" }
+ufsi = { path = "../../ufsi" }
 parking_lot = "0.12"
 
 [lints]

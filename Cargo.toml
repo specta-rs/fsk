@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "fsbind",
+    "ufsi",
     "examples/memory-backend",
     "examples/network-backend",
 ]
