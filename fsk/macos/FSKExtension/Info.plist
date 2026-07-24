@@ -44,6 +44,8 @@
         </array>
         <key>FSSupportsBlockResources</key>
         <false/>
+        <key>FSSupportsGenericURLResources</key>
+        <true/>
         <key>FSSupportsPathURLs</key>
         <false/>
     </dict>
