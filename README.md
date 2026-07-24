@@ -328,10 +328,22 @@ Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
 
 ProjFS requires an empty or previously initialized virtualization root.
 
-## Signed macOS releases
+## Releases
 
-Tags matching `v*` build, sign, notarize, staple, and upload `FSBind.app`.
-Configure:
+Tags matching `v*` build, sign, notarize, staple, and upload `FSBind.app`, then
+publish the matching `fsbind` crate through crates.io Trusted Publishing.
+
+Configure a crates.io trusted publisher for:
+
+- GitHub owner: `specta-rs`
+- repository: `fsbind`
+- workflow: `release.yml`
+- environment: none
+
+The workflow uses GitHub OIDC and does not require a crates.io API-token
+secret. The tag must exactly match the crate version, such as `v0.0.1`.
+
+For macOS signing, configure:
 
 - `BUILD_CERTIFICATE_BASE64`
 - `P12_PASSWORD`
