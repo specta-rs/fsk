@@ -149,7 +149,7 @@ jobs:
             --verify-tag
 
   publish-crate:
-    name: Publish ufsi to crates.io
+    name: Publish fsk to crates.io
     needs: release
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -168,7 +168,7 @@ jobs:
         run: |
           set -euo pipefail
           crate_version=$(cargo metadata --no-deps --format-version 1 |
-            jq -r '.packages[] | select(.name == "ufsi") | .version')
+            jq -r '.packages[] | select(.name == "fsk") | .version')
           test "$GITHUB_REF_NAME" = "v$crate_version"
 
       - name: Authenticate with crates.io
@@ -176,6 +176,6 @@ jobs:
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish crate
-        run: cargo publish -p ufsi --locked
+        run: cargo publish -p fsk --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}

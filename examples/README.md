@@ -1,7 +1,7 @@
 # UFSI examples
 
 These are standalone, binary-only implementations of the `Filesystem` traits.
-They are not part of the published `ufsi` crate and deliberately make
+They are not part of the published `fsk` crate and deliberately make
 different storage and consistency choices.
 
 ## `memory-backend`

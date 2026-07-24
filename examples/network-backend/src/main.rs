@@ -1,5 +1,8 @@
 mod fs;
 
+use fsk::MountSession;
+#[cfg(target_os = "macos")]
+use fsk::{AuthorizationStatus, authorization_status, open_authorization_app};
 use std::{
     env, io,
     sync::{
@@ -9,9 +12,6 @@ use std::{
     thread,
     time::Duration,
 };
-use ufsi::MountSession;
-#[cfg(target_os = "macos")]
-use ufsi::{AuthorizationStatus, authorization_status, open_authorization_app};
 
 fn main() -> io::Result<()> {
     let mut arguments = env::args_os().skip(1);

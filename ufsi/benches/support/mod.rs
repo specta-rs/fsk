@@ -1,9 +1,9 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-use ufsi::{
+use fsk::{
     DirectoryEntry, DirectorySink, Error, FileType, Filesystem, Metadata, ROOT_INODE,
     ReadDirectoryResult, Result, StatFs,
     raw::{RawEvent, RawEventMask, RawOutcome},
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Minimal, immutable fixture for measuring `UFSI`'s interface costs.
 ///

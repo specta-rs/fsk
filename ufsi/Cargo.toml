@@ -1,5 +1,5 @@
 [package]
-name = "ufsi"
+name = "fsk"
 version = "0.0.1"
 description = "Build cross-platform virtual file systems with ease"
 authors = ["Oscar Beaumont <oscar@otbeaumont.me>"]
@@ -7,7 +7,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository = "https://github.com/specta-rs/fsk"
-documentation = "https://docs.rs/ufsi/latest/ufsi"
+documentation = "https://docs.rs/fsk/latest/fsk"
 readme = "../README.md"
 keywords = ["filesystem", "virtual-filesystem", "fuse", "fskit", "projfs"]
 categories = ["api-bindings", "filesystem"]

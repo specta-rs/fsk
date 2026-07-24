@@ -1,11 +1,11 @@
 mod support;
 
+use fsk::{DirectoryEntry, DirectorySink, Filesystem, ROOT_INODE};
 use std::{
     hint::black_box,
     time::{Duration, Instant},
 };
 use support::BenchmarkFilesystem;
-use ufsi::{DirectoryEntry, DirectorySink, Filesystem, ROOT_INODE};
 
 struct CountingSink(u32);
 

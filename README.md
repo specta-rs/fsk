@@ -1,4 +1,4 @@
-# UFSI
+# FSK
 
 Build cross-platform virtual file systems with ease
 
@@ -14,7 +14,7 @@ read directly into caller-provided buffers. Names are arbitrary bytes on Unix
 and WTF-8 on Windows, preserving Windows UTF-16 names including unpaired
 surrogates.
 
-The published `ufsi` crate deliberately implements neither `Filesystem` nor
+The published `fsk` crate deliberately implements neither `Filesystem` nor
 `NetworkFilesystem`. It does not choose an inode index, cache, locking model,
 transaction boundary, consistency policy, or storage engine for downstream
 users. The workspace's memory and network backends are examples only; copy
@@ -40,16 +40,16 @@ model.
 ## Implement a filesystem
 
 ```rust
-use ufsi::{Filesystem, MountSession};
+use fsk::{Filesystem, MountSession};
 
 struct MyCoolFilesystem;
 
 impl Filesystem for MyCoolFilesystem {
-    fn statfs(&self) -> ufsi::Result<ufsi::StatFs> {
+    fn statfs(&self) -> fsk::Result<fsk::StatFs> {
         todo!()
     }
 
-    fn metadata(&self, inode: u64) -> ufsi::Result<ufsi::Metadata> {
+    fn metadata(&self, inode: u64) -> fsk::Result<fsk::Metadata> {
         todo!()
     }
 
@@ -57,7 +57,7 @@ impl Filesystem for MyCoolFilesystem {
         &self,
         parent: u64,
         name: &[u8],
-    ) -> ufsi::Result<(u64, ufsi::FileType)> {
+    ) -> fsk::Result<(u64, fsk::FileType)> {
         todo!()
     }
 
@@ -66,8 +66,8 @@ impl Filesystem for MyCoolFilesystem {
         inode: u64,
         cookie: u64,
         verifier: u64,
-        sink: &mut dyn ufsi::DirectorySink,
-    ) -> ufsi::Result<ufsi::ReadDirectoryResult> {
+        sink: &mut dyn fsk::DirectorySink,
+    ) -> fsk::Result<fsk::ReadDirectoryResult> {
         todo!()
     }
 
@@ -76,7 +76,7 @@ impl Filesystem for MyCoolFilesystem {
         inode: u64,
         offset: u64,
         output: &mut [u8],
-    ) -> ufsi::Result<usize> {
+    ) -> fsk::Result<usize> {
         todo!()
     }
 }
@@ -105,14 +105,14 @@ See [`examples/README.md`](examples/README.md) for the complete example catalog.
 ## Network filesystems and downloaded files
 
 ```rust
-use ufsi::{LocalFile, NetworkFile, NetworkFilesystem};
+use fsk::{LocalFile, NetworkFile, NetworkFilesystem};
 
 impl NetworkFilesystem for MyCoolFilesystem {
     fn open_file(
         &self,
         inode: u64,
         _writable: bool,
-    ) -> ufsi::Result<NetworkFile> {
+    ) -> fsk::Result<NetworkFile> {
         if let Some(download) = self.downloaded_file(inode) {
             return Ok(NetworkFile::Local(LocalFile::new(
                 download.path,
@@ -126,13 +126,13 @@ impl NetworkFilesystem for MyCoolFilesystem {
         &self,
         inode: u64,
         file: NetworkFile,
-    ) -> ufsi::Result<()> {
+    ) -> fsk::Result<()> {
         self.download_manager.file_closed(inode, file);
         Ok(())
     }
 }
 
-let mount = ufsi::MountSession::mount_network(
+let mount = fsk::MountSession::mount_network(
     MyCoolFilesystem::connect()?,
     "/path/to/mount",
 )?;
@@ -153,7 +153,7 @@ Implementers can inspect platform-specific events without forcing every
 filesystem through an allocation-heavy universal request object:
 
 ```rust
-use ufsi::raw::{
+use fsk::raw::{
     NativeRequest, Operation, RawEvent, RawEventMask, RawOutcome,
 };
 
@@ -262,9 +262,9 @@ authenticated lookup result from a 162–169k baseline to 182–196k round trips
 Run the same benchmarks locally:
 
 ```sh
-cargo bench -p ufsi --bench throughput
-cargo bench -p ufsi --bench raw_overhead
-cargo test --release -p ufsi \
+cargo bench -p fsk --bench throughput
+cargo bench -p fsk --bench raw_overhead
+cargo test --release -p fsk \
   ipc::tests::benchmark_authenticated_ipc_lookup_roundtrip \
   -- --ignored --nocapture
 ```
@@ -306,12 +306,12 @@ Items & Extensions → File System Extensions**. A CLI can query and open the
 authorization guide:
 
 ```rust
-match ufsi::authorization_status()? {
-    ufsi::AuthorizationStatus::Authorized => {}
-    ufsi::AuthorizationStatus::NeedsApproval => {
-        ufsi::open_authorization_app()?;
+match fsk::authorization_status()? {
+    fsk::AuthorizationStatus::Authorized => {}
+    fsk::AuthorizationStatus::NeedsApproval => {
+        fsk::open_authorization_app()?;
     }
-    ufsi::AuthorizationStatus::NotInstalled => {
+    fsk::AuthorizationStatus::NotInstalled => {
         eprintln!("Install UFSI.app in /Applications");
     }
 }
@@ -334,7 +334,7 @@ ProjFS requires an empty or previously initialized virtualization root.
 ## Releases
 
 Tags matching `v*` build, sign, notarize, staple, and upload `UFSI.app`, then
-publish the matching `ufsi` crate through crates.io Trusted Publishing.
+publish the matching `fsk` crate through crates.io Trusted Publishing.
 
 Configure a crates.io trusted publisher for:
 

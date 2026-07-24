@@ -1,11 +1,11 @@
 mod support;
 
-use std::{hint::black_box, time::Instant};
-use support::BenchmarkFilesystem;
-use ufsi::{
+use fsk::{
     Filesystem, ROOT_INODE,
     raw::{Caller, NativeRequest, Operation, Platform, RawEvent, RawEventMask},
 };
+use std::{hint::black_box, time::Instant};
+use support::BenchmarkFilesystem;
 
 fn timed(iterations: u64, mut operation: impl FnMut()) -> f64 {
     let start = Instant::now();

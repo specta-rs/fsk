@@ -1,4 +1,8 @@
 use dashmap::DashMap;
+use fsk::{
+    DirectoryEntry, DirectorySink, Error, FileType, Filesystem, Metadata, ROOT_INODE,
+    ReadDirectoryResult, Result, SetMetadata, StatFs, now_ns,
+};
 use parking_lot::{Mutex, RwLock};
 use std::{
     collections::HashMap,
@@ -6,10 +10,6 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-};
-use ufsi::{
-    DirectoryEntry, DirectorySink, Error, FileType, Filesystem, Metadata, ROOT_INODE,
-    ReadDirectoryResult, Result, SetMetadata, StatFs, now_ns,
 };
 
 const BLOCK_SIZE: u64 = 4096;
@@ -664,8 +664,8 @@ mod errno {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fsk::DirectorySink;
     use std::sync::Arc;
-    use ufsi::DirectorySink;
 
     #[derive(Default)]
     struct VecSink {
