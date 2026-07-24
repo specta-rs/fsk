@@ -24,7 +24,7 @@ their ideas or replace them entirely.
 
 | Platform | Native layer | Model | Installation |
 |---|---|---|---|
-| macOS 26+ | FSKit | Full virtual filesystem; lazy network support | Install and authorize `UFSI.app` once |
+| macOS 26+ | FSKit | Full virtual filesystem; lazy network support | Install and authorize `FSK.app` once |
 | Linux | FUSE kernel protocol through `fuser` | Full virtual filesystem; lazy network support | FUSE must be available |
 | Windows 10 1809+ | ProjFS | Lazy projected tree with Windows-managed local cache | Enable the Projected File System optional component |
 
@@ -33,7 +33,7 @@ hydrated content live in its virtualization root, while providers receive
 native notifications through the raw hook. This is a particularly good fit for
 source-control, cloud, content-addressed, and other network-backed trees. A
 fully synthetic Windows filesystem with provider-owned write semantics would
-use WinFsp; UFSI exposes the Windows-native callback context in a form that
+use WinFsp; FSK exposes the Windows-native callback context in a form that
 does not prevent a WinFsp adapter from being added without changing the common
 model.
 
@@ -94,7 +94,7 @@ The workspace's memory example is a complete CLI and a deliberately separate
 implementation:
 
 ```sh
-cargo run -p ufsi-memory-backend -- /path/to/mount
+cargo run -p fsk-memory-backend -- /path/to/mount
 ```
 
 Control-C performs an orderly unmount. The same executable builds against the
@@ -221,7 +221,7 @@ flowchart LR
     M --> S["Install-once Swift extension"]
 ```
 
-macOS mounts use a mode-0600 Unix socket in the UFSI App Group container and
+macOS mounts use a mode-0600 Unix socket in the FSK App Group container and
 a random per-mount capability. The extension pools up to one persistent
 connection per active CPU. Linux uses multiple FUSE event loops and
 `FUSE_DEV_IOC_CLONE` where available. Windows lets ProjFS select or configure
@@ -297,11 +297,11 @@ macOS additionally requires Xcode 26, XcodeGen, and an Apple team capable of
 signing `com.apple.developer.fskit.fsmodule`.
 
 ```sh
-(cd ufsi/macos && xcodegen generate)
-./ufsi/macos/check.sh
+(cd fsk/macos && xcodegen generate)
+./fsk/macos/check.sh
 ```
 
-Install `UFSI.app`, then enable it under **System Settings → General → Login
+Install `FSK.app`, then enable it under **System Settings → General → Login
 Items & Extensions → File System Extensions**. A CLI can query and open the
 authorization guide:
 
@@ -312,13 +312,13 @@ match fsk::authorization_status()? {
         fsk::open_authorization_app()?;
     }
     fsk::AuthorizationStatus::NotInstalled => {
-        eprintln!("Install UFSI.app in /Applications");
+        eprintln!("Install FSK.app in /Applications");
     }
 }
 # Ok::<(), std::io::Error>(())
 ```
 
-Set `UFSI_APP_PATH` while testing an app outside `/Applications`.
+Set `FSK_APP_PATH` while testing an app outside `/Applications`.
 
 ### Windows
 
@@ -333,7 +333,7 @@ ProjFS requires an empty or previously initialized virtualization root.
 
 ## Releases
 
-Tags matching `v*` build, sign, notarize, staple, and upload `UFSI.app`, then
+Tags matching `v*` build, sign, notarize, staple, and upload `FSK.app`, then
 publish the matching `fsk` crate through crates.io Trusted Publishing.
 
 Configure a crates.io trusted publisher for:

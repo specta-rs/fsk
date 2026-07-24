@@ -25,7 +25,7 @@ jobs:
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Generate Xcode project
-        working-directory: ufsi/macos
+        working-directory: fsk/macos
         run: xcodegen generate
 
       - name: Install signing certificate and provisioning profiles
@@ -40,7 +40,7 @@ jobs:
           certificate_path="$RUNNER_TEMP/developer-id.p12"
           app_profile_path="$RUNNER_TEMP/app.provisionprofile"
           extension_profile_path="$RUNNER_TEMP/extension.provisionprofile"
-          keychain_path="$RUNNER_TEMP/ufsi-signing.keychain-db"
+          keychain_path="$RUNNER_TEMP/fsk-signing.keychain-db"
 
           printf '%s' "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$certificate_path"
           printf '%s' "$APP_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$app_profile_path"
@@ -74,16 +74,16 @@ jobs:
         run: |
           set -euo pipefail
           xcodebuild \
-            -project ufsi/macos/UFSI.xcodeproj \
-            -scheme UFSIApp \
+            -project fsk/macos/FSK.xcodeproj \
+            -scheme FSKApp \
             -configuration Release \
-            -archivePath "$RUNNER_TEMP/UFSI.xcarchive" \
+            -archivePath "$RUNNER_TEMP/FSK.xcarchive" \
             ARCHS="arm64 x86_64" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Developer ID Application" \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-            UFSI_APP_PROFILE="$APP_PROFILE_UUID" \
-            UFSI_EXTENSION_PROFILE="$EXTENSION_PROFILE_UUID" \
+            FSK_APP_PROFILE="$APP_PROFILE_UUID" \
+            FSK_EXTENSION_PROFILE="$EXTENSION_PROFILE_UUID" \
             archive
 
       - name: Export signed application
@@ -117,7 +117,7 @@ jobs:
 
           xcodebuild \
             -exportArchive \
-            -archivePath "$RUNNER_TEMP/UFSI.xcarchive" \
+            -archivePath "$RUNNER_TEMP/FSK.xcarchive" \
             -exportPath "$RUNNER_TEMP/export" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
 
@@ -128,23 +128,23 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          ditto -c -k --keepParent "$RUNNER_TEMP/export/UFSI.app" "$RUNNER_TEMP/notarization.zip"
+          ditto -c -k --keepParent "$RUNNER_TEMP/export/FSK.app" "$RUNNER_TEMP/notarization.zip"
           xcrun notarytool submit "$RUNNER_TEMP/notarization.zip" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
-          xcrun stapler staple "$RUNNER_TEMP/export/UFSI.app"
-          ditto -c -k --keepParent "$RUNNER_TEMP/export/UFSI.app" \
-            "$RUNNER_TEMP/UFSI-${GITHUB_REF_NAME}.zip"
+          xcrun stapler staple "$RUNNER_TEMP/export/FSK.app"
+          ditto -c -k --keepParent "$RUNNER_TEMP/export/FSK.app" \
+            "$RUNNER_TEMP/FSK-${GITHUB_REF_NAME}.zip"
 
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            "$RUNNER_TEMP/UFSI-${GITHUB_REF_NAME}.zip" \
-            --title "UFSI $GITHUB_REF_NAME" \
+            "$RUNNER_TEMP/FSK-${GITHUB_REF_NAME}.zip" \
+            --title "FSK $GITHUB_REF_NAME" \
             --generate-notes \
             --verify-tag
 

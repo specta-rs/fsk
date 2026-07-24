@@ -18,7 +18,7 @@ fn main() -> io::Result<()> {
     let mount_path = arguments.next().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: ufsi-network-backend <mount-path> [remote-content]",
+            "usage: fsk-network-backend <mount-path> [remote-content]",
         )
     })?;
     let resource = arguments.next().map_or_else(
@@ -55,12 +55,12 @@ fn check_platform_authorization() -> io::Result<()> {
             open_authorization_app()?;
             Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "enable UFSI in the window that opened, then run this command again",
+                "enable FSK in the window that opened, then run this command again",
             ))
         }
         AuthorizationStatus::NotInstalled => Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "install UFSI.app in /Applications before mounting",
+            "install FSK.app in /Applications before mounting",
         )),
     }
 }

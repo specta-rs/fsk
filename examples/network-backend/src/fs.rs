@@ -142,7 +142,7 @@ impl NetworkFilesystem for ExampleNetworkFilesystem {
 /// Returns an error if its starter files cannot be created.
 pub fn filesystem(resource: &[u8]) -> Result<ExampleNetworkFilesystem> {
     let downloaded = b"This file is read locally.\n".to_vec();
-    let downloaded_path = std::env::temp_dir().join("ufsi-downloaded-example.txt");
+    let downloaded_path = std::env::temp_dir().join("fsk-downloaded-example.txt");
     std::fs::write(&downloaded_path, &downloaded)
         .map_err(|error| fsk::Error(error.raw_os_error().unwrap_or(5)))?;
 

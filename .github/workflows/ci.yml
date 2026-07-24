@@ -28,10 +28,10 @@ jobs:
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Run Rust and Swift checks
-        run: ./ufsi/macos/check.sh
+        run: ./fsk/macos/check.sh
 
       - name: Verify crate package
-        run: cargo package -p ufsi
+        run: cargo package -p fsk
 
   rust-platforms:
     name: ${{ matrix.name }}

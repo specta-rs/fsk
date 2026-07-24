@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "ufsi",
+    "fsk",
     "examples/memory-backend",
     "examples/network-backend",
 ]

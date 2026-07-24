@@ -1,5 +1,5 @@
 [package]
-name = "ufsi-network-backend"
+name = "fsk-network-backend"
 version = "0.1.0"
 publish = false
 edition.workspace = true
@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 ctrlc = "3.4"
-fsk = { path = "../../ufsi" }
+fsk = { path = "../../fsk" }
 
 [lints]
 workspace = true

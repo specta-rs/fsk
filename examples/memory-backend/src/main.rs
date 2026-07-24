@@ -17,7 +17,7 @@ fn main() -> io::Result<()> {
     let mount_path = env::args_os().nth(1).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: ufsi-memory-backend <mount-path>",
+            "usage: fsk-memory-backend <mount-path>",
         )
     })?;
 
@@ -50,12 +50,12 @@ fn check_platform_authorization() -> io::Result<()> {
             open_authorization_app()?;
             Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "enable UFSI in the window that opened, then run this command again",
+                "enable FSK in the window that opened, then run this command again",
             ))
         }
         AuthorizationStatus::NotInstalled => Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "install UFSI.app in /Applications before mounting",
+            "install FSK.app in /Applications before mounting",
         )),
     }
 }
