@@ -129,11 +129,23 @@ jobs:
         run: |
           set -euo pipefail
           ditto -c -k --keepParent "$RUNNER_TEMP/export/FSK.app" "$RUNNER_TEMP/notarization.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/notarization.zip" \
+          submission_json=$(xcrun notarytool submit "$RUNNER_TEMP/notarization.zip" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
-            --wait
+            --wait \
+            --output-format json)
+          submission_id=$(jq -r '.id' <<< "$submission_json")
+          submission_status=$(jq -r '.status' <<< "$submission_json")
+          printf 'Notarization submission %s finished with status: %s\n' \
+            "$submission_id" "$submission_status"
+          if [[ "$submission_status" != "Accepted" ]]; then
+            xcrun notarytool log "$submission_id" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID"
+            exit 1
+          fi
           xcrun stapler staple "$RUNNER_TEMP/export/FSK.app"
           ditto -c -k --keepParent "$RUNNER_TEMP/export/FSK.app" \
             "$RUNNER_TEMP/FSK-${GITHUB_REF_NAME}.zip"
