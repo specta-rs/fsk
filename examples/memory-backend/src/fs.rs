@@ -58,6 +58,24 @@ pub struct MemoryFileSystem {
     capacity: u64,
 }
 
+/// Build the seeded filesystem used by the mount example.
+#[must_use]
+#[allow(dead_code)]
+pub fn filesystem() -> MemoryFileSystem {
+    let filesystem = MemoryFileSystem::new();
+    let readme = filesystem
+        .create(ROOT_INODE, b"hello.txt", FileType::File, 0o644)
+        .expect("create example file");
+    filesystem
+        .write(
+            readme,
+            0,
+            b"Hello from Rust through a Swift FSKit extension.\n",
+        )
+        .expect("write example file");
+    filesystem
+}
+
 impl Default for MemoryFileSystem {
     fn default() -> Self {
         Self::new()

@@ -1,3 +1,5 @@
+mod fs;
+
 use fsbind::MountSession;
 #[cfg(target_os = "macos")]
 use fsbind::{AuthorizationStatus, authorization_status, open_authorization_app};
@@ -21,7 +23,7 @@ fn main() -> io::Result<()> {
 
     check_platform_authorization()?;
 
-    let session = MountSession::mount(fsbind_memory_backend::filesystem(), &mount_path)?;
+    let session = MountSession::mount(fs::filesystem(), &mount_path)?;
     println!(
         "mounted at {} — press Ctrl-C to unmount",
         session.mount_path().display()

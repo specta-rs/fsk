@@ -1,5 +1,8 @@
+#[path = "../src/fs.rs"]
+mod fs;
+
+use fs::MemoryFileSystem;
 use fsbind::{DirectoryEntry, DirectorySink, FileType, Filesystem, ROOT_INODE};
-use fsbind_memory_backend::MemoryFileSystem;
 use std::{
     hint::black_box,
     time::{Duration, Instant},

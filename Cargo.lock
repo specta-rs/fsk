@@ -125,8 +125,8 @@ dependencies = [
 name = "fsbind-network-backend"
 version = "0.1.0"
 dependencies = [
+ "ctrlc",
  "fsbind",
- "fsbind-memory-backend",
 ]
 
 [[package]]
