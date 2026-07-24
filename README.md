@@ -1,7 +1,6 @@
 # UFSI
 
-UFSI is a high-performance Rust library for building virtual and network
-filesystems on macOS, Linux, and Windows from one data model.
+Build cross-platform virtual file systems with ease
 
 - macOS: FSKit extension with an install-once Swift bridge.
 - Linux: multithreaded kernel FUSE adapter.

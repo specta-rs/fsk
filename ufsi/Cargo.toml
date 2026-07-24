@@ -1,7 +1,7 @@
 [package]
 name = "ufsi"
 version = "0.0.1"
-description = "High-performance virtual and network filesystems for macOS, Linux, and Windows"
+description = "Build cross-platform virtual file systems with ease"
 authors = ["Oscar Beaumont <oscar@otbeaumont.me>"]
 edition.workspace = true
 license.workspace = true
