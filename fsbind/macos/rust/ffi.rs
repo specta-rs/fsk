@@ -511,7 +511,9 @@ pub unsafe extern "C" fn fsb_read(
             return Err(Error(EINVAL));
         }
         let output = unsafe { bytes_mut(output, length)? };
-        let count = unsafe { volume(pointer)? }.read(inode, offset, output)?;
+        let count = unsafe { volume(pointer)? }
+            .read(inode, offset, output)
+            .and_then(|count| crate::core::checked_io_count(count, output.len()))?;
         unsafe { ptr::write(count_out, count) };
         Ok(())
     })
@@ -531,7 +533,9 @@ pub unsafe extern "C" fn fsb_write(
             return Err(Error(EINVAL));
         }
         let input = unsafe { bytes(input, length)? };
-        let count = unsafe { volume(pointer)? }.write(inode, offset, input)?;
+        let count = unsafe { volume(pointer)? }
+            .write(inode, offset, input)
+            .and_then(|count| crate::core::checked_io_count(count, input.len()))?;
         unsafe { ptr::write(count_out, count) };
         Ok(())
     })
@@ -595,7 +599,9 @@ pub unsafe extern "C" fn fsb_readlink(
             return Err(Error(EINVAL));
         }
         let output = unsafe { bytes_mut(output, capacity)? };
-        let count = unsafe { volume(pointer)? }.read_symlink(inode, output)?;
+        let count = unsafe { volume(pointer)? }
+            .read_symlink(inode, output)
+            .and_then(|count| crate::core::checked_io_count(count, output.len()))?;
         unsafe { ptr::write(count_out, count) };
         Ok(())
     })

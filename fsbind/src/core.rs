@@ -112,7 +112,9 @@ pub trait Filesystem: Send + Sync + 'static {
         verifier: u64,
         sink: &mut dyn DirectorySink,
     ) -> Result<ReadDirectoryResult>;
+    /// Reads at most `output.len()` bytes and returns the initialized byte count.
     fn read(&self, inode: u64, offset: u64, output: &mut [u8]) -> Result<usize>;
+    /// Writes at most `input.len()` bytes and returns the consumed byte count.
     fn write(&self, _inode: u64, _offset: u64, _input: &[u8]) -> Result<usize> {
         Err(Error::NOT_SUPPORTED)
     }
@@ -128,6 +130,7 @@ pub trait Filesystem: Send + Sync + 'static {
     ) -> Result<u64> {
         Err(Error::NOT_SUPPORTED)
     }
+    /// Reads at most `output.len()` bytes and returns the initialized byte count.
     fn read_symlink(&self, _inode: u64, _output: &mut [u8]) -> Result<usize> {
         Err(Error::NOT_SUPPORTED)
     }
@@ -183,4 +186,23 @@ pub fn now_ns() -> u64 {
         .unwrap_or_default()
         .as_nanos();
     u64::try_from(nanos).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn checked_io_count(count: usize, capacity: usize) -> Result<usize> {
+    if count <= capacity {
+        Ok(count)
+    } else {
+        Err(Error::INVALID)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_io_counts_beyond_the_supplied_buffer() {
+        assert_eq!(checked_io_count(4, 4), Ok(4));
+        assert_eq!(checked_io_count(5, 4), Err(Error::INVALID));
+    }
 }

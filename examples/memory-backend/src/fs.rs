@@ -201,6 +201,8 @@ impl MemoryFileSystem {
             return Err(Error(errno::EEXIST));
         }
 
+        let size = u64::try_from(bytes.len()).map_err(|_| Error(errno::EFBIG))?;
+        self.reserve_growth(0, allocated_size(size))?;
         let node = self.allocate_node(parent, kind, mode, bytes);
         let inode = node.state.read().metadata.inode;
         let slot = directory.slots.len();
@@ -213,10 +215,31 @@ impl MemoryFileSystem {
         directory.version = directory.version.wrapping_add(1).max(1);
         parent_state.metadata.modified_ns = now_ns();
         parent_state.metadata.generation = parent_state.metadata.generation.wrapping_add(1);
-        self.used_bytes
-            .fetch_add(node.state.read().metadata.allocated_size, Ordering::Relaxed);
         self.nodes.insert(inode, node);
         Ok(inode)
+    }
+
+    fn reserve_growth(&self, old: u64, new: u64) -> Result<()> {
+        let additional = new.saturating_sub(old);
+        if additional == 0 {
+            return Ok(());
+        }
+        self.used_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(additional)
+                    .filter(|total| *total <= self.capacity)
+            })
+            .map(|_| ())
+            .map_err(|_| Error(errno::ENOSPC))
+    }
+
+    fn update_usage(&self, old: u64, new: u64) -> Result<()> {
+        if new > old {
+            self.reserve_growth(old, new)
+        } else {
+            self.used_bytes.fetch_sub(old - new, Ordering::Relaxed);
+            Ok(())
+        }
     }
 }
 
@@ -251,14 +274,11 @@ impl Filesystem for MemoryFileSystem {
                 return Err(Error(errno::EISDIR));
             };
             let new_len = usize::try_from(size).map_err(|_| Error(errno::EFBIG))?;
+            let new_allocated = allocated_size(size);
+            self.update_usage(old_allocated, new_allocated)?;
             data.resize(new_len, 0);
             state.metadata.size = size;
-            state.metadata.allocated_size = allocated_size(size);
-            adjust_atomic(
-                &self.used_bytes,
-                old_allocated,
-                state.metadata.allocated_size,
-            );
+            state.metadata.allocated_size = new_allocated;
         }
         if let Some(mode) = update.mode {
             state.metadata.mode = mode & 0o7777;
@@ -361,6 +381,7 @@ impl Filesystem for MemoryFileSystem {
             return Err(Error(errno::ENOSPC));
         }
         if end > data.len() {
+            self.update_usage(old_allocated, allocated_size(end as u64))?;
             data.resize(end, 0);
         }
         data[start..end].copy_from_slice(input);
@@ -368,11 +389,6 @@ impl Filesystem for MemoryFileSystem {
         state.metadata.allocated_size = allocated_size(state.metadata.size);
         state.metadata.modified_ns = now_ns();
         state.metadata.generation = state.metadata.generation.wrapping_add(1);
-        adjust_atomic(
-            &self.used_bytes,
-            old_allocated,
-            state.metadata.allocated_size,
-        );
         Ok(input.len())
     }
 
@@ -454,6 +470,9 @@ impl Filesystem for MemoryFileSystem {
                 .clone()
                 .ok_or(Error(errno::ENOENT))?
         };
+        if source_parent == destination_parent && source_name == destination_name {
+            return Ok(());
+        }
         if source_entry.kind == FileType::Directory
             && self.is_descendant_of(destination_parent, source_entry.inode)?
         {
@@ -596,15 +615,7 @@ fn remove_destination(
 }
 
 const fn allocated_size(size: u64) -> u64 {
-    size.div_ceil(BLOCK_SIZE) * BLOCK_SIZE
-}
-
-fn adjust_atomic(value: &AtomicU64, old: u64, new: u64) {
-    if new >= old {
-        value.fetch_add(new - old, Ordering::Relaxed);
-    } else {
-        value.fetch_sub(old - new, Ordering::Relaxed);
-    }
+    size.div_ceil(BLOCK_SIZE).saturating_mul(BLOCK_SIZE)
 }
 
 #[cfg(unix)]
@@ -839,6 +850,94 @@ mod tests {
             Error(errno::ENOTEMPTY)
         );
         assert_eq!(filesystem.lookup(ROOT_INODE, b"source").unwrap().0, source);
+    }
+
+    #[test]
+    fn same_name_rename_is_a_noop_even_with_replacement_inode() {
+        let filesystem = MemoryFileSystem::new();
+        let inode = filesystem
+            .create(ROOT_INODE, b"same", FileType::File, 0o644)
+            .unwrap();
+
+        filesystem
+            .rename(ROOT_INODE, b"same", ROOT_INODE, b"same", Some(inode))
+            .unwrap();
+
+        assert_eq!(
+            filesystem.lookup(ROOT_INODE, b"same").unwrap(),
+            (inode, FileType::File)
+        );
+        assert_eq!(filesystem.metadata(inode).unwrap().inode, inode);
+    }
+
+    #[test]
+    fn capacity_is_enforced_across_files_and_failed_growth_is_atomic() {
+        let filesystem = MemoryFileSystem::with_capacity(BLOCK_SIZE * 2);
+        let first = filesystem
+            .create(ROOT_INODE, b"first", FileType::File, 0o644)
+            .unwrap();
+        let second = filesystem
+            .create(ROOT_INODE, b"second", FileType::File, 0o644)
+            .unwrap();
+        filesystem.write(first, 0, b"a").unwrap();
+        filesystem.write(second, 0, b"b").unwrap();
+
+        assert_eq!(
+            filesystem.write(first, BLOCK_SIZE, b"x").unwrap_err(),
+            Error(errno::ENOSPC)
+        );
+        assert_eq!(filesystem.metadata(first).unwrap().size, 1);
+        assert_eq!(filesystem.statfs().unwrap().free_bytes, 0);
+
+        filesystem
+            .set_metadata(
+                second,
+                SetMetadata {
+                    size: Some(0),
+                    ..SetMetadata::default()
+                },
+            )
+            .unwrap();
+        filesystem.write(first, BLOCK_SIZE, b"x").unwrap();
+        assert_eq!(filesystem.metadata(first).unwrap().size, BLOCK_SIZE + 1);
+    }
+
+    #[test]
+    fn concurrent_growth_cannot_overcommit_capacity() {
+        let filesystem = Arc::new(MemoryFileSystem::with_capacity(BLOCK_SIZE));
+        let first = filesystem
+            .create(ROOT_INODE, b"first", FileType::File, 0o644)
+            .unwrap();
+        let second = filesystem
+            .create(ROOT_INODE, b"second", FileType::File, 0o644)
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let threads: Vec<_> = [first, second]
+            .into_iter()
+            .map(|inode| {
+                let filesystem = Arc::clone(&filesystem);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    filesystem.write(inode, 0, b"x")
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Err(Error(errno::ENOSPC)))
+                .count(),
+            1
+        );
+        assert_eq!(filesystem.statfs().unwrap().free_bytes, 0);
     }
 
     #[test]

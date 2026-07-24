@@ -340,7 +340,12 @@ impl fuser::Filesystem for FuseAdapter {
         }
         READ_BUFFER.with_borrow_mut(|buffer| {
             buffer.resize(64 * 1024, 0);
-            match self.backend.filesystem().read_symlink(ino.0, buffer) {
+            match self
+                .backend
+                .filesystem()
+                .read_symlink(ino.0, buffer)
+                .and_then(|count| crate::core::checked_io_count(count, buffer.len()))
+            {
                 Ok(count) => reply.data(&buffer[..count]),
                 Err(error) => reply.error(errno(error)),
             }
@@ -511,7 +516,10 @@ impl fuser::Filesystem for FuseAdapter {
                 file.read_at(buffer, offset)
                     .map_err(|error| Error(error.raw_os_error().unwrap_or(libc::EIO)))
             } else {
-                self.backend.filesystem().read(ino.0, offset, buffer)
+                self.backend
+                    .filesystem()
+                    .read(ino.0, offset, buffer)
+                    .and_then(|count| crate::core::checked_io_count(count, buffer.len()))
             };
             match result {
                 Ok(count) => reply.data(&buffer[..count]),
@@ -550,7 +558,12 @@ impl fuser::Filesystem for FuseAdapter {
             reply.error(errno(error));
             return;
         }
-        match self.backend.filesystem().write(ino.0, offset, data) {
+        match self
+            .backend
+            .filesystem()
+            .write(ino.0, offset, data)
+            .and_then(|count| crate::core::checked_io_count(count, data.len()))
+        {
             Ok(count) => match u32::try_from(count) {
                 Ok(count) => reply.written(count),
                 Err(_) => reply.error(Errno::EOVERFLOW),

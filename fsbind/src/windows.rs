@@ -215,7 +215,7 @@ impl Drop for MountSession {
 struct WindowsState {
     filesystem: Arc<dyn Filesystem>,
     raw_mask: RawEventMask,
-    enumerations: Mutex<HashMap<[u8; 16], Enumeration>>,
+    enumerations: Mutex<HashMap<[u8; 16], Arc<Mutex<Enumeration>>>>,
 }
 
 impl WindowsState {
@@ -306,10 +306,11 @@ struct CollectSink<'a> {
 impl DirectorySink for CollectSink<'_> {
     fn push(&mut self, entry: DirectoryEntry<'_>) -> bool {
         match self.filesystem.metadata(entry.inode) {
-            Ok(metadata) => self.entries.push(WindowsEntry {
-                name: decode_wtf8(entry.name),
-                metadata,
-            }),
+            Ok(metadata) => {
+                let mut name = decode_wtf8(entry.name);
+                name.push(0);
+                self.entries.push(WindowsEntry { name, metadata });
+            }
             Err(error) => {
                 self.error = Some(error);
                 return false;
@@ -345,6 +346,12 @@ unsafe extern "system" fn start_directory(
             .read_directory(inode, cookie, verifier, &mut sink)
         {
             Ok(result) => {
+                if let Some(error) = sink.error {
+                    return error_hresult(error);
+                }
+                if !result.eof && result.next_cookie == cookie {
+                    return error_hresult(Error::INVALID);
+                }
                 cookie = result.next_cookie;
                 verifier = result.verifier;
                 if result.eof {
@@ -357,16 +364,18 @@ unsafe extern "system" fn start_directory(
     if let Some(error) = sink.error {
         return error_hresult(error);
     }
-    sink.entries
-        .sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    sink.entries.sort_unstable_by(|left, right| {
+        // SAFETY: collected names are null-terminated UTF-16 strings.
+        unsafe { PrjFileNameCompare(left.name.as_ptr(), right.name.as_ptr()) }.cmp(&0)
+    });
     // SAFETY: enumeration_id references one GUID.
     let key = unsafe { guid_bytes(enumeration_id) };
     state.enumerations.lock().insert(
         key,
-        Enumeration {
+        Arc::new(Mutex::new(Enumeration {
             entries: sink.entries,
             index: 0,
-        },
+        })),
     );
     S_OK
 }
@@ -393,20 +402,18 @@ unsafe extern "system" fn get_directory(
     // SAFETY: pointers are callback-scoped and valid.
     let state = unsafe { WindowsState::from_callback(callback) };
     let key = unsafe { guid_bytes(enumeration_id) };
-    let mut sessions = state.enumerations.lock();
-    let Some(session) = sessions.get_mut(&key) else {
+    let Some(session) = state.enumerations.lock().get(&key).cloned() else {
         return hresult(ERROR_INVALID_PARAMETER);
     };
+    let mut session = session.lock();
     // SAFETY: callback references initialized callback data.
     if unsafe { (*callback).Flags } & PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN != 0 {
         session.index = 0;
     }
     while let Some(entry) = session.entries.get(session.index) {
-        let mut name = entry.name.clone();
-        name.push(0);
         if !search_expression.is_null()
             // SAFETY: both are null-terminated UTF-16 strings.
-            && !unsafe { PrjFileNameMatch(name.as_ptr(), search_expression) }
+            && !unsafe { PrjFileNameMatch(entry.name.as_ptr(), search_expression) }
         {
             session.index += 1;
             continue;
@@ -414,7 +421,7 @@ unsafe extern "system" fn get_directory(
         let info = basic_info(entry.metadata);
         // SAFETY: name and info remain alive for this call.
         let result =
-            unsafe { PrjFillDirEntryBuffer(name.as_ptr(), &raw const info, buffer_handle) };
+            unsafe { PrjFillDirEntryBuffer(entry.name.as_ptr(), &raw const info, buffer_handle) };
         if result == hresult(ERROR_INSUFFICIENT_BUFFER) {
             break;
         }
@@ -491,7 +498,11 @@ unsafe extern "system" fn get_file_data(
     };
     // SAFETY: buffer is live and writable until it is freed below.
     let bytes = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), length as usize) };
-    let count = match state.filesystem.read(inode, offset, bytes) {
+    let count = match state
+        .filesystem
+        .read(inode, offset, bytes)
+        .and_then(|count| crate::core::checked_io_count(count, bytes.len()))
+    {
         Ok(value) => value,
         Err(error) => {
             // SAFETY: buffer came from PrjAllocateAlignedBuffer.

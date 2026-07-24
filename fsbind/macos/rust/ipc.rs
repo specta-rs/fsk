@@ -233,14 +233,19 @@ impl Service {
                     return Err(Error::INVALID);
                 }
                 let mut output = vec![0; length];
-                let count = fs.read(inode, offset, &mut output)?;
+                let count = fs
+                    .read(inode, offset, &mut output)
+                    .and_then(|count| crate::core::checked_io_count(count, output.len()))?;
                 output.truncate(count);
                 Ok(output)
             }
             opcode::WRITE => {
                 let inode = input.u64()?;
                 let offset = input.u64()?;
-                let count = fs.write(inode, offset, input.remaining())?;
+                let input = input.remaining();
+                let count = fs
+                    .write(inode, offset, input)
+                    .and_then(|count| crate::core::checked_io_count(count, input.len()))?;
                 let mut output = Encoder::with_capacity(8);
                 output.u64(u64::try_from(count).map_err(|_| Error::INVALID)?);
                 Ok(output.finish())
@@ -264,7 +269,9 @@ impl Service {
                 let inode = input.u64()?;
                 let capacity = usize::try_from(input.u32()?).map_err(|_| Error::INVALID)?;
                 let mut output = vec![0; capacity.min(MAX_FRAME)];
-                let count = fs.read_symlink(inode, &mut output)?;
+                let count = fs
+                    .read_symlink(inode, &mut output)
+                    .and_then(|count| crate::core::checked_io_count(count, output.len()))?;
                 output.truncate(count);
                 Ok(output)
             }
