@@ -85,8 +85,8 @@ impl MemoryFileSystem {
                     modified_ns: now,
                     accessed_ns: now,
                     mode: 0o755,
-                    uid: unsafe { libc_getuid() },
-                    gid: unsafe { libc_getgid() },
+                    uid: current_uid(),
+                    gid: current_gid(),
                     link_count: 1,
                     kind: FileType::Directory,
                 },
@@ -154,8 +154,8 @@ impl MemoryFileSystem {
                     modified_ns: now,
                     accessed_ns: now,
                     mode: mode & 0o7777,
-                    uid: unsafe { libc_getuid() },
-                    gid: unsafe { libc_getgid() },
+                    uid: current_uid(),
+                    gid: current_gid(),
                     link_count: 1,
                     kind,
                 },
@@ -589,6 +589,7 @@ fn adjust_atomic(value: &AtomicU64, old: u64, new: u64) {
     }
 }
 
+#[cfg(unix)]
 unsafe extern "C" {
     #[link_name = "getuid"]
     fn c_getuid() -> u32;
@@ -596,12 +597,26 @@ unsafe extern "C" {
     fn c_getgid() -> u32;
 }
 
-unsafe fn libc_getuid() -> u32 {
+#[cfg(unix)]
+fn current_uid() -> u32 {
     unsafe { c_getuid() }
 }
 
-unsafe fn libc_getgid() -> u32 {
+#[cfg(unix)]
+fn current_gid() -> u32 {
     unsafe { c_getgid() }
+}
+
+// Windows has no numeric POSIX UID/GID. Zero is the neutral value consumed by
+// the portable model; ProjFS applies Windows ACLs to the virtualization root.
+#[cfg(windows)]
+const fn current_uid() -> u32 {
+    0
+}
+
+#[cfg(windows)]
+const fn current_gid() -> u32 {
+    0
 }
 
 mod errno {
