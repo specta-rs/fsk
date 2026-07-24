@@ -220,7 +220,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\ncd \"$SRCROOT\"\nbuild_arch=\"$CURRENT_ARCH\"\nif [ \"$build_arch\" = \"undefined_arch\" ]; then build_arch=\"$NATIVE_ARCH_ACTUAL\"; fi\ncase \"$build_arch\" in\n  arm64) rust_target=\"aarch64-apple-darwin\" ;;\n  x86_64) rust_target=\"x86_64-apple-darwin\" ;;\n  *) echo \"Unsupported architecture: $build_arch\" >&2; exit 1 ;;\nesac\ncargo build --release -p fsbind-memory-backend --target \"$rust_target\"\noutput_dir=\"$SRCROOT/target/xcode/$build_arch\"\nmkdir -p \"$output_dir\"\ncp \"$SRCROOT/target/$rust_target/release/libfsbind_memory_backend.a\" \"$output_dir/\"\n";
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT\"\nbuild_arch=\"$CURRENT_ARCH\"\nif [ \"$build_arch\" = \"undefined_arch\" ]; then\n  set -- $ARCHS\n  build_arch=\"${1:-$NATIVE_ARCH_ACTUAL}\"\nfi\ncase \"$build_arch\" in\n  arm64) rust_target=\"aarch64-apple-darwin\" ;;\n  x86_64) rust_target=\"x86_64-apple-darwin\" ;;\n  *) echo \"Unsupported architecture: $build_arch\" >&2; exit 1 ;;\nesac\ncargo build --release -p fsbind-memory-backend --target \"$rust_target\"\noutput_dir=\"$SRCROOT/target/xcode/$build_arch\"\nmkdir -p \"$output_dir\"\ncp \"$SRCROOT/target/$rust_target/release/libfsbind_memory_backend.a\" \"$output_dir/\"\n";
 		};
 		9B58B8AE8D851C4CDCB2C754 /* Build Rust backend */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -239,7 +239,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\ncd \"$SRCROOT\"\nbuild_arch=\"$CURRENT_ARCH\"\nif [ \"$build_arch\" = \"undefined_arch\" ]; then build_arch=\"$NATIVE_ARCH_ACTUAL\"; fi\ncase \"$build_arch\" in\n  arm64) rust_target=\"aarch64-apple-darwin\" ;;\n  x86_64) rust_target=\"x86_64-apple-darwin\" ;;\n  *) echo \"Unsupported architecture: $build_arch\" >&2; exit 1 ;;\nesac\ncargo build --release -p fsbind-memory-backend --target \"$rust_target\"\noutput_dir=\"$SRCROOT/target/xcode/$build_arch\"\nmkdir -p \"$output_dir\"\ncp \"$SRCROOT/target/$rust_target/release/libfsbind_memory_backend.a\" \"$output_dir/\"\n";
+			shellScript = "set -euo pipefail\ncd \"$SRCROOT\"\nbuild_arch=\"$CURRENT_ARCH\"\nif [ \"$build_arch\" = \"undefined_arch\" ]; then\n  set -- $ARCHS\n  build_arch=\"${1:-$NATIVE_ARCH_ACTUAL}\"\nfi\ncase \"$build_arch\" in\n  arm64) rust_target=\"aarch64-apple-darwin\" ;;\n  x86_64) rust_target=\"x86_64-apple-darwin\" ;;\n  *) echo \"Unsupported architecture: $build_arch\" >&2; exit 1 ;;\nesac\ncargo build --release -p fsbind-memory-backend --target \"$rust_target\"\noutput_dir=\"$SRCROOT/target/xcode/$build_arch\"\nmkdir -p \"$output_dir\"\ncp \"$SRCROOT/target/$rust_target/release/libfsbind_memory_backend.a\" \"$output_dir/\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

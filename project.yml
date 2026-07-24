@@ -44,7 +44,10 @@ targets:
           set -euo pipefail
           cd "$SRCROOT"
           build_arch="$CURRENT_ARCH"
-          if [ "$build_arch" = "undefined_arch" ]; then build_arch="$NATIVE_ARCH_ACTUAL"; fi
+          if [ "$build_arch" = "undefined_arch" ]; then
+            set -- $ARCHS
+            build_arch="${1:-$NATIVE_ARCH_ACTUAL}"
+          fi
           case "$build_arch" in
             arm64) rust_target="aarch64-apple-darwin" ;;
             x86_64) rust_target="x86_64-apple-darwin" ;;
@@ -85,7 +88,10 @@ targets:
           set -euo pipefail
           cd "$SRCROOT"
           build_arch="$CURRENT_ARCH"
-          if [ "$build_arch" = "undefined_arch" ]; then build_arch="$NATIVE_ARCH_ACTUAL"; fi
+          if [ "$build_arch" = "undefined_arch" ]; then
+            set -- $ARCHS
+            build_arch="${1:-$NATIVE_ARCH_ACTUAL}"
+          fi
           case "$build_arch" in
             arm64) rust_target="aarch64-apple-darwin" ;;
             x86_64) rust_target="x86_64-apple-darwin" ;;
