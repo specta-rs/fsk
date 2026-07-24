@@ -1,10 +1,21 @@
 [package]
 name = "fsbind"
 version = "0.1.0"
-description = "Fast Rust backends for macOS FSKit extensions"
+description = "Build high-performance local and network filesystems with macOS FSKit and Rust"
+authors = ["Oscar Beaumont <oscar@otbeaumont.me>"]
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository = "https://github.com/specta-rs/fsbind"
+documentation = "https://docs.rs/fsbind/latest/fsbind"
+readme = "../../README.md"
+keywords = ["fskit", "filesystem", "macos", "ffi", "network"]
+categories = ["api-bindings", "filesystem", "os::macos-apis"]
+include = ["/src", "/examples", "/Cargo.toml"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 dashmap = "6.1"
@@ -12,7 +23,7 @@ parking_lot = "0.12"
 
 [dev-dependencies]
 proptest = "1.7"
+tempfile = "3"
 
 [lints]
 workspace = true
-

@@ -7,7 +7,7 @@ final class FSBindFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         resource: FSResource,
         replyHandler: @escaping (FSProbeResult?, (any Error)?) -> Void
     ) {
-        guard resource is FSPathURLResource else {
+        guard resource is FSPathURLResource || resource is FSGenericURLResource else {
             replyHandler(nil, POSIXError(.ENODEV))
             return
         }
@@ -20,7 +20,12 @@ final class FSBindFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         options: FSTaskOptions,
         replyHandler: @escaping (FSVolume?, (any Error)?) -> Void
     ) {
-        guard resource is FSPathURLResource else {
+        let resourceURL: URL
+        if let pathResource = resource as? FSPathURLResource {
+            resourceURL = pathResource.url
+        } else if let genericResource = resource as? FSGenericURLResource {
+            resourceURL = genericResource.url
+        } else {
             replyHandler(nil, POSIXError(.EINVAL))
             return
         }
@@ -28,8 +33,15 @@ final class FSBindFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
             replyHandler(nil, POSIXError(.ENOTSUP))
             return
         }
-        containerStatus = .ready
-        replyHandler(FSBindVolume(backend: RustBackend()), nil)
+        do {
+            let backend = try RustBackend(resourceURL: resourceURL)
+            containerStatus = .ready
+            replyHandler(FSBindVolume(backend: backend), nil)
+        } catch let error as RustBackendError {
+            replyHandler(nil, error.asPOSIXError)
+        } catch {
+            replyHandler(nil, error)
+        }
     }
 
     func unloadResource(
@@ -40,4 +52,3 @@ final class FSBindFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         replyHandler(nil)
     }
 }
-

@@ -10,12 +10,29 @@ extern "C" {
 
 typedef void *FSBVolumeRef;
 
-#define FSB_ABI_VERSION 1u
+#define FSB_ABI_VERSION 2u
 
 enum {
     FSB_KIND_FILE = 1,
     FSB_KIND_DIRECTORY = 2,
     FSB_KIND_SYMLINK = 3,
+};
+
+enum {
+    FSB_FILESYSTEM_LOCAL = 0,
+    FSB_FILESYSTEM_NETWORK = 1,
+};
+
+enum {
+    FSB_CACHE_NONE = 0,
+    FSB_CACHE_METADATA_ONLY = 1,
+    FSB_CACHE_READ = 2,
+    FSB_CACHE_READ_WRITE = 3,
+};
+
+enum {
+    FSB_FILE_REMOTE = 0,
+    FSB_FILE_LOCAL = 1,
 };
 
 enum {
@@ -73,9 +90,32 @@ typedef struct {
     uint8_t reserved;
 } FSBDirEntry;
 
-FSBVolumeRef fsb_volume_create(void);
+typedef struct {
+    uint8_t kind;
+    uint8_t lazy;
+    uint8_t supports_local_files;
+    uint8_t kernel_cache_policy;
+    uint8_t reserved[4];
+} FSBConfiguration;
+
+typedef struct {
+    uint64_t lease;
+    uint64_t generation;
+    size_t path_length;
+    uint8_t source;
+    uint8_t reserved[7];
+} FSBOpenFile;
+
+FSBVolumeRef fsb_volume_create(const uint8_t *resource,
+                               size_t resource_length,
+                               int32_t *error_out);
 uint32_t fsb_abi_version(void);
 void fsb_volume_destroy(FSBVolumeRef volume);
+int32_t fsb_configuration(FSBVolumeRef volume, FSBConfiguration *output);
+int32_t fsb_open_file(FSBVolumeRef volume, uint64_t inode, uint8_t writable,
+                      uint8_t *path, size_t path_capacity,
+                      FSBOpenFile *output);
+int32_t fsb_close_file(FSBVolumeRef volume, uint64_t lease);
 int32_t fsb_statfs(FSBVolumeRef volume, FSBStatFS *output);
 int32_t fsb_getattr(FSBVolumeRef volume, uint64_t inode, FSBAttributes *output);
 int32_t fsb_setattr(FSBVolumeRef volume, uint64_t inode,

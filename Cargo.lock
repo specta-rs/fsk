@@ -84,10 +84,18 @@ dependencies = [
  "dashmap",
  "parking_lot",
  "proptest",
+ "tempfile",
 ]
 
 [[package]]
 name = "fsbind-memory-backend"
+version = "0.1.0"
+dependencies = [
+ "fsbind",
+]
+
+[[package]]
+name = "fsbind-network-backend"
 version = "0.1.0"
 dependencies = [
  "fsbind",

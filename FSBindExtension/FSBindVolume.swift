@@ -5,7 +5,11 @@ import os
 private let rootInode: UInt64 = 1
 private let directoryCookieBias: UInt64 = 2
 
-final class FSBindVolume: FSVolume, FSVolume.ReadWriteOperations, @unchecked Sendable {
+final class FSBindVolume: FSVolume,
+    FSVolume.ReadWriteOperations,
+    FSVolume.OpenCloseOperations,
+    @unchecked Sendable
+{
     let backend: RustBackend
     let rootItem = FSBindItem(inode: rootInode, kind: .directory)
     private let itemCache = OSAllocatedUnfairLock(initialState: [UInt64: FSBindItem]())
@@ -32,7 +36,7 @@ final class FSBindVolume: FSVolume, FSVolume.ReadWriteOperations, @unchecked Sen
         capabilities.supportsSymbolicLinks = true
         capabilities.supportsSparseFiles = true
         capabilities.supportsZeroRuns = true
-        capabilities.supportsFastStatFS = true
+        capabilities.supportsFastStatFS = !backend.configuration.isNetwork
         capabilities.supports2TBFiles = true
         capabilities.supports64BitObjectIDs = true
         capabilities.caseFormat = .sensitive
@@ -74,8 +78,15 @@ final class FSBindVolume: FSVolume, FSVolume.ReadWriteOperations, @unchecked Sen
         options: FSDeactivateOptions = [],
         replyHandler: @escaping ((any Error)?) -> Void
     ) {
-        itemCache.withLock { cache in
+        let items = itemCache.withLock { cache -> [FSBindItem] in
+            let items = Array(cache.values)
             cache.removeAll(keepingCapacity: false)
+            return items
+        }
+        for item in items {
+            if let lease = item.releaseOpenState() {
+                try? backend.close(lease: lease)
+            }
         }
         replyHandler(nil)
     }
@@ -179,6 +190,9 @@ final class FSBindVolume: FSVolume, FSVolume.ReadWriteOperations, @unchecked Sen
         }
         if item.inode != rootInode {
             _ = itemCache.withLock { $0.removeValue(forKey: item.inode) }
+        }
+        if let lease = item.releaseOpenState() {
+            try? backend.close(lease: lease)
         }
         replyHandler(nil)
     }
@@ -389,11 +403,20 @@ final class FSBindVolume: FSVolume, FSVolume.ReadWriteOperations, @unchecked Sen
             var operationError: Error?
             buffer.withUnsafeMutableBytes { bytes in
                 do {
-                    count = try backend.read(
-                        inode: item.inode,
-                        offset: UInt64(offset),
-                        into: UnsafeMutableRawBufferPointer(rebasing: bytes.prefix(length))
-                    )
+                    let target = UnsafeMutableRawBufferPointer(rebasing: bytes.prefix(length))
+                    if let localCount = try item.readLocal(
+                        offset: offset,
+                        length: length,
+                        into: target
+                    ) {
+                        count = localCount
+                    } else {
+                        count = try backend.read(
+                            inode: item.inode,
+                            offset: UInt64(offset),
+                            into: target
+                        )
+                    }
                 } catch {
                     operationError = error
                 }
@@ -421,6 +444,54 @@ final class FSBindVolume: FSVolume, FSVolume.ReadWriteOperations, @unchecked Sen
             replyHandler(try backend.write(inode: item.inode, offset: UInt64(offset), data: contents), nil)
         } catch {
             replyHandler(0, posix(error))
+        }
+    }
+
+    func openItem(
+        _ item: FSItem,
+        modes: FSVolume.OpenModes,
+        replyHandler: @escaping ((any Error)?) -> Void
+    ) {
+        guard let item = item as? FSBindItem else {
+            replyHandler(POSIXError(.EINVAL))
+            return
+        }
+        guard backend.configuration.isNetwork, item.kind == .file else {
+            replyHandler(nil)
+            return
+        }
+        do {
+            let opened = try backend.open(inode: item.inode, writable: modes.contains(.write))
+            do {
+                try item.install(opened)
+            } catch {
+                try? backend.close(lease: opened.lease)
+                throw error
+            }
+            replyHandler(nil)
+        } catch {
+            replyHandler(posix(error))
+        }
+    }
+
+    func closeItem(
+        _ item: FSItem,
+        modes: FSVolume.OpenModes,
+        replyHandler: @escaping ((any Error)?) -> Void
+    ) {
+        guard let item = item as? FSBindItem else {
+            replyHandler(POSIXError(.EINVAL))
+            return
+        }
+        guard modes.isEmpty, let lease = item.releaseOpenState() else {
+            replyHandler(nil)
+            return
+        }
+        do {
+            try backend.close(lease: lease)
+            replyHandler(nil)
+        } catch {
+            replyHandler(posix(error))
         }
     }
 
@@ -456,6 +527,12 @@ final class FSBindVolume: FSVolume, FSVolume.ReadWriteOperations, @unchecked Sen
         if wants(.modifyTime) { result.modifyTime = timespec(value.modified_ns) }
         if wants(.changeTime) { result.changeTime = timespec(value.modified_ns) }
         if wants(.accessTime) { result.accessTime = timespec(value.accessed_ns) }
+        if wants(.inhibitKernelOffloadedIO),
+           backend.configuration.isNetwork,
+           backend.configuration.isLazy
+        {
+            result.inhibitKernelOffloadedIO = true
+        }
         return result
     }
 

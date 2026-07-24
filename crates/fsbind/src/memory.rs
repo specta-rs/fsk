@@ -1,5 +1,5 @@
 use crate::{
-    DirectoryEntry, DirectorySink, Error, FileSystem, FileType, Metadata, ROOT_INODE,
+    DirectoryEntry, DirectorySink, Error, FileType, Filesystem, Metadata, ROOT_INODE,
     ReadDirectoryResult, Result, SetMetadata, StatFs, now_ns,
 };
 use dashmap::DashMap;
@@ -202,7 +202,7 @@ impl MemoryFileSystem {
     }
 }
 
-impl FileSystem for MemoryFileSystem {
+impl Filesystem for MemoryFileSystem {
     fn statfs(&self) -> Result<StatFs> {
         let used = self.used_bytes.load(Ordering::Relaxed).min(self.capacity);
         let free = self.capacity - used;

@@ -1,0 +1,17 @@
+[package]
+name = "fsbind-network-backend"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+fsbind = { path = "../../crates/fsbind" }
+
+[lints]
+workspace = true
+

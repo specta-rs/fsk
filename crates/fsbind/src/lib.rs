@@ -1,18 +1,22 @@
 //! A small, allocation-conscious interface for implementing macOS `FSKit` volumes in Rust.
 //!
-//! Backends implement [`FileSystem`]. The [`export_filesystem!`] macro turns a factory
+//! Backends implement [`Filesystem`]. The [`export_filesystem!`] macro turns a factory
 //! into the stable C ABI consumed by the Swift `FSKit` extension.
 
 mod ffi;
 mod memory;
+mod network;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use ffi::{FsbAttributes, FsbDirEntry, FsbSetAttributes, FsbStatFs};
 pub use memory::MemoryFileSystem;
+pub use network::{
+    KernelCachePolicy, LocalFile, Mount, NetworkConfiguration, NetworkFile, NetworkFilesystem,
+};
 
 /// Version of the C ABI implemented by this crate.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// The root inode. `FSKit` treats inode values as opaque, except that zero is invalid.
 pub const ROOT_INODE: u64 = 1;
@@ -108,7 +112,7 @@ pub struct ReadDirectoryResult {
 /// Methods may run concurrently. Implementations must be thread-safe and must return
 /// positive POSIX errno values in [`Error`].
 #[allow(clippy::missing_errors_doc)]
-pub trait FileSystem: Send + Sync + 'static {
+pub trait Filesystem: Send + Sync + 'static {
     fn statfs(&self) -> Result<StatFs>;
     fn metadata(&self, inode: u64) -> Result<Metadata>;
     fn set_metadata(&self, _inode: u64, _update: SetMetadata) -> Result<Metadata> {
@@ -188,15 +192,47 @@ pub fn now_ns() -> u64 {
 macro_rules! export_filesystem {
     ($factory:path) => {
         #[unsafe(no_mangle)]
-        pub extern "C" fn fsb_volume_create() -> *mut ::core::ffi::c_void {
+        pub unsafe extern "C" fn fsb_volume_create(
+            _resource: *const u8,
+            _resource_length: usize,
+            error_out: *mut i32,
+        ) -> *mut ::core::ffi::c_void {
+            if !error_out.is_null() {
+                unsafe { *error_out = 0 };
+            }
             $crate::__private::create_volume($factory())
+        }
+    };
+}
+
+/// Exports a network backend factory using the ABI expected by `FSBindExtension`.
+///
+/// The factory receives the URL used to mount the volume and returns either a
+/// network filesystem or a positive Darwin errno.
+#[macro_export]
+macro_rules! export_network_filesystem {
+    ($factory:path) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn fsb_volume_create(
+            resource: *const u8,
+            resource_length: usize,
+            error_out: *mut i32,
+        ) -> *mut ::core::ffi::c_void {
+            unsafe {
+                $crate::__private::create_network_volume_from_raw(
+                    resource,
+                    resource_length,
+                    error_out,
+                    $factory,
+                )
+            }
         }
     };
 }
 
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::ffi::create_volume;
+    pub use crate::ffi::{create_network_volume_from_raw, create_volume};
 }
 
 mod libc_errno {

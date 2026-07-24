@@ -1,11 +1,15 @@
 use crate::{
-    ABI_VERSION, DirectoryEntry, DirectorySink, Error, FileSystem, FileType, Metadata,
-    ReadDirectoryResult, SetMetadata, StatFs,
+    ABI_VERSION, DirectoryEntry, DirectorySink, Error, FileType, Filesystem, Metadata, Mount,
+    NetworkFile, NetworkFilesystem, ReadDirectoryResult, SetMetadata, StatFs,
 };
+use parking_lot::Mutex;
 use std::{
+    collections::HashMap,
     ffi::c_void,
+    os::unix::ffi::OsStrExt,
     panic::{AssertUnwindSafe, catch_unwind},
     ptr, slice,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 const EIO: i32 = 5;
@@ -66,15 +70,126 @@ pub struct FsbDirEntry {
     pub reserved: u8,
 }
 
-struct Volume {
-    filesystem: Box<dyn FileSystem>,
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FsbConfiguration {
+    pub kind: u8,
+    pub lazy: u8,
+    pub supports_local_files: u8,
+    pub kernel_cache_policy: u8,
+    pub reserved: [u8; 4],
 }
 
-pub fn create_volume(filesystem: impl FileSystem) -> *mut c_void {
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FsbOpenFile {
+    pub lease: u64,
+    pub generation: u64,
+    pub path_length: usize,
+    pub source: u8,
+    pub reserved: [u8; 7],
+}
+
+enum Backend {
+    Local(Box<dyn Filesystem>),
+    Network(Box<dyn NetworkFilesystem>),
+}
+
+impl Backend {
+    fn filesystem(&self) -> &dyn Filesystem {
+        match self {
+            Self::Local(filesystem) => filesystem.as_ref(),
+            Self::Network(filesystem) => filesystem.as_ref(),
+        }
+    }
+
+    fn network(&self) -> Option<&dyn NetworkFilesystem> {
+        match self {
+            Self::Local(_) => None,
+            Self::Network(filesystem) => Some(filesystem.as_ref()),
+        }
+    }
+}
+
+struct Volume {
+    backend: Backend,
+    leases: Mutex<HashMap<u64, (u64, NetworkFile)>>,
+    next_lease: AtomicU64,
+}
+
+impl Volume {
+    fn new(backend: Backend) -> Self {
+        Self {
+            backend,
+            leases: Mutex::new(HashMap::new()),
+            next_lease: AtomicU64::new(1),
+        }
+    }
+}
+
+impl Drop for Volume {
+    fn drop(&mut self) {
+        let Some(network) = self.backend.network() else {
+            return;
+        };
+        for (_, (inode, file)) in self.leases.get_mut().drain() {
+            let _ = network.close_file(inode, file);
+        }
+    }
+}
+
+pub fn create_volume(filesystem: impl Filesystem) -> *mut c_void {
+    Box::into_raw(Box::new(Volume::new(Backend::Local(Box::new(filesystem))))).cast()
+}
+
+fn create_network_volume(filesystem: impl NetworkFilesystem) -> *mut c_void {
     Box::into_raw(Box::new(Volume {
-        filesystem: Box::new(filesystem),
+        backend: Backend::Network(Box::new(filesystem)),
+        leases: Mutex::new(HashMap::new()),
+        next_lease: AtomicU64::new(1),
     }))
     .cast()
+}
+
+/// Builds an exported network volume from the raw mount URL.
+///
+/// # Safety
+///
+/// `resource` must reference `resource_length` readable bytes when the length is
+/// nonzero. `error_out`, when non-null, must be writable.
+pub unsafe fn create_network_volume_from_raw<T>(
+    resource: *const u8,
+    resource_length: usize,
+    error_out: *mut i32,
+    factory: impl FnOnce(&Mount) -> Result<T, Error>,
+) -> *mut c_void
+where
+    T: NetworkFilesystem,
+{
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let resource = unsafe { bytes(resource, resource_length)? };
+        factory(&Mount::new(resource.to_vec()))
+    }));
+    match result {
+        Ok(Ok(filesystem)) => {
+            if !error_out.is_null() {
+                unsafe { ptr::write(error_out, 0) };
+            }
+            create_network_volume(filesystem)
+        }
+        Ok(Err(error)) => {
+            if !error_out.is_null() {
+                unsafe { ptr::write(error_out, error.0.max(1)) };
+            }
+            ptr::null_mut()
+        }
+        Err(_) => {
+            if !error_out.is_null() {
+                unsafe { ptr::write(error_out, EIO) };
+            }
+            ptr::null_mut()
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -82,12 +197,15 @@ pub extern "C" fn fsb_abi_version() -> u32 {
     ABI_VERSION
 }
 
-unsafe fn volume<'a>(pointer: *mut c_void) -> Result<&'a dyn FileSystem, Error> {
+unsafe fn volume_handle<'a>(pointer: *mut c_void) -> Result<&'a Volume, Error> {
     if pointer.is_null() {
         return Err(Error(EINVAL));
     }
-    let volume = unsafe { &*pointer.cast::<Volume>() };
-    Ok(volume.filesystem.as_ref())
+    Ok(unsafe { &*pointer.cast::<Volume>() })
+}
+
+unsafe fn volume<'a>(pointer: *mut c_void) -> Result<&'a dyn Filesystem, Error> {
+    Ok(unsafe { volume_handle(pointer)? }.backend.filesystem())
 }
 
 fn status(function: impl FnOnce() -> Result<(), Error>) -> i32 {
@@ -125,6 +243,97 @@ pub unsafe extern "C" fn fsb_volume_destroy(pointer: *mut c_void) {
             drop(unsafe { Box::from_raw(pointer.cast::<Volume>()) });
         }));
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fsb_configuration(
+    pointer: *mut c_void,
+    output: *mut FsbConfiguration,
+) -> i32 {
+    status(|| {
+        if output.is_null() {
+            return Err(Error(EINVAL));
+        }
+        let volume = unsafe { volume_handle(pointer)? };
+        let configuration = if let Some(network) = volume.backend.network() {
+            let configuration = network.network_configuration();
+            FsbConfiguration {
+                kind: 1,
+                lazy: u8::from(configuration.lazy),
+                supports_local_files: u8::from(configuration.supports_local_files),
+                kernel_cache_policy: configuration.kernel_cache_policy as u8,
+                reserved: [0; 4],
+            }
+        } else {
+            FsbConfiguration::default()
+        };
+        unsafe { ptr::write(output, configuration) };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fsb_open_file(
+    pointer: *mut c_void,
+    inode: u64,
+    writable: u8,
+    path: *mut u8,
+    path_capacity: usize,
+    output: *mut FsbOpenFile,
+) -> i32 {
+    status(|| {
+        if output.is_null() {
+            return Err(Error(EINVAL));
+        }
+        let volume = unsafe { volume_handle(pointer)? };
+        let Some(network) = volume.backend.network() else {
+            unsafe { ptr::write(output, FsbOpenFile::default()) };
+            return Ok(());
+        };
+        let file = network.open_file(inode, writable != 0)?;
+        let (source, generation, path_bytes) = match &file {
+            NetworkFile::Remote => (0, 0, &[][..]),
+            NetworkFile::Local(local) => {
+                (1, local.generation(), local.path().as_os_str().as_bytes())
+            }
+        };
+        if path_bytes.len() > path_capacity || (!path_bytes.is_empty() && path.is_null()) {
+            let _ = network.close_file(inode, file);
+            return Err(Error(ERANGE));
+        }
+        if !path_bytes.is_empty() {
+            unsafe { ptr::copy_nonoverlapping(path_bytes.as_ptr(), path, path_bytes.len()) };
+        }
+        let path_length = path_bytes.len();
+        let lease = volume.next_lease.fetch_add(1, Ordering::Relaxed).max(1);
+        volume.leases.lock().insert(lease, (inode, file));
+        unsafe {
+            ptr::write(
+                output,
+                FsbOpenFile {
+                    lease,
+                    generation,
+                    path_length,
+                    source,
+                    reserved: [0; 7],
+                },
+            );
+        }
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fsb_close_file(pointer: *mut c_void, lease: u64) -> i32 {
+    status(|| {
+        if lease == 0 {
+            return Ok(());
+        }
+        let volume = unsafe { volume_handle(pointer)? };
+        let network = volume.backend.network().ok_or(Error(EINVAL))?;
+        let (inode, file) = volume.leases.lock().remove(&lease).ok_or(Error(EINVAL))?;
+        network.close_file(inode, file)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -478,5 +687,124 @@ impl From<FsbSetAttributes> for SetMetadata {
             accessed_ns: (value.valid & 16 != 0).then_some(value.accessed_ns),
             modified_ns: (value.valid & 32 != 0).then_some(value.modified_ns),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        FileType, KernelCachePolicy, LocalFile, MemoryFileSystem, NetworkConfiguration, ROOT_INODE,
+        ReadDirectoryResult,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct TestNetworkFilesystem {
+        inner: MemoryFileSystem,
+        local_path: std::path::PathBuf,
+        closes: Arc<AtomicUsize>,
+    }
+
+    impl Filesystem for TestNetworkFilesystem {
+        fn statfs(&self) -> crate::Result<StatFs> {
+            self.inner.statfs()
+        }
+
+        fn metadata(&self, inode: u64) -> crate::Result<Metadata> {
+            self.inner.metadata(inode)
+        }
+
+        fn lookup(&self, parent: u64, name: &[u8]) -> crate::Result<(u64, FileType)> {
+            self.inner.lookup(parent, name)
+        }
+
+        fn read_directory(
+            &self,
+            inode: u64,
+            cookie: u64,
+            verifier: u64,
+            sink: &mut dyn DirectorySink,
+        ) -> crate::Result<ReadDirectoryResult> {
+            self.inner.read_directory(inode, cookie, verifier, sink)
+        }
+
+        fn read(&self, inode: u64, offset: u64, output: &mut [u8]) -> crate::Result<usize> {
+            self.inner.read(inode, offset, output)
+        }
+    }
+
+    impl NetworkFilesystem for TestNetworkFilesystem {
+        fn network_configuration(&self) -> NetworkConfiguration {
+            NetworkConfiguration {
+                lazy: true,
+                supports_local_files: true,
+                kernel_cache_policy: KernelCachePolicy::MetadataOnly,
+            }
+        }
+
+        fn open_file(&self, _inode: u64, _writable: bool) -> crate::Result<NetworkFile> {
+            Ok(NetworkFile::Local(LocalFile::new(
+                self.local_path.clone(),
+                42,
+            )))
+        }
+
+        fn close_file(&self, _inode: u64, _file: NetworkFile) -> crate::Result<()> {
+            self.closes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn network_configuration_and_local_file_lease_cross_the_abi() {
+        let directory = tempfile::tempdir().unwrap();
+        let local_path = directory.path().join("downloaded");
+        std::fs::write(&local_path, b"cached").unwrap();
+        let closes = Arc::new(AtomicUsize::new(0));
+        let pointer = create_network_volume(TestNetworkFilesystem {
+            inner: MemoryFileSystem::new(),
+            local_path: local_path.clone(),
+            closes: Arc::clone(&closes),
+        });
+
+        let mut configuration = FsbConfiguration::default();
+        assert_eq!(
+            unsafe { fsb_configuration(pointer, &raw mut configuration) },
+            0
+        );
+        assert_eq!(configuration.kind, 1);
+        assert_eq!(configuration.lazy, 1);
+        assert_eq!(
+            configuration.kernel_cache_policy,
+            KernelCachePolicy::MetadataOnly as u8
+        );
+
+        let mut path = [0_u8; 1024];
+        let mut opened = FsbOpenFile::default();
+        assert_eq!(
+            unsafe {
+                fsb_open_file(
+                    pointer,
+                    ROOT_INODE,
+                    0,
+                    path.as_mut_ptr(),
+                    path.len(),
+                    &raw mut opened,
+                )
+            },
+            0
+        );
+        assert_eq!(opened.source, 1);
+        assert_eq!(opened.generation, 42);
+        assert_eq!(
+            &path[..opened.path_length],
+            local_path.as_os_str().as_bytes()
+        );
+        assert_eq!(unsafe { fsb_close_file(pointer, opened.lease) }, 0);
+        assert_eq!(closes.load(Ordering::Relaxed), 1);
+        unsafe { fsb_volume_destroy(pointer) };
     }
 }

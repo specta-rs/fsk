@@ -1,11 +1,12 @@
 import Foundation
+import FSKit
 import Testing
 
 @Suite("Rust backend C ABI")
 struct RustBackendTests {
     @Test("factory exposes the example file")
     func exampleFile() throws {
-        let backend = RustBackend()
+        let backend = try RustBackend()
         let result = try backend.lookup(parent: 1, name: Data("hello.txt".utf8))
         let attributes = try backend.attributes(inode: result.inode)
         var bytes = [UInt8](repeating: 0, count: Int(attributes.size))
@@ -17,7 +18,7 @@ struct RustBackendTests {
 
     @Test("create, sparse write, read, and remove round trip")
     func mutableRoundTrip() throws {
-        let backend = RustBackend()
+        let backend = try RustBackend()
         let name = Data("round-trip".utf8)
         let inode = try backend.create(
             parent: 1,
@@ -40,7 +41,7 @@ struct RustBackendTests {
 
     @Test("directory batch packs names into one arena")
     func packedDirectoryBatch() throws {
-        let backend = RustBackend()
+        let backend = try RustBackend()
         for index in 0..<20 {
             _ = try backend.create(
                 parent: 1,
@@ -71,5 +72,28 @@ struct RustBackendTests {
         #expect(second.eof)
         #expect(second.entries.count == 13)
     }
-}
 
+    @Test("local network files read through a leased descriptor")
+    func localFileLease() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appending(path: "fsbind-local-\(UUID().uuidString)")
+        try Data("downloaded".utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let item = FSBindItem(inode: 99, kind: .file)
+        try item.install(
+            RustOpenFile(
+                lease: 7,
+                generation: 1,
+                localPath: Data(url.path.utf8)
+            )
+        )
+        var bytes = [UInt8](repeating: 0, count: 10)
+        let count = try bytes.withUnsafeMutableBytes {
+            try item.readLocal(offset: 0, length: $0.count, into: $0)
+        }
+        #expect(count == 10)
+        #expect(String(decoding: bytes, as: UTF8.self) == "downloaded")
+        #expect(item.releaseOpenState() == 7)
+    }
+}

@@ -2,6 +2,7 @@
 members = [
     "crates/fsbind",
     "examples/memory-backend",
+    "examples/network-backend",
 ]
 resolver = "2"
 

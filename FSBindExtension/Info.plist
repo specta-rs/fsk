@@ -37,6 +37,11 @@
         <false/>
         <key>FSShortName</key>
         <string>fsbind</string>
+        <key>FSSupportedSchemes</key>
+        <array>
+            <string>fsbind</string>
+            <string>https</string>
+        </array>
         <key>FSSupportsBlockResources</key>
         <false/>
         <key>FSSupportsPathURLs</key>
@@ -44,4 +49,3 @@
     </dict>
 </dict>
 </plist>
-

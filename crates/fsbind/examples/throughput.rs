@@ -1,4 +1,4 @@
-use fsbind::{DirectoryEntry, DirectorySink, FileSystem, FileType, MemoryFileSystem, ROOT_INODE};
+use fsbind::{DirectoryEntry, DirectorySink, FileType, Filesystem, MemoryFileSystem, ROOT_INODE};
 use std::{
     hint::black_box,
     time::{Duration, Instant},

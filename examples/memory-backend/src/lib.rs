@@ -1,4 +1,4 @@
-use fsbind::{FileSystem, FileType, MemoryFileSystem, ROOT_INODE};
+use fsbind::{FileType, Filesystem, MemoryFileSystem, ROOT_INODE};
 
 fn filesystem() -> MemoryFileSystem {
     let filesystem = MemoryFileSystem::new();

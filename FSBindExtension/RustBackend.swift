@@ -29,18 +29,53 @@ struct RustDirectoryBatch {
     }
 }
 
+struct RustBackendConfiguration: Sendable {
+    let isNetwork: Bool
+    let isLazy: Bool
+    let supportsLocalFiles: Bool
+    let kernelCachePolicy: UInt8
+}
+
+struct RustOpenFile: Sendable {
+    let lease: UInt64
+    let generation: UInt64
+    let localPath: Data?
+}
+
 final class RustBackend: @unchecked Sendable {
     private let handle: FSBVolumeRef
+    let configuration: RustBackendConfiguration
 
-    init() {
+    init(resourceURL: URL = URL(fileURLWithPath: "/")) throws {
         precondition(
             fsb_abi_version() == FSB_ABI_VERSION,
             "The linked Rust backend uses an incompatible FSBind ABI"
         )
-        guard let handle = fsb_volume_create() else {
-            fatalError("Rust backend factory returned a null volume")
+        var creationError: Int32 = 0
+        let resource = Data(resourceURL.absoluteString.utf8)
+        let createdHandle = resource.withUnsafeBytes { bytes in
+            fsb_volume_create(
+                bytes.bindMemory(to: UInt8.self).baseAddress,
+                bytes.count,
+                &creationError
+            )
         }
-        self.handle = handle
+        guard let createdHandle else {
+            throw RustBackendError.posix(creationError == 0 ? Int32(EIO) : creationError)
+        }
+        handle = createdHandle
+        var rawConfiguration = FSBConfiguration()
+        let status = fsb_configuration(handle, &rawConfiguration)
+        guard status == 0 else {
+            fsb_volume_destroy(handle)
+            throw RustBackendError.posix(status)
+        }
+        configuration = RustBackendConfiguration(
+            isNetwork: rawConfiguration.kind == UInt8(FSB_FILESYSTEM_NETWORK),
+            isLazy: rawConfiguration.lazy != 0,
+            supportsLocalFiles: rawConfiguration.supports_local_files != 0,
+            kernelCachePolicy: rawConfiguration.kernel_cache_policy
+        )
     }
 
     deinit {
@@ -253,6 +288,38 @@ final class RustBackend: @unchecked Sendable {
 
     func synchronize() throws {
         try check(fsb_sync(handle))
+    }
+
+    func open(inode: UInt64, writable: Bool) throws -> RustOpenFile {
+        var path = Data(count: Int(MAXPATHLEN))
+        var opened = FSBOpenFile()
+        let status = path.withUnsafeMutableBytes { bytes in
+            fsb_open_file(
+                handle,
+                inode,
+                writable ? 1 : 0,
+                bytes.bindMemory(to: UInt8.self).baseAddress,
+                bytes.count,
+                &opened
+            )
+        }
+        try check(status)
+        let localPath: Data?
+        if opened.source == UInt8(FSB_FILE_LOCAL) {
+            path.removeSubrange(Int(opened.path_length)..<path.count)
+            localPath = path
+        } else {
+            localPath = nil
+        }
+        return RustOpenFile(
+            lease: opened.lease,
+            generation: opened.generation,
+            localPath: localPath
+        )
+    }
+
+    func close(lease: UInt64) throws {
+        try check(fsb_close_file(handle, lease))
     }
 
     private func check(_ status: Int32) throws {
