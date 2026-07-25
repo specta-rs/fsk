@@ -7,6 +7,7 @@ private let rootInode: UInt64 = 1
 private let directoryCookieBias: UInt64 = 2
 
 final class FSKVolume: FSVolume,
+    FSVolume.Operations,
     FSVolume.ReadWriteOperations,
     FSVolume.OpenCloseOperations,
     @unchecked Sendable

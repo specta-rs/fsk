@@ -3,6 +3,7 @@ import Foundation
 import FSKit
 import Testing
 import Darwin
+import ObjectiveC
 
 @Suite("Rust process bridge")
 struct RustBackendTests {
@@ -74,5 +75,23 @@ struct RustBackendTests {
         #expect(count == 10)
         #expect(String(decoding: bytes, as: UTF8.self) == "downloaded")
         #expect(item.releaseOpenState() == 7)
+    }
+
+    @Test("volume exposes the FSKit lifecycle protocol and selectors")
+    func volumeOperationsSurface() throws {
+        let operations = try #require(NSProtocolFromString("FSVolumeOperations"))
+        #expect(class_conformsToProtocol(FSKVolume.self, operations))
+        #expect(
+            class_getInstanceMethod(
+                FSKVolume.self,
+                NSSelectorFromString("activateWithOptions:replyHandler:")
+            ) != nil
+        )
+        #expect(
+            class_getInstanceMethod(
+                FSKVolume.self,
+                NSSelectorFromString("deactivateWithOptions:replyHandler:")
+            ) != nil
+        )
     }
 }
