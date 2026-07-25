@@ -123,7 +123,7 @@ impl MountSession {
         mount_path: &Path,
         options: &MountOptions,
     ) -> io::Result<Self> {
-        fs::create_dir_all(mount_path)?;
+        let mount_path = prepare_mount_path(mount_path)?;
         let socket_path = socket_path()?;
         if let Some(parent) = socket_path.parent() {
             fs::create_dir_all(parent)?;
@@ -166,7 +166,7 @@ impl MountSession {
         if !options.mount_options.is_empty() {
             command.arg("-o").arg(options.mount_options.join(","));
         }
-        let output = command.arg(&resource).arg(mount_path).output()?;
+        let output = command.arg(&resource).arg(&mount_path).output()?;
         if !output.status.success() {
             stop.store(true, Ordering::Release);
             let _ = UnixStream::connect(&socket_path);
@@ -179,7 +179,7 @@ impl MountSession {
         }
 
         Ok(Self {
-            mount_path: mount_path.to_owned(),
+            mount_path,
             socket_path,
             stop,
             accept_thread: Some(accept_thread),
@@ -218,6 +218,11 @@ impl Drop for MountSession {
     fn drop(&mut self) {
         let _ = self.unmount_inner();
     }
+}
+
+fn prepare_mount_path(path: &Path) -> io::Result<PathBuf> {
+    fs::create_dir_all(path)?;
+    fs::canonicalize(path)
 }
 
 fn random_token() -> io::Result<[u8; 32]> {
@@ -273,5 +278,12 @@ mod tests {
         let value = resource_url(Path::new("/tmp/a b.sock"), &[0xab; 32]);
         assert!(value.starts_with("fsk://mount?socket=/tmp/a%20b.sock&token="));
         assert!(value.ends_with(&"ab".repeat(32)));
+    }
+
+    #[test]
+    fn mount_path_is_canonicalized_for_diskutil() {
+        let path = Path::new("/tmp");
+        let canonical = prepare_mount_path(path).unwrap();
+        assert_eq!(canonical, Path::new("/private/tmp"));
     }
 }
