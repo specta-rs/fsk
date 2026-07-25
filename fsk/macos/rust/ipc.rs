@@ -94,6 +94,7 @@ impl Service {
     }
 
     pub(crate) fn serve_connection(&self, mut stream: UnixStream) -> io::Result<()> {
+        stream.set_nonblocking(false)?;
         let (request_id, operation, payload) = read_request(&mut stream)?;
         if operation != opcode::HELLO || payload.as_slice() != self.token {
             write_response(&mut stream, request_id, libc::EACCES, &[])?;
@@ -595,7 +596,10 @@ fn invalid_frame(_: Error) -> io::Error {
 mod tests {
     use super::*;
     use crate::{FileType, ROOT_INODE, test_support::TestFilesystem};
-    use std::os::unix::net::UnixStream;
+    use std::{
+        os::{fd::AsRawFd, unix::net::UnixStream},
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn authenticated_connection_serves_metadata() {
@@ -628,6 +632,37 @@ mod tests {
         });
         send_request(&mut client, 1, opcode::HELLO, &[8; 32]);
         assert_eq!(read_test_response(&mut client).0, libc::EACCES);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn nonblocking_server_stream_is_normalized_before_reading() {
+        let filesystem = TestFilesystem::default();
+        let token = [7; 32];
+        let service = Arc::new(Service::local(filesystem, token));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let observer = server.try_clone().unwrap();
+        let worker = std::thread::spawn(move || service.serve_connection(server).unwrap());
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            // SAFETY: `observer` owns this valid descriptor for the duration
+            // of the call, and `F_GETFL` takes no variadic argument.
+            let flags = unsafe { libc::fcntl(observer.as_raw_fd(), libc::F_GETFL) };
+            assert_ne!(flags, -1);
+            if flags & libc::O_NONBLOCK == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "serve_connection did not restore blocking mode"
+            );
+            std::thread::yield_now();
+        }
+        send_request(&mut client, 1, opcode::HELLO, &token);
+        assert_eq!(read_test_response(&mut client).0, 0);
+        drop(client);
         worker.join().unwrap();
     }
 

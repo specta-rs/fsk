@@ -139,9 +139,6 @@ jobs:
             'Print :com.apple.security.app-sandbox' \
             "$RUNNER_TEMP/extension-entitlements.plist")" = "true"
           test "$(/usr/libexec/PlistBuddy -c \
-            'Print :com.apple.security.network.client' \
-            "$RUNNER_TEMP/extension-entitlements.plist")" = "true"
-          test "$(/usr/libexec/PlistBuddy -c \
             'Print :com.apple.developer.fskit.fsmodule' \
             "$RUNNER_TEMP/extension-entitlements.plist")" = "true"
 
