@@ -190,6 +190,7 @@ fn check_platform_authorization() -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)]
 fn check_platform_authorization() -> io::Result<()> {
     Ok(())
 }
