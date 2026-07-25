@@ -483,20 +483,7 @@ private final class IPCConnection {
         ) == 0 else {
             throw RustBackendError.posix(errno)
         }
-        let bytes = Array(path.utf8CString)
-        guard bytes.count <= MemoryLayout.size(ofValue: sockaddr_un().sun_path) else {
-            throw RustBackendError.posix(ENAMETOOLONG)
-        }
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        withUnsafeMutableBytes(of: &address) { destination in
-            bytes.withUnsafeBytes { source in
-                destination[
-                    MemoryLayout<sa_family_t>.size..<(MemoryLayout<sa_family_t>.size + bytes.count)
-                ].copyBytes(from: source)
-            }
-        }
-        let length = socklen_t(MemoryLayout<sa_family_t>.size + bytes.count)
+        var (address, length) = try unixSocketAddress(path: path)
         let status = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 Darwin.connect(descriptor, $0, length)
@@ -570,6 +557,28 @@ private final class IPCConnection {
         }
         return data
     }
+}
+
+func unixSocketAddress(path: String) throws -> (sockaddr_un, socklen_t) {
+    let bytes = Array(path.utf8CString)
+    let pathOffset = MemoryLayout<sockaddr_un>.offset(of: \.sun_path)!
+    guard bytes.count <= MemoryLayout.size(ofValue: sockaddr_un().sun_path) else {
+        throw RustBackendError.posix(ENAMETOOLONG)
+    }
+    let length = pathOffset + bytes.count - 1
+    guard length <= UInt8.max else {
+        throw RustBackendError.posix(ENAMETOOLONG)
+    }
+
+    var address = sockaddr_un()
+    address.sun_len = UInt8(length)
+    address.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &address) { destination in
+        bytes.withUnsafeBytes { source in
+            destination[pathOffset..<(pathOffset + bytes.count)].copyBytes(from: source)
+        }
+    }
+    return (address, socklen_t(length))
 }
 
 private struct IPCEncoder {

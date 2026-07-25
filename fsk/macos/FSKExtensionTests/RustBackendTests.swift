@@ -2,6 +2,7 @@
 import Foundation
 import FSKit
 import Testing
+import Darwin
 
 @Suite("Rust process bridge")
 struct RustBackendTests {
@@ -30,6 +31,25 @@ struct RustBackendTests {
             eof: true
         )
         #expect(String(decoding: batch.name(for: entry), as: UTF8.self) == "second")
+    }
+
+    @Test("Unix socket addresses preserve the Darwin family and path layout")
+    func unixSocketAddressLayout() throws {
+        let path = "/tmp/fsk.sock"
+        var (address, length) = try unixSocketAddress(path: path)
+        let pathOffset = MemoryLayout<sockaddr_un>.offset(of: \.sun_path)!
+
+        #expect(address.sun_len == UInt8(length))
+        #expect(address.sun_family == sa_family_t(AF_UNIX))
+        #expect(Int(length) == pathOffset + path.utf8.count)
+
+        let encodedPath = withUnsafeBytes(of: &address) {
+            Array($0[pathOffset..<(pathOffset + path.utf8.count)])
+        }
+        #expect(encodedPath == Array(path.utf8))
+        withUnsafeBytes(of: &address) {
+            #expect($0[Int(length)] == 0)
+        }
     }
 
     @Test("local network files read through a leased descriptor")
