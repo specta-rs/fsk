@@ -1,7 +1,7 @@
 use fsk::{
     DirectoryEntry, DirectorySink, Error, FileType, Filesystem, KernelCachePolicy, Metadata,
     NetworkConfiguration, NetworkFile, NetworkFilesystem, ROOT_INODE, ReadDirectoryResult, Result,
-    StatFs,
+    SetMetadata, StatFs,
 };
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -14,6 +14,34 @@ fn inode_index(inode: u64) -> Option<usize> {
     usize::try_from(inode).ok()?.checked_sub(1)
 }
 
+#[cfg(unix)]
+unsafe extern "C" {
+    #[link_name = "getuid"]
+    fn c_getuid() -> u32;
+    #[link_name = "getgid"]
+    fn c_getgid() -> u32;
+}
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    unsafe { c_getuid() }
+}
+
+#[cfg(unix)]
+fn current_gid() -> u32 {
+    unsafe { c_getgid() }
+}
+
+#[cfg(windows)]
+const fn current_uid() -> u32 {
+    0
+}
+
+#[cfg(windows)]
+const fn current_gid() -> u32 {
+    0
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DriveFile {
@@ -24,6 +52,15 @@ struct DriveFile {
     parents: Vec<String>,
     #[serde(default)]
     size: u64,
+    #[serde(default)]
+    capabilities: Capabilities,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Capabilities {
+    #[serde(default)]
+    can_modify_content: bool,
 }
 
 #[derive(Deserialize)]
@@ -48,6 +85,18 @@ struct SharedDrive {
     name: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct About {
+    storage_quota: StorageQuota,
+}
+
+#[derive(Deserialize)]
+struct StorageQuota {
+    limit: Option<String>,
+    usage: String,
+}
+
 #[derive(Clone)]
 struct RemoteFile {
     id: String,
@@ -60,6 +109,7 @@ struct Node {
     kind: FileType,
     size: u64,
     remote: Option<RemoteFile>,
+    writable: bool,
 }
 
 pub struct GoogleDrive {
@@ -68,6 +118,10 @@ pub struct GoogleDrive {
     nodes: Vec<Node>,
     children: HashMap<u64, Vec<u64>>,
     cache: Mutex<HashMap<u64, Vec<u8>>>,
+    sizes: Mutex<HashMap<u64, u64>>,
+    writes: Mutex<()>,
+    total_bytes: u64,
+    free_bytes: u64,
 }
 
 impl GoogleDrive {
@@ -84,15 +138,34 @@ impl GoogleDrive {
                 kind: FileType::Directory,
                 size: 0,
                 remote: None,
+                writable: false,
             }],
             children: HashMap::new(),
             cache: Mutex::new(HashMap::new()),
+            sizes: Mutex::new(HashMap::new()),
+            writes: Mutex::new(()),
+            total_bytes: u64::MAX,
+            free_bytes: u64::MAX,
         };
-        let my_drive = filesystem.add_node(ROOT_INODE, "My Drive", FileType::Directory, 0, None);
-        let shared =
-            filesystem.add_node(ROOT_INODE, "Shared with me", FileType::Directory, 0, None);
-        let shared_drives =
-            filesystem.add_node(ROOT_INODE, "Shared drives", FileType::Directory, 0, None);
+        filesystem.load_quota()?;
+        let my_drive =
+            filesystem.add_node(ROOT_INODE, "My Drive", FileType::Directory, 0, None, false);
+        let shared = filesystem.add_node(
+            ROOT_INODE,
+            "Shared with me",
+            FileType::Directory,
+            0,
+            None,
+            false,
+        );
+        let shared_drives = filesystem.add_node(
+            ROOT_INODE,
+            "Shared drives",
+            FileType::Directory,
+            0,
+            None,
+            false,
+        );
 
         let account_files = filesystem.list_files("user", None, Some("trashed = false"))?;
         filesystem.add_tree(my_drive, "root", &account_files);
@@ -105,8 +178,14 @@ impl GoogleDrive {
             filesystem.add_drive_file(shared, &file);
         }
         for drive in filesystem.list_drives()? {
-            let root =
-                filesystem.add_node(shared_drives, &drive.name, FileType::Directory, 0, None);
+            let root = filesystem.add_node(
+                shared_drives,
+                &drive.name,
+                FileType::Directory,
+                0,
+                None,
+                false,
+            );
             let files = filesystem.list_files("drive", Some(&drive.id), Some("trashed = false"))?;
             filesystem.add_tree(root, &drive.id, &files);
         }
@@ -142,6 +221,26 @@ impl GoogleDrive {
         self.client.get(url).bearer_auth(&self.token)
     }
 
+    fn load_quota(&mut self) -> io::Result<()> {
+        let about: About = self
+            .request(&format!("{API}/about"))
+            .query(&[("fields", "storageQuota(limit,usage)")])
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .and_then(reqwest::blocking::Response::json)
+            .map_err(io::Error::other)?;
+        let used = about.storage_quota.usage.parse::<u64>().unwrap_or(0);
+        if let Some(limit) = about
+            .storage_quota
+            .limit
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            self.total_bytes = limit;
+            self.free_bytes = limit.saturating_sub(used);
+        }
+        Ok(())
+    }
+
     fn list_files(
         &self,
         corpus: &str,
@@ -155,7 +254,8 @@ impl GoogleDrive {
                 ("corpora", corpus.to_owned()),
                 (
                     "fields",
-                    "nextPageToken,files(id,name,mimeType,parents,size)".to_owned(),
+                    "nextPageToken,files(id,name,mimeType,parents,size,capabilities(canModifyContent))"
+                        .to_owned(),
                 ),
                 ("pageSize", "1000".to_owned()),
                 ("supportsAllDrives", "true".to_owned()),
@@ -250,7 +350,8 @@ impl GoogleDrive {
                 }),
             )
         };
-        self.add_node(parent, &name, kind, file.size, remote)
+        let writable = drive_file_is_writable(file);
+        self.add_node(parent, &name, kind, file.size, remote, writable)
     }
 
     fn add_node(
@@ -260,6 +361,7 @@ impl GoogleDrive {
         kind: FileType,
         size: u64,
         remote: Option<RemoteFile>,
+        writable: bool,
     ) -> u64 {
         let mut display = name.as_bytes().to_vec();
         if self.children.get(&parent).is_some_and(|children| {
@@ -277,6 +379,7 @@ impl GoogleDrive {
             kind,
             size,
             remote,
+            writable,
         });
         self.children.entry(parent).or_default().push(inode);
         inode
@@ -307,6 +410,42 @@ impl GoogleDrive {
             .insert(inode, data.clone());
         Ok(data)
     }
+
+    fn upload(&self, remote: &RemoteFile, data: &[u8]) -> Result<()> {
+        let response = self
+            .client
+            .patch(format!(
+                "https://www.googleapis.com/upload/drive/v3/files/{}",
+                remote.id
+            ))
+            .bearer_auth(&self.token)
+            .query(&[("uploadType", "resumable"), ("supportsAllDrives", "true")])
+            .header("X-Upload-Content-Type", &remote.mime_type)
+            .header("X-Upload-Content-Length", data.len())
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|_| Error::IO)?;
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or(Error::IO)?;
+        self.client
+            .put(location)
+            .header(reqwest::header::CONTENT_TYPE, &remote.mime_type)
+            .header(reqwest::header::CONTENT_LENGTH, data.len())
+            .body(data.to_vec())
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|_| Error::IO)?;
+        Ok(())
+    }
+}
+
+fn drive_file_is_writable(file: &DriveFile) -> bool {
+    file.mime_type != FOLDER
+        && file.capabilities.can_modify_content
+        && !file.mime_type.starts_with("application/vnd.google-apps.")
 }
 
 fn export_format(mime: &str) -> (&'static str, Option<&'static str>) {
@@ -330,13 +469,22 @@ fn export_format(mime: &str) -> (&'static str, Option<&'static str>) {
 
 impl Filesystem for GoogleDrive {
     fn statfs(&self) -> Result<StatFs> {
-        let used = self.nodes.iter().map(|node| node.size).sum();
+        let sizes = self.sizes.lock().map_err(|_| Error::IO)?;
+        let used = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                let inode = u64::try_from(index + 1).unwrap_or(u64::MAX);
+                sizes.get(&inode).copied().unwrap_or(node.size)
+            })
+            .sum();
         Ok(StatFs {
             block_size: 4096,
             io_size: 131_072,
-            total_bytes: used,
-            free_bytes: 0,
-            available_bytes: 0,
+            total_bytes: self.total_bytes.max(used),
+            free_bytes: self.free_bytes,
+            available_bytes: self.free_bytes,
             files: self.nodes.len() as u64,
             free_files: 0,
         })
@@ -346,10 +494,17 @@ impl Filesystem for GoogleDrive {
         let node = inode_index(inode)
             .and_then(|index| self.nodes.get(index))
             .ok_or(Error(2))?;
+        let size = self
+            .sizes
+            .lock()
+            .map_err(|_| Error::IO)?
+            .get(&inode)
+            .copied()
+            .unwrap_or(node.size);
         Ok(Metadata {
             inode,
             parent: node.parent,
-            size: node.size,
+            size,
             allocated_size: 0,
             generation: 1,
             created_ns: 0,
@@ -357,11 +512,13 @@ impl Filesystem for GoogleDrive {
             accessed_ns: 0,
             mode: if node.kind == FileType::Directory {
                 0o555
+            } else if node.writable {
+                0o644
             } else {
                 0o444
             },
-            uid: 0,
-            gid: 0,
+            uid: current_uid(),
+            gid: current_gid(),
             link_count: 1,
             kind: node.kind,
         })
@@ -432,6 +589,69 @@ impl Filesystem for GoogleDrive {
         output[..count].copy_from_slice(&input[..count]);
         Ok(count)
     }
+
+    fn write(&self, inode: u64, offset: u64, input: &[u8]) -> Result<usize> {
+        let _write = self.writes.lock().map_err(|_| Error::IO)?;
+        let node = inode_index(inode)
+            .and_then(|index| self.nodes.get(index))
+            .ok_or(Error(2))?;
+        if !node.writable {
+            return Err(Error(30));
+        }
+        let remote = node.remote.as_ref().ok_or(Error(21))?;
+        let mut data = self.download(inode, remote)?;
+        let start = usize::try_from(offset).map_err(|_| Error::INVALID)?;
+        let end = start.checked_add(input.len()).ok_or(Error::INVALID)?;
+        if data.len() < end {
+            data.resize(end, 0);
+        }
+        data[start..end].copy_from_slice(input);
+        self.upload(remote, &data)?;
+        let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        self.cache
+            .lock()
+            .map_err(|_| Error::IO)?
+            .insert(inode, data);
+        self.sizes
+            .lock()
+            .map_err(|_| Error::IO)?
+            .insert(inode, size);
+        Ok(input.len())
+    }
+
+    fn set_metadata(&self, inode: u64, update: SetMetadata) -> Result<Metadata> {
+        let _write = self.writes.lock().map_err(|_| Error::IO)?;
+        let Some(size) = update.size else {
+            return Err(Error::NOT_SUPPORTED);
+        };
+        if update.mode.is_some()
+            || update.uid.is_some()
+            || update.gid.is_some()
+            || update.accessed_ns.is_some()
+            || update.modified_ns.is_some()
+        {
+            return Err(Error::NOT_SUPPORTED);
+        }
+        let node = inode_index(inode)
+            .and_then(|index| self.nodes.get(index))
+            .ok_or(Error(2))?;
+        if !node.writable {
+            return Err(Error(30));
+        }
+        let remote = node.remote.as_ref().ok_or(Error(21))?;
+        let mut data = self.download(inode, remote)?;
+        data.resize(usize::try_from(size).map_err(|_| Error::INVALID)?, 0);
+        self.upload(remote, &data)?;
+        self.cache
+            .lock()
+            .map_err(|_| Error::IO)?
+            .insert(inode, data);
+        self.sizes
+            .lock()
+            .map_err(|_| Error::IO)?
+            .insert(inode, size);
+        self.metadata(inode)
+    }
 }
 
 impl NetworkFilesystem for GoogleDrive {
@@ -442,11 +662,44 @@ impl NetworkFilesystem for GoogleDrive {
             kernel_cache_policy: KernelCachePolicy::Read,
         }
     }
-    fn open_file(&self, _inode: u64, writable: bool) -> Result<NetworkFile> {
-        if writable {
-            Err(Error(30))
-        } else {
-            Ok(NetworkFile::Remote)
+    fn open_file(&self, inode: u64, writable: bool) -> Result<NetworkFile> {
+        let node = inode_index(inode)
+            .and_then(|index| self.nodes.get(index))
+            .ok_or(Error(2))?;
+        if writable && !node.writable {
+            return Err(Error(30));
         }
+        Ok(NetworkFile::Remote)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(mime_type: &str, can_modify_content: bool) -> DriveFile {
+        DriveFile {
+            id: "id".to_owned(),
+            name: "name".to_owned(),
+            mime_type: mime_type.to_owned(),
+            parents: Vec::new(),
+            size: 0,
+            capabilities: Capabilities { can_modify_content },
+        }
+    }
+
+    #[test]
+    fn ordinary_files_follow_drive_write_capability() {
+        assert!(drive_file_is_writable(&file("text/plain", true)));
+        assert!(!drive_file_is_writable(&file("text/plain", false)));
+    }
+
+    #[test]
+    fn folders_and_exported_workspace_files_stay_read_only() {
+        assert!(!drive_file_is_writable(&file(FOLDER, true)));
+        assert!(!drive_file_is_writable(&file(
+            "application/vnd.google-apps.document",
+            true,
+        )));
     }
 }

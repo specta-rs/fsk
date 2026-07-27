@@ -36,20 +36,22 @@ cargo run -p fsk-network-backend -- /path/to/mount \
 
 ## `google-drive`
 
-A read-only Google Drive mount backed by the Drive API. It exposes `My Drive`,
+A Google Drive mount backed by the Drive API. It exposes `My Drive`,
 `Shared with me`, and every shared drive available to the account. File bytes
 are fetched lazily on first access. Google Workspace documents are exported to
 portable formats while the mount is indexed because Drive does not publish
-their exported byte lengths.
+their exported byte lengths. Ordinary files are writable when Drive reports
+`canModifyContent`; files without that capability and exported Google Workspace
+documents are exposed read-only through the platform's normal permission bits.
 
-Create an OAuth access token with the read-only Drive scope, then run:
+Create an OAuth access token with the Drive scope, then run:
 
 ```sh
 export GOOGLE_DRIVE_ACCESS_TOKEN="$(gcloud auth application-default print-access-token)"
 cargo run -p fsk-google-drive -- /path/to/mount
 ```
 
-The token must include `https://www.googleapis.com/auth/drive.readonly`.
+The token must include `https://www.googleapis.com/auth/drive` for writes.
 Application-default tokens from `gcloud` only work when the associated OAuth
 grant includes that scope; a token from any other OAuth flow works too.
 
