@@ -18,7 +18,9 @@ The published `fsk` crate deliberately implements neither `Filesystem` nor
 `NetworkFilesystem`. It does not choose an inode index, cache, locking model,
 transaction boundary, consistency policy, or storage engine for downstream
 users. The workspace's memory and network backends are examples only; copy
-their ideas or replace them entirely.
+their ideas or replace them entirely. The example catalog also includes a
+read-only Google Drive backend that mounts `My Drive`, items `Shared with me`,
+and shared drives using an OAuth token.
 
 ## Platform support
 

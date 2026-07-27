@@ -3,6 +3,7 @@ members = [
     "fsk",
     "examples/memory-backend",
     "examples/network-backend",
+    "examples/google-drive",
 ]
 resolver = "2"
 

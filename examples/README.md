@@ -34,5 +34,24 @@ cargo run -p fsk-network-backend -- /path/to/mount \
   "Content returned by origin.txt"
 ```
 
-On macOS, install and authorize `FSK.app` before running either CLI. Linux
+## `google-drive`
+
+A read-only Google Drive mount backed by the Drive API. It exposes `My Drive`,
+`Shared with me`, and every shared drive available to the account. File bytes
+are fetched lazily on first access. Google Workspace documents are exported to
+portable formats while the mount is indexed because Drive does not publish
+their exported byte lengths.
+
+Create an OAuth access token with the read-only Drive scope, then run:
+
+```sh
+export GOOGLE_DRIVE_ACCESS_TOKEN="$(gcloud auth application-default print-access-token)"
+cargo run -p fsk-google-drive -- /path/to/mount
+```
+
+The token must include `https://www.googleapis.com/auth/drive.readonly`.
+Application-default tokens from `gcloud` only work when the associated OAuth
+grant includes that scope; a token from any other OAuth flow works too.
+
+On macOS, install and authorize `FSK.app` before running a CLI. Linux
 requires FUSE, and Windows requires the Projected File System optional feature.
