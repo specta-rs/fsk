@@ -4,11 +4,26 @@ use fsk::{
     SetMetadata, StatFs,
 };
 use reqwest::blocking::Client;
-use serde::Deserialize;
-use std::{collections::HashMap, io, sync::Mutex};
+use serde::{Deserialize, Deserializer, de::Error as _};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    sync::Mutex,
+};
+use unicode_normalization::UnicodeNormalization;
 
 const API: &str = "https://www.googleapis.com/drive/v3";
 const FOLDER: &str = "application/vnd.google-apps.folder";
+const SHORTCUT: &str = "application/vnd.google-apps.shortcut";
+
+fn deserialize_u64_string<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    String::deserialize(deserializer)?
+        .parse()
+        .map_err(D::Error::custom)
+}
 
 fn inode_index(inode: u64) -> Option<usize> {
     usize::try_from(inode).ok()?.checked_sub(1)
@@ -50,9 +65,26 @@ struct DriveFile {
     mime_type: String,
     #[serde(default)]
     parents: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_u64_string")]
     size: u64,
     #[serde(default)]
+    capabilities: Capabilities,
+    shortcut_details: Option<ShortcutDetails>,
+    #[serde(skip)]
+    resolved_target: Option<ShortcutTarget>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShortcutDetails {
+    target_id: String,
+}
+
+#[derive(Clone)]
+struct ShortcutTarget {
+    id: String,
+    mime_type: String,
+    size: u64,
     capabilities: Capabilities,
 }
 
@@ -61,6 +93,8 @@ struct DriveFile {
 struct Capabilities {
     #[serde(default)]
     can_modify_content: bool,
+    #[serde(default)]
+    can_download: bool,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +117,11 @@ struct DrivePage {
 struct SharedDrive {
     id: String,
     name: String,
+}
+
+#[derive(Deserialize)]
+struct RootFile {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -117,9 +156,10 @@ pub struct GoogleDrive {
     token: String,
     nodes: Vec<Node>,
     children: HashMap<u64, Vec<u64>>,
-    cache: Mutex<HashMap<u64, Vec<u8>>>,
-    sizes: Mutex<HashMap<u64, u64>>,
+    cache: Mutex<HashMap<String, Vec<u8>>>,
+    sizes: Mutex<HashMap<String, u64>>,
     writes: Mutex<()>,
+    dirty: Mutex<HashSet<String>>,
     total_bytes: u64,
     free_bytes: u64,
 }
@@ -144,6 +184,7 @@ impl GoogleDrive {
             cache: Mutex::new(HashMap::new()),
             sizes: Mutex::new(HashMap::new()),
             writes: Mutex::new(()),
+            dirty: Mutex::new(HashSet::new()),
             total_bytes: u64::MAX,
             free_bytes: u64::MAX,
         };
@@ -167,16 +208,19 @@ impl GoogleDrive {
             false,
         );
 
-        let account_files = filesystem.list_files("user", None, Some("trashed = false"))?;
-        filesystem.add_tree(my_drive, "root", &account_files);
-        let shared_files = filesystem.list_files(
+        let root_id = filesystem.resolve_root_id()?;
+        let account_files = filesystem.resolve_shortcuts(filesystem.list_files(
+            "user",
+            None,
+            Some("trashed = false"),
+        )?);
+        filesystem.add_tree(my_drive, &root_id, &account_files);
+        let shared_files = filesystem.resolve_shortcuts(filesystem.list_files(
             "user",
             None,
             Some("sharedWithMe = true and trashed = false"),
-        )?;
-        for file in shared_files {
-            filesystem.add_drive_file(shared, &file);
-        }
+        )?);
+        filesystem.add_shared_tree(shared, &shared_files, &account_files);
         for drive in filesystem.list_drives()? {
             let root = filesystem.add_node(
                 shared_drives,
@@ -186,17 +230,21 @@ impl GoogleDrive {
                 None,
                 false,
             );
-            let files = filesystem.list_files("drive", Some(&drive.id), Some("trashed = false"))?;
+            let files = filesystem.resolve_shortcuts(filesystem.list_files(
+                "drive",
+                Some(&drive.id),
+                Some("trashed = false"),
+            )?);
             filesystem.add_tree(root, &drive.id, &files);
         }
-        filesystem.hydrate_exports()?;
+        filesystem.hydrate_exports();
         Ok(filesystem)
     }
 
     // The Drive API does not report an exported byte length for native Google
     // documents. Materialize those during indexing so getattr can return the
     // exact size; ordinary files remain lazy.
-    fn hydrate_exports(&mut self) -> io::Result<()> {
+    fn hydrate_exports(&mut self) {
         let exports: Vec<_> = self
             .nodes
             .iter()
@@ -208,13 +256,17 @@ impl GoogleDrive {
             })
             .collect();
         for (inode, remote) in exports {
-            let data = self
-                .download(inode, &remote)
-                .map_err(|error| io::Error::from_raw_os_error(error.0))?;
-            let index = inode_index(inode).expect("allocated inode fits usize");
-            self.nodes[index].size = u64::try_from(data.len()).unwrap_or(u64::MAX);
+            if let Ok(data) = self.download(&remote) {
+                let index = inode_index(inode).expect("allocated inode fits usize");
+                self.nodes[index].size = u64::try_from(data.len()).unwrap_or(u64::MAX);
+            } else {
+                let index = inode_index(inode).expect("allocated inode fits usize");
+                let parent = self.nodes[index].parent;
+                if let Some(children) = self.children.get_mut(&parent) {
+                    children.retain(|child| *child != inode);
+                }
+            }
         }
-        Ok(())
     }
 
     fn request(&self, url: &str) -> reqwest::blocking::RequestBuilder {
@@ -241,6 +293,53 @@ impl GoogleDrive {
         Ok(())
     }
 
+    fn resolve_root_id(&self) -> io::Result<String> {
+        let root: RootFile = self
+            .request(&format!("{API}/files/root"))
+            .query(&[("fields", "id")])
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .and_then(reqwest::blocking::Response::json)
+            .map_err(io::Error::other)?;
+        Ok(root.id)
+    }
+
+    fn resolve_shortcuts(&self, files: Vec<DriveFile>) -> Vec<DriveFile> {
+        files
+            .into_iter()
+            .filter_map(|mut file| {
+                if file.mime_type != SHORTCUT {
+                    return supported_file(&file).then_some(file);
+                }
+                let target_id = file.shortcut_details.as_ref()?.target_id.clone();
+                let target = self.get_file(&target_id).ok()?;
+                file.resolved_target = Some(ShortcutTarget {
+                    id: target.id,
+                    mime_type: target.mime_type,
+                    size: target.size,
+                    capabilities: target.capabilities,
+                });
+                file.shortcut_details = None;
+                supported_file(&file).then_some(file)
+            })
+            .collect()
+    }
+
+    fn get_file(&self, id: &str) -> io::Result<DriveFile> {
+        self.request(&format!("{API}/files/{id}"))
+            .query(&[
+                (
+                    "fields",
+                    "id,name,mimeType,parents,size,capabilities(canModifyContent,canDownload),shortcutDetails(targetId)",
+                ),
+                ("supportsAllDrives", "true"),
+            ])
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .and_then(reqwest::blocking::Response::json)
+            .map_err(io::Error::other)
+    }
+
     fn list_files(
         &self,
         corpus: &str,
@@ -254,7 +353,7 @@ impl GoogleDrive {
                 ("corpora", corpus.to_owned()),
                 (
                     "fields",
-                    "nextPageToken,files(id,name,mimeType,parents,size,capabilities(canModifyContent))"
+                    "nextPageToken,files(id,name,mimeType,parents,size,capabilities(canModifyContent,canDownload),shortcutDetails(targetId))"
                         .to_owned(),
                 ),
                 ("pageSize", "1000".to_owned()),
@@ -314,16 +413,50 @@ impl GoogleDrive {
     }
 
     fn add_tree(&mut self, root_inode: u64, root_id: &str, files: &[DriveFile]) {
-        let mut ids = HashMap::from([(root_id.to_owned(), root_inode)]);
+        let mut ids = HashMap::from([(root_id.to_owned(), vec![root_inode])]);
         let mut pending: Vec<_> = files.iter().collect();
         loop {
             let before = pending.len();
             pending.retain(|file| {
-                let Some(parent) = file.parents.iter().find_map(|id| ids.get(id)).copied() else {
+                let parents = tree_parents(file, &ids);
+                if parents.is_empty() {
                     return true;
-                };
-                let inode = self.add_drive_file(parent, file);
-                ids.insert(file.id.clone(), inode);
+                }
+                let inodes: Vec<_> = parents
+                    .into_iter()
+                    .map(|parent| self.add_drive_file(parent, file))
+                    .collect();
+                register_tree_ids(&mut ids, file, &inodes);
+                false
+            });
+            if pending.is_empty() || pending.len() == before {
+                break;
+            }
+        }
+    }
+
+    fn add_shared_tree(&mut self, root_inode: u64, roots: &[DriveFile], files: &[DriveFile]) {
+        let mut ids: HashMap<String, Vec<u64>> = HashMap::new();
+        for file in roots {
+            let inode = self.add_drive_file(root_inode, file);
+            register_tree_ids(&mut ids, file, &[inode]);
+        }
+        let mut pending: Vec<_> = files
+            .iter()
+            .filter(|file| !roots.iter().any(|root| root.id == file.id))
+            .collect();
+        loop {
+            let before = pending.len();
+            pending.retain(|file| {
+                let parents = tree_parents(file, &ids);
+                if parents.is_empty() {
+                    return true;
+                }
+                let inodes: Vec<_> = parents
+                    .into_iter()
+                    .map(|parent| self.add_drive_file(parent, file))
+                    .collect();
+                register_tree_ids(&mut ids, file, &inodes);
                 false
             });
             if pending.is_empty() || pending.len() == before {
@@ -333,7 +466,8 @@ impl GoogleDrive {
     }
 
     fn add_drive_file(&mut self, parent: u64, file: &DriveFile) -> u64 {
-        let kind = if file.mime_type == FOLDER {
+        let (remote_id, mime_type, size, _) = effective_file(file);
+        let kind = if mime_type == FOLDER {
             FileType::Directory
         } else {
             FileType::File
@@ -341,17 +475,17 @@ impl GoogleDrive {
         let (name, remote) = if kind == FileType::Directory {
             (file.name.clone(), None)
         } else {
-            let (suffix, _) = export_format(&file.mime_type);
+            let (suffix, _) = export_format(mime_type);
             (
                 format!("{}{}", file.name, suffix),
                 Some(RemoteFile {
-                    id: file.id.clone(),
-                    mime_type: file.mime_type.clone(),
+                    id: remote_id.to_owned(),
+                    mime_type: mime_type.to_owned(),
                 }),
             )
         };
         let writable = drive_file_is_writable(file);
-        self.add_node(parent, &name, kind, file.size, remote, writable)
+        self.add_node(parent, &name, kind, size, remote, writable)
     }
 
     fn add_node(
@@ -363,14 +497,18 @@ impl GoogleDrive {
         remote: Option<RemoteFile>,
         writable: bool,
     ) -> u64 {
-        let mut display = name.as_bytes().to_vec();
-        if self.children.get(&parent).is_some_and(|children| {
+        let base = portable_name(name);
+        let mut display = base.clone();
+        let mut suffix = 2_u64;
+        while self.children.get(&parent).is_some_and(|children| {
             children.iter().any(|inode| {
                 let index = inode_index(*inode).expect("allocated inode fits usize");
-                self.nodes[index].name == display
+                names_equal(&self.nodes[index].name, &display)
             })
         }) {
-            display.extend_from_slice(format!(" ({})", self.nodes.len() + 1).as_bytes());
+            display.clone_from(&base);
+            display.extend_from_slice(format!(" ({suffix})").as_bytes());
+            suffix += 1;
         }
         let inode = u64::try_from(self.nodes.len() + 1).unwrap_or(u64::MAX);
         self.nodes.push(Node {
@@ -385,8 +523,8 @@ impl GoogleDrive {
         inode
     }
 
-    fn download(&self, inode: u64, remote: &RemoteFile) -> Result<Vec<u8>> {
-        if let Some(data) = self.cache.lock().map_err(|_| Error(5))?.get(&inode) {
+    fn download(&self, remote: &RemoteFile) -> Result<Vec<u8>> {
+        if let Some(data) = self.cache.lock().map_err(|_| Error(5))?.get(&remote.id) {
             return Ok(data.clone());
         }
         let (_, export_mime) = export_format(&remote.mime_type);
@@ -407,7 +545,7 @@ impl GoogleDrive {
         self.cache
             .lock()
             .map_err(|_| Error(5))?
-            .insert(inode, data.clone());
+            .insert(remote.id.clone(), data.clone());
         Ok(data)
     }
 
@@ -440,12 +578,138 @@ impl GoogleDrive {
             .map_err(|_| Error::IO)?;
         Ok(())
     }
+
+    fn flush(&self, inode: u64) -> Result<()> {
+        let remote = inode_index(inode)
+            .and_then(|index| self.nodes.get(index))
+            .and_then(|node| node.remote.as_ref())
+            .ok_or(Error(2))?;
+        self.flush_remote(remote)
+    }
+
+    fn flush_remote(&self, remote: &RemoteFile) -> Result<()> {
+        let _write = self.writes.lock().map_err(|_| Error::IO)?;
+        if !self
+            .dirty
+            .lock()
+            .map_err(|_| Error::IO)?
+            .contains(&remote.id)
+        {
+            return Ok(());
+        }
+        let data = self
+            .cache
+            .lock()
+            .map_err(|_| Error::IO)?
+            .get(&remote.id)
+            .cloned()
+            .ok_or(Error::IO)?;
+        self.upload(remote, &data)?;
+        self.dirty.lock().map_err(|_| Error::IO)?.remove(&remote.id);
+        Ok(())
+    }
 }
 
 fn drive_file_is_writable(file: &DriveFile) -> bool {
-    file.mime_type != FOLDER
-        && file.capabilities.can_modify_content
-        && !file.mime_type.starts_with("application/vnd.google-apps.")
+    let (_, mime_type, _, capabilities) = effective_file(file);
+    mime_type != FOLDER
+        && capabilities.can_modify_content
+        && !mime_type.starts_with("application/vnd.google-apps.")
+}
+
+fn supported_file(file: &DriveFile) -> bool {
+    let (_, mime_type, _, capabilities) = effective_file(file);
+    mime_type == FOLDER
+        || (capabilities.can_download
+            && (!mime_type.starts_with("application/vnd.google-apps.")
+                || export_format(mime_type).1.is_some()))
+}
+
+fn effective_file(file: &DriveFile) -> (&str, &str, u64, &Capabilities) {
+    file.resolved_target.as_ref().map_or(
+        (
+            file.id.as_str(),
+            file.mime_type.as_str(),
+            file.size,
+            &file.capabilities,
+        ),
+        |target| {
+            (
+                target.id.as_str(),
+                target.mime_type.as_str(),
+                target.size,
+                &target.capabilities,
+            )
+        },
+    )
+}
+
+fn tree_parents(file: &DriveFile, ids: &HashMap<String, Vec<u64>>) -> Vec<u64> {
+    let mut output = Vec::new();
+    for parent in file.parents.iter().filter_map(|id| ids.get(id)) {
+        for inode in parent {
+            if !output.contains(inode) {
+                output.push(*inode);
+            }
+        }
+    }
+    output
+}
+
+fn register_tree_ids(ids: &mut HashMap<String, Vec<u64>>, file: &DriveFile, inodes: &[u64]) {
+    let mut keys = vec![file.id.as_str()];
+    if let Some(target) = &file.resolved_target {
+        keys.push(&target.id);
+    }
+    for key in keys {
+        let values = ids.entry(key.to_owned()).or_default();
+        for inode in inodes {
+            if !values.contains(inode) {
+                values.push(*inode);
+            }
+        }
+    }
+}
+
+fn portable_name(name: &str) -> Vec<u8> {
+    let mut output: String = name
+        .chars()
+        .map(|character| match character {
+            '\0' | '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => character,
+        })
+        .collect();
+    while output.ends_with([' ', '.']) {
+        output.pop();
+    }
+    while output.len() > 240 {
+        output.pop();
+    }
+    if output.is_empty() || matches!(output.as_str(), "." | "..") {
+        "_".clone_into(&mut output);
+    }
+    let stem = output.split('.').next().unwrap_or_default();
+    let reserved = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if reserved
+        .iter()
+        .any(|value| stem.eq_ignore_ascii_case(value))
+    {
+        output.insert(0, '_');
+    }
+    output.into_bytes()
+}
+
+fn names_equal(left: &[u8], right: &[u8]) -> bool {
+    let normalize = |value: &[u8]| {
+        String::from_utf8_lossy(value)
+            .nfd()
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    normalize(left) == normalize(right)
 }
 
 fn export_format(mime: &str) -> (&'static str, Option<&'static str>) {
@@ -473,10 +737,12 @@ impl Filesystem for GoogleDrive {
         let used = self
             .nodes
             .iter()
-            .enumerate()
-            .map(|(index, node)| {
-                let inode = u64::try_from(index + 1).unwrap_or(u64::MAX);
-                sizes.get(&inode).copied().unwrap_or(node.size)
+            .map(|node| {
+                node.remote
+                    .as_ref()
+                    .and_then(|remote| sizes.get(&remote.id))
+                    .copied()
+                    .unwrap_or(node.size)
             })
             .sum();
         Ok(StatFs {
@@ -494,11 +760,11 @@ impl Filesystem for GoogleDrive {
         let node = inode_index(inode)
             .and_then(|index| self.nodes.get(index))
             .ok_or(Error(2))?;
-        let size = self
-            .sizes
-            .lock()
-            .map_err(|_| Error::IO)?
-            .get(&inode)
+        let sizes = self.sizes.lock().map_err(|_| Error::IO)?;
+        let size = node
+            .remote
+            .as_ref()
+            .and_then(|remote| sizes.get(&remote.id))
             .copied()
             .unwrap_or(node.size);
         Ok(Metadata {
@@ -580,7 +846,7 @@ impl Filesystem for GoogleDrive {
             .and_then(|index| self.nodes.get(index))
             .ok_or(Error(2))?;
         let remote = node.remote.as_ref().ok_or(Error(21))?;
-        let data = self.download(inode, remote)?;
+        let data = self.download(remote)?;
         let start = usize::try_from(offset).map_err(|_| Error::INVALID)?;
         let Some(input) = data.get(start..) else {
             return Ok(0);
@@ -599,23 +865,26 @@ impl Filesystem for GoogleDrive {
             return Err(Error(30));
         }
         let remote = node.remote.as_ref().ok_or(Error(21))?;
-        let mut data = self.download(inode, remote)?;
+        let mut data = self.download(remote)?;
         let start = usize::try_from(offset).map_err(|_| Error::INVALID)?;
         let end = start.checked_add(input.len()).ok_or(Error::INVALID)?;
         if data.len() < end {
             data.resize(end, 0);
         }
         data[start..end].copy_from_slice(input);
-        self.upload(remote, &data)?;
         let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
         self.cache
             .lock()
             .map_err(|_| Error::IO)?
-            .insert(inode, data);
+            .insert(remote.id.clone(), data);
         self.sizes
             .lock()
             .map_err(|_| Error::IO)?
-            .insert(inode, size);
+            .insert(remote.id.clone(), size);
+        self.dirty
+            .lock()
+            .map_err(|_| Error::IO)?
+            .insert(remote.id.clone());
         Ok(input.len())
     }
 
@@ -639,18 +908,39 @@ impl Filesystem for GoogleDrive {
             return Err(Error(30));
         }
         let remote = node.remote.as_ref().ok_or(Error(21))?;
-        let mut data = self.download(inode, remote)?;
+        let mut data = self.download(remote)?;
         data.resize(usize::try_from(size).map_err(|_| Error::INVALID)?, 0);
         self.upload(remote, &data)?;
         self.cache
             .lock()
             .map_err(|_| Error::IO)?
-            .insert(inode, data);
+            .insert(remote.id.clone(), data);
         self.sizes
             .lock()
             .map_err(|_| Error::IO)?
-            .insert(inode, size);
+            .insert(remote.id.clone(), size);
+        self.dirty.lock().map_err(|_| Error::IO)?.remove(&remote.id);
         self.metadata(inode)
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        let dirty: Vec<_> = self
+            .dirty
+            .lock()
+            .map_err(|_| Error::IO)?
+            .iter()
+            .cloned()
+            .collect();
+        for id in dirty {
+            let remote = self
+                .nodes
+                .iter()
+                .filter_map(|node| node.remote.as_ref())
+                .find(|remote| remote.id == id)
+                .ok_or(Error(2))?;
+            self.flush_remote(remote)?;
+        }
+        Ok(())
     }
 }
 
@@ -671,11 +961,37 @@ impl NetworkFilesystem for GoogleDrive {
         }
         Ok(NetworkFile::Remote)
     }
+
+    fn close_file(&self, inode: u64, _file: NetworkFile) -> Result<()> {
+        self.flush(inode)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn filesystem() -> GoogleDrive {
+        GoogleDrive {
+            client: Client::new(),
+            token: String::new(),
+            nodes: vec![Node {
+                parent: ROOT_INODE,
+                name: Vec::new(),
+                kind: FileType::Directory,
+                size: 0,
+                remote: None,
+                writable: false,
+            }],
+            children: HashMap::new(),
+            cache: Mutex::new(HashMap::new()),
+            sizes: Mutex::new(HashMap::new()),
+            writes: Mutex::new(()),
+            dirty: Mutex::new(HashSet::new()),
+            total_bytes: 0,
+            free_bytes: 0,
+        }
+    }
 
     fn file(mime_type: &str, can_modify_content: bool) -> DriveFile {
         DriveFile {
@@ -684,7 +1000,12 @@ mod tests {
             mime_type: mime_type.to_owned(),
             parents: Vec::new(),
             size: 0,
-            capabilities: Capabilities { can_modify_content },
+            capabilities: Capabilities {
+                can_modify_content,
+                can_download: true,
+            },
+            shortcut_details: None,
+            resolved_target: None,
         }
     }
 
@@ -701,5 +1022,119 @@ mod tests {
             "application/vnd.google-apps.document",
             true,
         )));
+    }
+
+    #[test]
+    fn parses_string_encoded_drive_file_size() {
+        let file: DriveFile = serde_json::from_str(
+            r#"{"id":"id","name":"file","mimeType":"text/plain","size":"42"}"#,
+        )
+        .expect("Drive API file should deserialize");
+        assert_eq!(file.size, 42);
+    }
+
+    #[test]
+    fn portable_names_avoid_host_special_names_and_characters() {
+        assert_eq!(portable_name("a/b:c"), b"a_b_c");
+        assert_eq!(portable_name("CON"), b"_CON");
+        assert_eq!(portable_name("trailing. "), b"trailing");
+        assert!(portable_name(&"x".repeat(300)).len() <= 240);
+        assert!(names_equal("É".as_bytes(), "é".as_bytes()));
+        assert!(names_equal("é".as_bytes(), "e\u{301}".as_bytes()));
+    }
+
+    #[test]
+    fn trees_use_actual_root_ids_and_include_shared_descendants() {
+        let mut filesystem = filesystem();
+        let my_drive =
+            filesystem.add_node(ROOT_INODE, "My Drive", FileType::Directory, 0, None, false);
+        let shared = filesystem.add_node(
+            ROOT_INODE,
+            "Shared with me",
+            FileType::Directory,
+            0,
+            None,
+            false,
+        );
+        let mut folder = file(FOLDER, false);
+        folder.id = "folder".to_owned();
+        folder.parents = vec!["actual-root-id".to_owned()];
+        let mut child = file("text/plain", false);
+        child.id = "child".to_owned();
+        child.parents = vec!["folder".to_owned()];
+
+        filesystem.add_tree(my_drive, "actual-root-id", &[folder.clone(), child.clone()]);
+        let (my_folder, _) = filesystem
+            .lookup(my_drive, b"name")
+            .expect("top-level folder");
+        assert!(filesystem.lookup(my_folder, b"name").is_ok());
+
+        filesystem.add_shared_tree(shared, &[folder], &[child]);
+        let (shared_folder, _) = filesystem.lookup(shared, b"name").expect("shared folder");
+        assert!(filesystem.lookup(shared_folder, b"name").is_ok());
+    }
+
+    #[test]
+    fn folder_shortcuts_preserve_identity_and_duplicate_target_children() {
+        let mut filesystem = filesystem();
+        let root = filesystem.add_node(ROOT_INODE, "My Drive", FileType::Directory, 0, None, false);
+        let mut folder = file(FOLDER, false);
+        folder.id = "target".to_owned();
+        folder.parents = vec!["root-id".to_owned()];
+        let mut shortcut = file(SHORTCUT, false);
+        shortcut.id = "shortcut".to_owned();
+        shortcut.parents = vec!["root-id".to_owned()];
+        shortcut.resolved_target = Some(ShortcutTarget {
+            id: "target".to_owned(),
+            mime_type: FOLDER.to_owned(),
+            size: 0,
+            capabilities: Capabilities::default(),
+        });
+        let mut child = file("text/plain", false);
+        child.id = "child".to_owned();
+        child.parents = vec!["target".to_owned()];
+
+        filesystem.add_tree(root, "root-id", &[folder, shortcut, child]);
+        let (folder_inode, _) = filesystem.lookup(root, b"name").expect("real folder");
+        let (shortcut_inode, _) = filesystem.lookup(root, b"name (2)").expect("shortcut");
+        assert!(filesystem.lookup(folder_inode, b"name").is_ok());
+        assert!(filesystem.lookup(shortcut_inode, b"name").is_ok());
+    }
+
+    #[test]
+    fn unsupported_and_download_restricted_files_are_hidden() {
+        let mut unsupported = file("application/vnd.google-apps.form", true);
+        assert!(!supported_file(&unsupported));
+        unsupported.mime_type = "text/plain".to_owned();
+        unsupported.capabilities.can_download = false;
+        assert!(!supported_file(&unsupported));
+    }
+
+    #[test]
+    fn writes_buffer_by_remote_id_until_close() {
+        let mut filesystem = filesystem();
+        let inode = filesystem.add_node(
+            ROOT_INODE,
+            "file",
+            FileType::File,
+            3,
+            Some(RemoteFile {
+                id: "id".to_owned(),
+                mime_type: "text/plain".to_owned(),
+            }),
+            true,
+        );
+        filesystem
+            .cache
+            .lock()
+            .expect("cache")
+            .insert("id".to_owned(), b"abc".to_vec());
+
+        assert_eq!(filesystem.write(inode, 1, b"XY"), Ok(2));
+        assert_eq!(
+            filesystem.cache.lock().expect("cache").get("id"),
+            Some(&b"aXY".to_vec())
+        );
+        assert!(filesystem.dirty.lock().expect("dirty").contains("id"));
     }
 }

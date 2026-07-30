@@ -31,6 +31,7 @@ use windows_sys::{
 };
 
 const S_OK: HRESULT = 0;
+const FILE_ATTRIBUTE_READ_ONLY: u32 = 0x1;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 const WINDOWS_EPOCH_OFFSET_100NS: u64 = 116_444_736_000_000_000;
@@ -565,6 +566,15 @@ unsafe extern "system" fn cancel_command(callback: *const PRJ_CALLBACK_DATA) {
 }
 
 fn basic_info(metadata: Metadata) -> PRJ_FILE_BASIC_INFO {
+    let mut attributes = if metadata.kind == FileType::Directory {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_NORMAL
+    };
+    if metadata.mode & 0o222 == 0 {
+        attributes &= !FILE_ATTRIBUTE_NORMAL;
+        attributes |= FILE_ATTRIBUTE_READ_ONLY;
+    }
     PRJ_FILE_BASIC_INFO {
         IsDirectory: metadata.kind == FileType::Directory,
         FileSize: i64::try_from(metadata.size).unwrap_or(i64::MAX),
@@ -572,11 +582,7 @@ fn basic_info(metadata: Metadata) -> PRJ_FILE_BASIC_INFO {
         LastAccessTime: windows_time(metadata.accessed_ns),
         LastWriteTime: windows_time(metadata.modified_ns),
         ChangeTime: windows_time(metadata.modified_ns),
-        FileAttributes: if metadata.kind == FileType::Directory {
-            FILE_ATTRIBUTE_DIRECTORY
-        } else {
-            FILE_ATTRIBUTE_NORMAL
-        },
+        FileAttributes: attributes,
     }
 }
 

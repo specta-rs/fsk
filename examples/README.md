@@ -43,6 +43,10 @@ portable formats while the mount is indexed because Drive does not publish
 their exported byte lengths. Ordinary files are writable when Drive reports
 `canModifyContent`; files without that capability and exported Google Workspace
 documents are exposed read-only through the platform's normal permission bits.
+On macOS and Linux, writes are uploaded to Drive. Windows ProjFS keeps edits in
+its local projection cache and does not currently provide portable write-back
+callbacks, but Drive read-only files still receive the Windows read-only
+attribute.
 
 Create an OAuth access token with the Drive scope, then run:
 
@@ -54,6 +58,8 @@ cargo run -p fsk-google-drive -- /path/to/mount
 The token must include `https://www.googleapis.com/auth/drive` for writes.
 Application-default tokens from `gcloud` only work when the associated OAuth
 grant includes that scope; a token from any other OAuth flow works too.
+Access tokens are short-lived; restart the example with a refreshed token when
+the current token expires.
 
 On macOS, install and authorize `FSK.app` before running a CLI. Linux
 requires FUSE, and Windows requires the Projected File System optional feature.

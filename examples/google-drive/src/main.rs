@@ -23,7 +23,7 @@ fn main() -> io::Result<()> {
     let token = env::var("GOOGLE_DRIVE_ACCESS_TOKEN").map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "set GOOGLE_DRIVE_ACCESS_TOKEN to an OAuth token with the drive.readonly scope",
+            "set GOOGLE_DRIVE_ACCESS_TOKEN to an OAuth token with the drive scope",
         )
     })?;
     check_platform_authorization()?;
