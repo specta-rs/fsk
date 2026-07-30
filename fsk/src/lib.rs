@@ -30,7 +30,11 @@ pub mod raw;
 mod windows;
 
 #[cfg(target_os = "macos")]
-pub use authorization::{AuthorizationStatus, authorization_status, open_authorization_app};
+#[allow(deprecated)]
+pub use authorization::{
+    AppInstallOutcome, AuthorizationStatus, authorization_status, download_and_install_app,
+    launch_app, open_authorization_app,
+};
 pub use core::{
     DirectoryEntry, DirectorySink, Error, FileType, Filesystem, Metadata, ROOT_INODE,
     ReadDirectoryResult, Result, SetMetadata, StatFs, now_ns,

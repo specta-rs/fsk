@@ -301,18 +301,22 @@ signing `com.apple.developer.fskit.fsmodule`.
 ./fsk/macos/check.sh
 ```
 
-Install `FSK.app`, then enable it under **System Settings → General → Login
-Items & Extensions → File System Extensions**. A CLI can query and open the
-authorization guide:
+The Rust SDK can download and install the matching `FSK.app` release without
+opening it. Run the blocking installation call on your background executor,
+then launch the app separately when the user is ready to authorize it under
+**System Settings → General → Login Items & Extensions → File System Extensions**:
 
 ```rust
+let outcome = fsk::download_and_install_app()?;
+println!("FSK app installation: {outcome:?}");
+
 match fsk::authorization_status()? {
     fsk::AuthorizationStatus::Authorized => {}
     fsk::AuthorizationStatus::NeedsApproval => {
-        fsk::open_authorization_app()?;
+        fsk::launch_app()?;
     }
     fsk::AuthorizationStatus::NotInstalled => {
-        eprintln!("Install FSK.app in /Applications");
+        unreachable!("the matching app was just installed");
     }
 }
 # Ok::<(), std::io::Error>(())
