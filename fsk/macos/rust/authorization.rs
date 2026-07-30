@@ -122,16 +122,6 @@ pub fn launch_app() -> io::Result<()> {
     }
 }
 
-/// Open the `FSK` companion app directly in its authorization guide.
-///
-/// # Errors
-///
-/// Returns an error when the app is missing or macOS cannot open it.
-#[deprecated(since = "0.0.10", note = "use launch_app")]
-pub fn open_authorization_app() -> io::Result<()> {
-    launch_app()
-}
-
 fn install_from_release(temporary: &Path, destination: &Path) -> io::Result<()> {
     let archive = temporary.join("FSK.zip");
     let extracted = temporary.join("extracted");
