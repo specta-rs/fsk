@@ -319,6 +319,9 @@ match fsk::authorization_status()? {
         unreachable!("the matching app was just installed");
     }
 }
+
+// Later, when your application no longer needs the extension:
+let removed = fsk::uninstall_app()?;
 # Ok::<(), std::io::Error>(())
 ```
 

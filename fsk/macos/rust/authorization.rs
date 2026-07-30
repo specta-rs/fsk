@@ -7,9 +7,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use parking_lot::Mutex;
+
 const APP_EXECUTABLE: &str = "Contents/MacOS/FSK";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASE_URL: &str = "https://github.com/specta-rs/fsk/releases/download";
+static APP_MUTATION: Mutex<()> = Mutex::new(());
 
 /// The result of installing the companion application for this SDK version.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,7 +21,7 @@ pub enum AppInstallOutcome {
     AlreadyInstalled,
     /// No application was present, so it was installed.
     Installed,
-    /// A different application version was replaced.
+    /// An existing outdated or invalid application was replaced.
     Updated,
 }
 
@@ -38,17 +41,19 @@ pub enum AuthorizationStatus {
 /// This operation is synchronous and never launches the application or presents
 /// UI, so callers can run it on a background thread or executor of their choice.
 /// The release is downloaded from GitHub, checked by macOS, and installed at
-/// `/Applications/FSK.app`. An already installed matching version is left alone.
-/// Set `FSK_APP_PATH` to choose a different destination during development.
+/// `/Applications/FSK.app`. An already installed, valid matching version is
+/// left alone. Set `FSK_APP_PATH` to choose a different destination during
+/// development.
 ///
 /// # Errors
 ///
 /// Returns an error if the release cannot be downloaded, unpacked, validated,
 /// or installed. Installing in the chosen destination may require permission.
 pub fn download_and_install_app() -> io::Result<AppInstallOutcome> {
+    let _mutation = APP_MUTATION.lock();
     let destination = app_path();
-    let previous_version = app_version(&destination)?;
-    if previous_version.as_deref() == Some(APP_VERSION) {
+    let was_installed = path_present(&destination)?;
+    if validate_app(&destination, APP_VERSION).is_ok() {
         return Ok(AppInstallOutcome::AlreadyInstalled);
     }
 
@@ -57,11 +62,27 @@ pub fn download_and_install_app() -> io::Result<AppInstallOutcome> {
     let _ = fs::remove_dir_all(&temporary);
     result?;
 
-    Ok(if previous_version.is_some() {
+    Ok(if was_installed {
         AppInstallOutcome::Updated
     } else {
         AppInstallOutcome::Installed
     })
+}
+
+/// Remove the installed `FSK` companion app without presenting UI.
+///
+/// This operation is synchronous and is serialized with installation calls in
+/// the same process. It returns `true` when an app was removed and `false` when
+/// no app was installed. Set `FSK_APP_PATH` to choose a different destination
+/// during development.
+///
+/// # Errors
+///
+/// Returns an error if the installed bundle cannot be removed. Removing it from
+/// the chosen destination may require permission.
+pub fn uninstall_app() -> io::Result<bool> {
+    let _mutation = APP_MUTATION.lock();
+    uninstall_app_at(&app_path())
 }
 
 /// Ask the installed Swift app for the current `FSKit` authorization state.
@@ -151,24 +172,7 @@ fn install_from_release(temporary: &Path, destination: &Path) -> io::Result<()> 
     )?;
 
     let source = extracted.join("FSK.app");
-    if app_version(&source)?.as_deref() != Some(APP_VERSION) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "downloaded FSK.app version does not match the Rust SDK",
-        ));
-    }
-    run(
-        Command::new("/usr/bin/codesign")
-            .args(["--verify", "--deep", "--strict"])
-            .arg(&source),
-        "verify FSK.app signature",
-    )?;
-    run(
-        Command::new("/usr/sbin/spctl")
-            .args(["--assess", "--type", "execute"])
-            .arg(&source),
-        "validate FSK.app with Gatekeeper",
-    )?;
+    validate_app(&source, APP_VERSION)?;
 
     let parent = destination.parent().ok_or_else(|| {
         io::Error::new(
@@ -177,29 +181,100 @@ fn install_from_release(temporary: &Path, destination: &Path) -> io::Result<()> 
         )
     })?;
     fs::create_dir_all(parent)?;
-    let staging = parent.join(format!(".FSK.app.install-{}", std::process::id()));
-    if staging.exists() {
-        fs::remove_dir_all(&staging)?;
-    }
-    run(
+    let invocation = temporary
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("invalid FSK installer temporary path"))?;
+    let staging = parent.join(format!(".FSK.app.install-{invocation}"));
+    let stage_result = run(
         Command::new("/usr/bin/ditto").arg(&source).arg(&staging),
         "stage FSK.app installation",
-    )?;
-
-    let backup = parent.join(format!(".FSK.app.backup-{}", std::process::id()));
-    if destination.exists() {
-        fs::rename(destination, &backup)?;
+    );
+    if let Err(error) = stage_result {
+        let _ = remove_path(&staging);
+        return Err(error);
     }
-    if let Err(error) = fs::rename(&staging, destination) {
-        if backup.exists() {
-            let _ = fs::rename(&backup, destination);
+
+    let backup = parent.join(format!(".FSK.app.backup-{invocation}"));
+    replace_app(&staging, destination, &backup)
+}
+
+fn replace_app(staging: &Path, destination: &Path, backup: &Path) -> io::Result<()> {
+    let destination_present = match path_present(destination) {
+        Ok(present) => present,
+        Err(error) => {
+            let _ = remove_path(staging);
+            return Err(error);
+        }
+    };
+    if destination_present {
+        if let Err(error) = fs::rename(destination, backup) {
+            let _ = remove_path(staging);
+            return Err(error);
+        }
+    }
+    if let Err(error) = fs::rename(staging, destination) {
+        let _ = remove_path(staging);
+        if destination_present {
+            return match fs::rename(backup, destination) {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(io::Error::other(format!(
+                    "could not install FSK.app ({error}) and could not restore the previous app ({restore_error}); the previous app remains at {}",
+                    backup.display()
+                ))),
+            };
         }
         return Err(error);
     }
-    if backup.exists() {
-        fs::remove_dir_all(backup)?;
-    }
+    remove_path(backup)?;
     Ok(())
+}
+
+fn validate_app(app: &Path, expected_version: &str) -> io::Result<()> {
+    if app_version(app)?.as_deref() != Some(expected_version) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FSK.app version does not match the Rust SDK",
+        ));
+    }
+    run(
+        Command::new("/usr/bin/codesign")
+            .args(["--verify", "--deep", "--strict"])
+            .arg(app),
+        "verify FSK.app signature",
+    )?;
+    run(
+        Command::new("/usr/sbin/spctl")
+            .args(["--assess", "--type", "execute"])
+            .arg(app),
+        "validate FSK.app with Gatekeeper",
+    )
+}
+
+fn uninstall_app_at(app: &Path) -> io::Result<bool> {
+    remove_path(app)
+}
+
+fn remove_path(path: &Path) -> io::Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(true)
+}
+
+fn path_present(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn app_version(app: &Path) -> io::Result<Option<String>> {
@@ -261,5 +336,58 @@ mod tests {
             Path::new("/Applications/FSK.app").join(APP_EXECUTABLE),
             Path::new("/Applications/FSK.app/Contents/MacOS/FSK")
         );
+    }
+
+    #[test]
+    fn uninstall_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("FSK.app");
+        fs::create_dir(&app).unwrap();
+
+        assert!(uninstall_app_at(&app).unwrap());
+        assert!(!uninstall_app_at(&app).unwrap());
+    }
+
+    #[test]
+    fn uninstall_removes_non_directory_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("FSK.app");
+        fs::write(&app, b"not an app bundle").unwrap();
+
+        assert!(uninstall_app_at(&app).unwrap());
+        assert!(!app.exists());
+    }
+
+    #[test]
+    fn failed_replacement_restores_previous_app() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("FSK.app");
+        let staging = directory.path().join("missing-staging");
+        let backup = directory.path().join("backup");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("marker"), b"previous app").unwrap();
+
+        assert!(replace_app(&staging, &destination, &backup).is_err());
+        assert_eq!(
+            fs::read(destination.join("marker")).unwrap(),
+            b"previous app"
+        );
+        assert!(!backup.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_removes_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let app = directory.path().join("FSK.app");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &app).unwrap();
+
+        assert!(uninstall_app_at(&app).unwrap());
+        assert!(target.exists());
+        assert!(!app.exists());
     }
 }

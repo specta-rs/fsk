@@ -32,7 +32,7 @@ mod windows;
 #[cfg(target_os = "macos")]
 pub use authorization::{
     AppInstallOutcome, AuthorizationStatus, authorization_status, download_and_install_app,
-    launch_app,
+    launch_app, uninstall_app,
 };
 pub use core::{
     DirectoryEntry, DirectorySink, Error, FileType, Filesystem, Metadata, ROOT_INODE,
