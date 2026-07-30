@@ -57,3 +57,17 @@ grant includes that scope; a token from any other OAuth flow works too.
 
 On macOS, install and authorize `FSK.app` before running a CLI. Linux
 requires FUSE, and Windows requires the Projected File System optional feature.
+
+## `github-filesystem`
+
+A complete, read-only GitHub filesystem inspired by
+[GHFS](https://github.com/indragiek/GHFS). It demonstrates repository discovery,
+lazy API-backed directory trees, atomic downloads, local-file acceleration, and
+automatic least-recently-used cache cleanup.
+
+```sh
+GITHUB_TOKEN=github_pat_... cargo run -p fsk-github-filesystem -- /path/to/mount
+```
+
+See [`github-filesystem/README.md`](github-filesystem/README.md) for cache and
+download controls.

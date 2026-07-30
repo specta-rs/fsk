@@ -2,6 +2,8 @@
 import Foundation
 import FSKit
 import Testing
+import Darwin
+import ObjectiveC
 
 @Suite("Rust process bridge")
 struct RustBackendTests {
@@ -32,6 +34,25 @@ struct RustBackendTests {
         #expect(String(decoding: batch.name(for: entry), as: UTF8.self) == "second")
     }
 
+    @Test("Unix socket addresses preserve the Darwin family and path layout")
+    func unixSocketAddressLayout() throws {
+        let path = "/tmp/fsk.sock"
+        var (address, length) = try unixSocketAddress(path: path)
+        let pathOffset = MemoryLayout<sockaddr_un>.offset(of: \.sun_path)!
+
+        #expect(address.sun_len == UInt8(length))
+        #expect(address.sun_family == sa_family_t(AF_UNIX))
+        #expect(Int(length) == pathOffset + path.utf8.count)
+
+        let encodedPath = withUnsafeBytes(of: &address) {
+            Array($0[pathOffset..<(pathOffset + path.utf8.count)])
+        }
+        #expect(encodedPath == Array(path.utf8))
+        withUnsafeBytes(of: &address) {
+            #expect($0[Int(length)] == 0)
+        }
+    }
+
     @Test("local network files read through a leased descriptor")
     func localFileLease() throws {
         let url = FileManager.default.temporaryDirectory
@@ -54,5 +75,23 @@ struct RustBackendTests {
         #expect(count == 10)
         #expect(String(decoding: bytes, as: UTF8.self) == "downloaded")
         #expect(item.releaseOpenState() == 7)
+    }
+
+    @Test("volume exposes the FSKit lifecycle protocol and selectors")
+    func volumeOperationsSurface() throws {
+        let operations = try #require(NSProtocolFromString("FSVolumeOperations"))
+        #expect(class_conformsToProtocol(FSKVolume.self, operations))
+        #expect(
+            class_getInstanceMethod(
+                FSKVolume.self,
+                NSSelectorFromString("activateWithOptions:replyHandler:")
+            ) != nil
+        )
+        #expect(
+            class_getInstanceMethod(
+                FSKVolume.self,
+                NSSelectorFromString("deactivateWithOptions:replyHandler:")
+            ) != nil
+        )
     }
 }
