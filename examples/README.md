@@ -60,6 +60,9 @@ Application-default tokens from `gcloud` only work when the associated OAuth
 grant includes that scope; a token from any other OAuth flow works too.
 Access tokens are short-lived; restart the example with a refreshed token when
 the current token expires.
+For simplicity, this example stages ordinary file contents in memory and limits
+individual buffered files to 256 MiB. Uploads use Drive revisions and ETags to
+reject saves when another client changed the remote file after it was indexed.
 
 On macOS, install and authorize `FSK.app` before running a CLI. Linux
 requires FUSE, and Windows requires the Projected File System optional feature.

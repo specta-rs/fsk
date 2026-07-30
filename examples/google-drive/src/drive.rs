@@ -7,7 +7,7 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Deserializer, de::Error as _};
 use std::{
     collections::{HashMap, HashSet},
-    io,
+    io::{self, Read},
     sync::Mutex,
 };
 use unicode_normalization::UnicodeNormalization;
@@ -15,6 +15,7 @@ use unicode_normalization::UnicodeNormalization;
 const API: &str = "https://www.googleapis.com/drive/v3";
 const FOLDER: &str = "application/vnd.google-apps.folder";
 const SHORTCUT: &str = "application/vnd.google-apps.shortcut";
+const MAX_BUFFERED_FILE_SIZE: u64 = 256 * 1024 * 1024;
 
 fn deserialize_u64_string<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
 where
@@ -72,6 +73,8 @@ struct DriveFile {
     shortcut_details: Option<ShortcutDetails>,
     #[serde(skip)]
     resolved_target: Option<ShortcutTarget>,
+    #[serde(default)]
+    version: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -86,6 +89,7 @@ struct ShortcutTarget {
     mime_type: String,
     size: u64,
     capabilities: Capabilities,
+    version: String,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -125,6 +129,11 @@ struct RootFile {
 }
 
 #[derive(Deserialize)]
+struct FileVersion {
+    version: String,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct About {
     storage_quota: StorageQuota,
@@ -160,6 +169,8 @@ pub struct GoogleDrive {
     sizes: Mutex<HashMap<String, u64>>,
     writes: Mutex<()>,
     dirty: Mutex<HashSet<String>>,
+    versions: Mutex<HashMap<String, String>>,
+    original_sizes: HashMap<String, u64>,
     total_bytes: u64,
     free_bytes: u64,
 }
@@ -185,6 +196,8 @@ impl GoogleDrive {
             sizes: Mutex::new(HashMap::new()),
             writes: Mutex::new(()),
             dirty: Mutex::new(HashSet::new()),
+            versions: Mutex::new(HashMap::new()),
+            original_sizes: HashMap::new(),
             total_bytes: u64::MAX,
             free_bytes: u64::MAX,
         };
@@ -318,6 +331,7 @@ impl GoogleDrive {
                     mime_type: target.mime_type,
                     size: target.size,
                     capabilities: target.capabilities,
+                    version: target.version,
                 });
                 file.shortcut_details = None;
                 supported_file(&file).then_some(file)
@@ -330,7 +344,7 @@ impl GoogleDrive {
             .query(&[
                 (
                     "fields",
-                    "id,name,mimeType,parents,size,capabilities(canModifyContent,canDownload),shortcutDetails(targetId)",
+                    "id,name,mimeType,parents,size,version,capabilities(canModifyContent,canDownload),shortcutDetails(targetId)",
                 ),
                 ("supportsAllDrives", "true"),
             ])
@@ -353,7 +367,7 @@ impl GoogleDrive {
                 ("corpora", corpus.to_owned()),
                 (
                     "fields",
-                    "nextPageToken,files(id,name,mimeType,parents,size,capabilities(canModifyContent,canDownload),shortcutDetails(targetId))"
+                    "nextPageToken,files(id,name,mimeType,parents,size,version,capabilities(canModifyContent,canDownload),shortcutDetails(targetId))"
                         .to_owned(),
                 ),
                 ("pageSize", "1000".to_owned()),
@@ -466,7 +480,7 @@ impl GoogleDrive {
     }
 
     fn add_drive_file(&mut self, parent: u64, file: &DriveFile) -> u64 {
-        let (remote_id, mime_type, size, _) = effective_file(file);
+        let (remote_id, mime_type, size, _, version) = effective_file(file);
         let kind = if mime_type == FOLDER {
             FileType::Directory
         } else {
@@ -485,6 +499,16 @@ impl GoogleDrive {
             )
         };
         let writable = drive_file_is_writable(file);
+        if kind == FileType::File {
+            self.original_sizes
+                .entry(remote_id.to_owned())
+                .or_insert(size);
+            self.versions
+                .get_mut()
+                .expect("version mutex is not poisoned during indexing")
+                .entry(remote_id.to_owned())
+                .or_insert_with(|| version.to_owned());
+        }
         self.add_node(parent, &name, kind, size, remote, writable)
     }
 
@@ -536,20 +560,42 @@ impl GoogleDrive {
                 .query(&[("alt", "media"), ("supportsAllDrives", "true")])
         };
         request = request.header(reqwest::header::ACCEPT, "*/*");
-        let data = request
+        let response = request
             .send()
             .and_then(reqwest::blocking::Response::error_for_status)
-            .and_then(reqwest::blocking::Response::bytes)
-            .map_err(|_| Error(5))?
-            .to_vec();
-        self.cache
-            .lock()
-            .map_err(|_| Error(5))?
-            .insert(remote.id.clone(), data.clone());
-        Ok(data)
+            .map_err(|_| Error::IO)?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_BUFFERED_FILE_SIZE)
+        {
+            return Err(Error(27));
+        }
+        let mut data = Vec::new();
+        response
+            .take(MAX_BUFFERED_FILE_SIZE + 1)
+            .read_to_end(&mut data)
+            .map_err(|_| Error::IO)?;
+        if u64::try_from(data.len()).unwrap_or(u64::MAX) > MAX_BUFFERED_FILE_SIZE {
+            return Err(Error(27));
+        }
+        cache_download(&self.cache, &remote.id, data)
     }
 
     fn upload(&self, remote: &RemoteFile, data: &[u8]) -> Result<()> {
+        if u64::try_from(data.len()).unwrap_or(u64::MAX) > MAX_BUFFERED_FILE_SIZE {
+            return Err(Error(27));
+        }
+        let (current_version, etag) = self.remote_version(&remote.id)?;
+        let expected_version = self
+            .versions
+            .lock()
+            .map_err(|_| Error::IO)?
+            .get(&remote.id)
+            .cloned()
+            .unwrap_or_default();
+        if !version_matches(&expected_version, &current_version) {
+            return Err(Error::STALE);
+        }
         let response = self
             .client
             .patch(format!(
@@ -557,7 +603,12 @@ impl GoogleDrive {
                 remote.id
             ))
             .bearer_auth(&self.token)
-            .query(&[("uploadType", "resumable"), ("supportsAllDrives", "true")])
+            .query(&[
+                ("uploadType", "resumable"),
+                ("supportsAllDrives", "true"),
+                ("fields", "version"),
+            ])
+            .header(reqwest::header::IF_MATCH, etag)
             .header("X-Upload-Content-Type", &remote.mime_type)
             .header("X-Upload-Content-Length", data.len())
             .send()
@@ -568,15 +619,38 @@ impl GoogleDrive {
             .get(reqwest::header::LOCATION)
             .and_then(|value| value.to_str().ok())
             .ok_or(Error::IO)?;
-        self.client
+        let updated: FileVersion = self
+            .client
             .put(location)
             .header(reqwest::header::CONTENT_TYPE, &remote.mime_type)
             .header(reqwest::header::CONTENT_LENGTH, data.len())
             .body(data.to_vec())
             .send()
             .and_then(reqwest::blocking::Response::error_for_status)
+            .and_then(reqwest::blocking::Response::json)
             .map_err(|_| Error::IO)?;
+        self.versions
+            .lock()
+            .map_err(|_| Error::IO)?
+            .insert(remote.id.clone(), updated.version);
         Ok(())
+    }
+
+    fn remote_version(&self, id: &str) -> Result<(String, String)> {
+        let response = self
+            .request(&format!("{API}/files/{id}"))
+            .query(&[("fields", "version"), ("supportsAllDrives", "true")])
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|_| Error::IO)?;
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .ok_or(Error::IO)?
+            .to_owned();
+        let version: FileVersion = response.json().map_err(|_| Error::IO)?;
+        Ok((version.version, etag))
     }
 
     fn flush(&self, inode: u64) -> Result<()> {
@@ -611,27 +685,28 @@ impl GoogleDrive {
 }
 
 fn drive_file_is_writable(file: &DriveFile) -> bool {
-    let (_, mime_type, _, capabilities) = effective_file(file);
+    let (_, mime_type, _, capabilities, _) = effective_file(file);
     mime_type != FOLDER
         && capabilities.can_modify_content
         && !mime_type.starts_with("application/vnd.google-apps.")
 }
 
 fn supported_file(file: &DriveFile) -> bool {
-    let (_, mime_type, _, capabilities) = effective_file(file);
+    let (_, mime_type, _, capabilities, _) = effective_file(file);
     mime_type == FOLDER
         || (capabilities.can_download
             && (!mime_type.starts_with("application/vnd.google-apps.")
                 || export_format(mime_type).1.is_some()))
 }
 
-fn effective_file(file: &DriveFile) -> (&str, &str, u64, &Capabilities) {
+fn effective_file(file: &DriveFile) -> (&str, &str, u64, &Capabilities, &str) {
     file.resolved_target.as_ref().map_or(
         (
             file.id.as_str(),
             file.mime_type.as_str(),
             file.size,
             &file.capabilities,
+            file.version.as_str(),
         ),
         |target| {
             (
@@ -639,6 +714,7 @@ fn effective_file(file: &DriveFile) -> (&str, &str, u64, &Capabilities) {
                 target.mime_type.as_str(),
                 target.size,
                 &target.capabilities,
+                target.version.as_str(),
             )
         },
     )
@@ -712,6 +788,23 @@ fn names_equal(left: &[u8], right: &[u8]) -> bool {
     normalize(left) == normalize(right)
 }
 
+fn cache_download(
+    cache: &Mutex<HashMap<String, Vec<u8>>>,
+    id: &str,
+    downloaded: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let mut cache = cache.lock().map_err(|_| Error::IO)?;
+    if let Some(current) = cache.get(id) {
+        return Ok(current.clone());
+    }
+    cache.insert(id.to_owned(), downloaded.clone());
+    Ok(downloaded)
+}
+
+fn version_matches(expected: &str, current: &str) -> bool {
+    expected.is_empty() || expected == current
+}
+
 fn export_format(mime: &str) -> (&'static str, Option<&'static str>) {
     match mime {
         "application/vnd.google-apps.document" => (
@@ -734,23 +827,26 @@ fn export_format(mime: &str) -> (&'static str, Option<&'static str>) {
 impl Filesystem for GoogleDrive {
     fn statfs(&self) -> Result<StatFs> {
         let sizes = self.sizes.lock().map_err(|_| Error::IO)?;
-        let used = self
-            .nodes
-            .iter()
-            .map(|node| {
-                node.remote
-                    .as_ref()
-                    .and_then(|remote| sizes.get(&remote.id))
-                    .copied()
-                    .unwrap_or(node.size)
-            })
-            .sum();
+        let mut used: u64 = self.original_sizes.values().copied().sum();
+        let mut free = self.free_bytes;
+        for (id, current) in &*sizes {
+            let original = self.original_sizes.get(id).copied().unwrap_or(0);
+            if *current >= original {
+                let growth = current - original;
+                used = used.saturating_add(growth);
+                free = free.saturating_sub(growth);
+            } else {
+                let shrinkage = original - current;
+                used = used.saturating_sub(shrinkage);
+                free = free.saturating_add(shrinkage).min(self.total_bytes);
+            }
+        }
         Ok(StatFs {
             block_size: 4096,
             io_size: 131_072,
             total_bytes: self.total_bytes.max(used),
-            free_bytes: self.free_bytes,
-            available_bytes: self.free_bytes,
+            free_bytes: free,
+            available_bytes: free,
             files: self.nodes.len() as u64,
             free_files: 0,
         })
@@ -865,9 +961,12 @@ impl Filesystem for GoogleDrive {
             return Err(Error(30));
         }
         let remote = node.remote.as_ref().ok_or(Error(21))?;
-        let mut data = self.download(remote)?;
         let start = usize::try_from(offset).map_err(|_| Error::INVALID)?;
         let end = start.checked_add(input.len()).ok_or(Error::INVALID)?;
+        if u64::try_from(end).unwrap_or(u64::MAX) > MAX_BUFFERED_FILE_SIZE {
+            return Err(Error(27));
+        }
+        let mut data = self.download(remote)?;
         if data.len() < end {
             data.resize(end, 0);
         }
@@ -906,6 +1005,9 @@ impl Filesystem for GoogleDrive {
             .ok_or(Error(2))?;
         if !node.writable {
             return Err(Error(30));
+        }
+        if size > MAX_BUFFERED_FILE_SIZE {
+            return Err(Error(27));
         }
         let remote = node.remote.as_ref().ok_or(Error(21))?;
         let mut data = self.download(remote)?;
@@ -988,6 +1090,8 @@ mod tests {
             sizes: Mutex::new(HashMap::new()),
             writes: Mutex::new(()),
             dirty: Mutex::new(HashSet::new()),
+            versions: Mutex::new(HashMap::new()),
+            original_sizes: HashMap::new(),
             total_bytes: 0,
             free_bytes: 0,
         }
@@ -1006,6 +1110,7 @@ mod tests {
             },
             shortcut_details: None,
             resolved_target: None,
+            version: "1".to_owned(),
         }
     }
 
@@ -1089,6 +1194,7 @@ mod tests {
             mime_type: FOLDER.to_owned(),
             size: 0,
             capabilities: Capabilities::default(),
+            version: "1".to_owned(),
         });
         let mut child = file("text/plain", false);
         child.id = "child".to_owned();
@@ -1136,5 +1242,60 @@ mod tests {
             Some(&b"aXY".to_vec())
         );
         assert!(filesystem.dirty.lock().expect("dirty").contains("id"));
+
+        let cached = filesystem.cache.lock().expect("cache").clone();
+        let sizes = filesystem.sizes.lock().expect("sizes").clone();
+        let dirty = filesystem.dirty.lock().expect("dirty").clone();
+        assert_eq!(
+            filesystem.write(inode, MAX_BUFFERED_FILE_SIZE, b"x"),
+            Err(Error(27))
+        );
+        assert_eq!(
+            filesystem.set_metadata(
+                inode,
+                SetMetadata {
+                    size: Some(MAX_BUFFERED_FILE_SIZE + 1),
+                    ..SetMetadata::default()
+                }
+            ),
+            Err(Error(27))
+        );
+        assert_eq!(*filesystem.cache.lock().expect("cache"), cached);
+        assert_eq!(*filesystem.sizes.lock().expect("sizes"), sizes);
+        assert_eq!(*filesystem.dirty.lock().expect("dirty"), dirty);
+    }
+
+    #[test]
+    fn completed_download_does_not_replace_concurrent_cached_write() {
+        let cache = Mutex::new(HashMap::from([(
+            "id".to_owned(),
+            b"new dirty data".to_vec(),
+        )]));
+        let selected =
+            cache_download(&cache, "id", b"stale download".to_vec()).expect("select cached data");
+        assert_eq!(selected, b"new dirty data");
+        assert_eq!(
+            cache.lock().expect("cache").get("id"),
+            Some(&b"new dirty data".to_vec())
+        );
+    }
+
+    #[test]
+    fn stale_remote_versions_are_rejected_and_quota_tracks_size_delta_once() {
+        assert!(version_matches("7", "7"));
+        assert!(!version_matches("7", "8"));
+
+        let mut filesystem = filesystem();
+        filesystem.total_bytes = 2_000;
+        filesystem.free_bytes = 1_000;
+        filesystem.original_sizes.insert("id".to_owned(), 100);
+        filesystem
+            .sizes
+            .lock()
+            .expect("sizes")
+            .insert("id".to_owned(), 125);
+        let stats = filesystem.statfs().expect("statfs");
+        assert_eq!(stats.free_bytes, 975);
+        assert_eq!(stats.available_bytes, 975);
     }
 }
