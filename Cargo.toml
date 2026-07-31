@@ -4,6 +4,7 @@ members = [
     "examples/github-filesystem",
     "examples/memory-backend",
     "examples/network-backend",
+    "examples/google-drive",
 ]
 resolver = "2"
 
