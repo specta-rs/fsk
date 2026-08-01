@@ -455,10 +455,10 @@ impl GoogleDrive {
             let inode = self.add_drive_file(root_inode, file);
             register_tree_ids(&mut ids, file, &[inode]);
         }
-        let mut pending: Vec<_> = files
-            .iter()
-            .filter(|file| !roots.iter().any(|root| root.id == file.id))
-            .collect();
+        // Direct shares are root-level aliases, but they can also be children of
+        // another shared folder. Process every account file so those aliases are
+        // retained at the root and attached beneath each reachable parent.
+        let mut pending: Vec<_> = files.iter().collect();
         loop {
             let before = pending.len();
             pending.retain(|file| {
@@ -531,7 +531,9 @@ impl GoogleDrive {
             })
         }) {
             display.clone_from(&base);
-            display.extend_from_slice(format!(" ({suffix})").as_bytes());
+            let suffix_bytes = format!(" ({suffix})").into_bytes();
+            truncate_utf8(&mut display, 240_usize.saturating_sub(suffix_bytes.len()));
+            display.extend_from_slice(&suffix_bytes);
             suffix += 1;
         }
         let inode = u64::try_from(self.nodes.len() + 1).unwrap_or(u64::MAX);
@@ -776,6 +778,14 @@ fn portable_name(name: &str) -> Vec<u8> {
         output.insert(0, '_');
     }
     output.into_bytes()
+}
+
+fn truncate_utf8(value: &mut Vec<u8>, max_len: usize) {
+    let mut len = value.len().min(max_len);
+    while len > 0 && std::str::from_utf8(&value[..len]).is_err() {
+        len -= 1;
+    }
+    value.truncate(len);
 }
 
 fn names_equal(left: &[u8], right: &[u8]) -> bool {
@@ -1149,6 +1159,20 @@ mod tests {
     }
 
     #[test]
+    fn collision_suffixes_stay_within_portable_name_limit() {
+        let mut filesystem = filesystem();
+        let long_name = "é".repeat(120);
+        let first = filesystem.add_node(ROOT_INODE, &long_name, FileType::File, 0, None, false);
+        let second = filesystem.add_node(ROOT_INODE, &long_name, FileType::File, 0, None, false);
+
+        assert!(filesystem.nodes[inode_index(first).unwrap()].name.len() <= 240);
+        let second_name = &filesystem.nodes[inode_index(second).unwrap()].name;
+        assert!(second_name.len() <= 240);
+        assert!(second_name.ends_with(b" (2)"));
+        assert!(std::str::from_utf8(second_name).is_ok());
+    }
+
+    #[test]
     fn trees_use_actual_root_ids_and_include_shared_descendants() {
         let mut filesystem = filesystem();
         let my_drive =
@@ -1177,6 +1201,32 @@ mod tests {
         filesystem.add_shared_tree(shared, &[folder], &[child]);
         let (shared_folder, _) = filesystem.lookup(shared, b"name").expect("shared folder");
         assert!(filesystem.lookup(shared_folder, b"name").is_ok());
+    }
+
+    #[test]
+    fn nested_direct_shares_keep_root_and_parent_aliases() {
+        let mut filesystem = filesystem();
+        let shared = filesystem.add_node(
+            ROOT_INODE,
+            "Shared with me",
+            FileType::Directory,
+            0,
+            None,
+            false,
+        );
+        let mut folder = file(FOLDER, false);
+        folder.id = "folder".to_owned();
+        folder.name = "folder".to_owned();
+        let mut child = file("text/plain", false);
+        child.id = "child".to_owned();
+        child.name = "child".to_owned();
+        child.parents = vec!["folder".to_owned()];
+
+        filesystem.add_shared_tree(shared, &[folder.clone(), child.clone()], &[folder, child]);
+
+        let (shared_folder, _) = filesystem.lookup(shared, b"folder").expect("shared folder");
+        assert!(filesystem.lookup(shared, b"child").is_ok());
+        assert!(filesystem.lookup(shared_folder, b"child").is_ok());
     }
 
     #[test]
