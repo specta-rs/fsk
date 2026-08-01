@@ -170,7 +170,6 @@ pub struct GoogleDrive {
     writes: Mutex<()>,
     dirty: Mutex<HashSet<String>>,
     versions: Mutex<HashMap<String, String>>,
-    original_sizes: HashMap<String, u64>,
     total_bytes: u64,
     free_bytes: u64,
 }
@@ -197,7 +196,6 @@ impl GoogleDrive {
             writes: Mutex::new(()),
             dirty: Mutex::new(HashSet::new()),
             versions: Mutex::new(HashMap::new()),
-            original_sizes: HashMap::new(),
             total_bytes: u64::MAX,
             free_bytes: u64::MAX,
         };
@@ -500,9 +498,6 @@ impl GoogleDrive {
         };
         let writable = drive_file_is_writable(file);
         if kind == FileType::File {
-            self.original_sizes
-                .entry(remote_id.to_owned())
-                .or_insert(size);
             self.versions
                 .get_mut()
                 .expect("version mutex is not poisoned during indexing")
@@ -836,27 +831,15 @@ fn export_format(mime: &str) -> (&'static str, Option<&'static str>) {
 
 impl Filesystem for GoogleDrive {
     fn statfs(&self) -> Result<StatFs> {
-        let sizes = self.sizes.lock().map_err(|_| Error::IO)?;
-        let mut used: u64 = self.original_sizes.values().copied().sum();
-        let mut free = self.free_bytes;
-        for (id, current) in &*sizes {
-            let original = self.original_sizes.get(id).copied().unwrap_or(0);
-            if *current >= original {
-                let growth = current - original;
-                used = used.saturating_add(growth);
-                free = free.saturating_sub(growth);
-            } else {
-                let shrinkage = original - current;
-                used = used.saturating_sub(shrinkage);
-                free = free.saturating_add(shrinkage).min(self.total_bytes);
-            }
-        }
+        // Drive's About quota is account-wide. Visible shared files may consume
+        // another owner's quota, so deriving quota deltas from mounted files can
+        // make these values less accurate than the authoritative API snapshot.
         Ok(StatFs {
             block_size: 4096,
             io_size: 131_072,
-            total_bytes: self.total_bytes.max(used),
-            free_bytes: free,
-            available_bytes: free,
+            total_bytes: self.total_bytes,
+            free_bytes: self.free_bytes,
+            available_bytes: self.free_bytes,
             files: self.nodes.len() as u64,
             free_files: 0,
         })
@@ -1101,7 +1084,6 @@ mod tests {
             writes: Mutex::new(()),
             dirty: Mutex::new(HashSet::new()),
             versions: Mutex::new(HashMap::new()),
-            original_sizes: HashMap::new(),
             total_bytes: 0,
             free_bytes: 0,
         }
@@ -1331,21 +1313,20 @@ mod tests {
     }
 
     #[test]
-    fn stale_remote_versions_are_rejected_and_quota_tracks_size_delta_once() {
+    fn stale_remote_versions_are_rejected_and_drive_quota_stays_authoritative() {
         assert!(version_matches("7", "7"));
         assert!(!version_matches("7", "8"));
 
         let mut filesystem = filesystem();
         filesystem.total_bytes = 2_000;
         filesystem.free_bytes = 1_000;
-        filesystem.original_sizes.insert("id".to_owned(), 100);
         filesystem
             .sizes
             .lock()
             .expect("sizes")
             .insert("id".to_owned(), 125);
         let stats = filesystem.statfs().expect("statfs");
-        assert_eq!(stats.free_bytes, 975);
-        assert_eq!(stats.available_bytes, 975);
+        assert_eq!(stats.free_bytes, 1_000);
+        assert_eq!(stats.available_bytes, 1_000);
     }
 }
