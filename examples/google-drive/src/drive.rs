@@ -748,7 +748,8 @@ fn portable_name(name: &str) -> Vec<u8> {
     let mut output: String = name
         .chars()
         .map(|character| match character {
-            '\0' | '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            character if character.is_control() => '_',
             _ => character,
         })
         .collect();
@@ -771,6 +772,9 @@ fn portable_name(name: &str) -> Vec<u8> {
         .any(|value| stem.eq_ignore_ascii_case(value))
     {
         output.insert(0, '_');
+    }
+    while output.len() > 240 {
+        output.pop();
     }
     output.into_bytes()
 }
@@ -1133,9 +1137,11 @@ mod tests {
     #[test]
     fn portable_names_avoid_host_special_names_and_characters() {
         assert_eq!(portable_name("a/b:c"), b"a_b_c");
+        assert_eq!(portable_name("a\u{1f}b"), b"a_b");
         assert_eq!(portable_name("CON"), b"_CON");
         assert_eq!(portable_name("trailing. "), b"trailing");
         assert!(portable_name(&"x".repeat(300)).len() <= 240);
+        assert!(portable_name(&format!("CON.{}", "x".repeat(300))).len() <= 240);
         assert!(names_equal("É".as_bytes(), "é".as_bytes()));
         assert!(names_equal("é".as_bytes(), "e\u{301}".as_bytes()));
     }
