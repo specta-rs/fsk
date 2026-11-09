@@ -133,6 +133,9 @@ jobs:
           test "$(defaults read "$extension/Contents/Info" CFBundleShortVersionString)" = "$expected_version"
           test "$(defaults read "$extension/Contents/Info" CFBundleVersion)" = "$expected_build"
           codesign --verify --deep --strict --verbose=2 "$app"
+          identity="$(codesign --display --verbose=4 "$app" 2>&1)"
+          grep -q '^Identifier=dev\.specta\.fsk$' <<< "$identity"
+          grep -q '^TeamIdentifier=68994Z5PT3$' <<< "$identity"
           codesign -d --xml --entitlements - "$extension" \
             > "$RUNNER_TEMP/extension-entitlements.plist"
           test "$(/usr/libexec/PlistBuddy -c \
@@ -175,8 +178,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          asset="$RUNNER_TEMP/FSK-${GITHUB_REF_NAME}.zip"
+          test -f "$asset"
+          # Assert the archive really contains the app bundle, not just a file
+          # with the expected name. Listing to a file avoids a SIGPIPE from
+          # `grep -q` failing the pipeline under `pipefail`.
+          unzip -l "$asset" > "$RUNNER_TEMP/asset-listing.txt"
+          grep -q 'FSK\.app/' "$RUNNER_TEMP/asset-listing.txt"
           gh release create "$GITHUB_REF_NAME" \
-            "$RUNNER_TEMP/FSK-${GITHUB_REF_NAME}.zip" \
+            "$asset" \
             --title "FSK $GITHUB_REF_NAME" \
             --generate-notes \
             --verify-tag

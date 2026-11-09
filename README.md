@@ -335,8 +335,23 @@ println!("FSK app removed: {removed}");
 The default download uses the public GitHub release for this repository. If the
 release is private, set `GITHUB_TOKEN` or `GH_TOKEN` and the SDK resolves the
 asset through the GitHub API, or set `FSK_RELEASE_BASE_URL` to a mirror that
-serves `{base}/v0.0.9/FSK-v0.0.9.zip`. Set `FSK_APP_PATH` while testing an app
-outside `/Applications`.
+serves `{base}/v0.0.9/FSK-v0.0.9.zip`.
+
+The app is installed machine-wide at `/Applications/FSK.app` and shared by every
+process and SDK consumer on the machine. Installation requires an exact version
+match, so a program built against an older SDK can replace (downgrade) an app
+installed by a newer SDK. `uninstall_app()` likewise removes the app for all
+consumers, not just the current program. Both operations are serialized across
+cooperating processes with an advisory lock on the destination's parent
+directory; no lock file is created.
+
+Set `FSK_APP_PATH` to the full path of an `.app` bundle (for example
+`/Applications/FSK.app`) while testing an app outside `/Applications`. All four
+helpers — install, authorization status, launch, and uninstall — require a full
+bundle path; it is not a directory that contains the app. Uninstall removes
+directory bundles only when their `CFBundleIdentifier` is `dev.specta.fsk`
+(symlinks at the destination are removed without following them, and any other
+file or directory is refused), and it always refuses to delete a mount point.
 
 ### Windows
 
