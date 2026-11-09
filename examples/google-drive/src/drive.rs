@@ -16,6 +16,13 @@ const API: &str = "https://www.googleapis.com/drive/v3";
 const FOLDER: &str = "application/vnd.google-apps.folder";
 const SHORTCUT: &str = "application/vnd.google-apps.shortcut";
 const MAX_BUFFERED_FILE_SIZE: u64 = 256 * 1024 * 1024;
+// Folder shortcuts and multi-parent folders turn the Drive listing into a DAG
+// whose aliases can multiply exponentially. Bound both the depth of a single
+// alias path and the total number of aliases one walk may create; realistic
+// trees stay well below these limits, while pathological shortcut graphs stop
+// quickly instead of exhausting memory.
+const MAX_ALIAS_DEPTH: usize = 64;
+const MAX_ALIAS_NODES: usize = 10_000;
 
 fn deserialize_u64_string<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
 where
@@ -425,57 +432,66 @@ impl GoogleDrive {
     }
 
     fn add_tree(&mut self, root_inode: u64, root_id: &str, files: &[DriveFile]) {
-        let mut ids = HashMap::from([(root_id.to_owned(), vec![root_inode])]);
-        let mut pending: Vec<_> = files.iter().collect();
-        loop {
-            let before = pending.len();
-            pending.retain(|file| {
-                let parents = tree_parents(file, &ids);
-                if parents.is_empty() {
-                    return true;
-                }
-                let inodes: Vec<_> = parents
-                    .into_iter()
-                    .map(|parent| self.add_drive_file(parent, file))
-                    .collect();
-                register_tree_ids(&mut ids, file, &inodes);
-                false
-            });
-            if pending.is_empty() || pending.len() == before {
-                break;
-            }
-        }
+        let mut ids = HashMap::from([(root_id.to_owned(), HashSet::from([root_inode]))]);
+        let mut ancestry = HashMap::from([(root_inode, Vec::new())]);
+        self.expand_tree_aliases(&mut ids, &mut ancestry, files);
     }
 
     fn add_shared_tree(&mut self, root_inode: u64, roots: &[DriveFile], files: &[DriveFile]) {
-        let mut ids: HashMap<String, Vec<u64>> = HashMap::new();
+        let mut ids: HashMap<String, HashSet<u64>> = HashMap::new();
         // Every inode created below the "Shared with me" root records the remote
-        // ids on its path from that root. This lets the fixed point below stop at
-        // a cycle instead of unfolding one forever.
+        // ids on its path from that root. This lets the walk below stop at a
+        // cycle instead of unfolding one forever.
         let mut ancestry: HashMap<u64, Vec<String>> = HashMap::from([(root_inode, Vec::new())]);
+        // Pagination overlaps can list the same shared file twice. Attaching
+        // both copies would create duplicate root aliases and double every
+        // expansion below them, so keep the first alias per remote id.
+        let mut seen_roots: HashSet<&str> = HashSet::new();
         for file in roots {
+            if !seen_roots.insert(file.id.as_str()) {
+                continue;
+            }
             let inode = self.add_drive_file(root_inode, file);
             register_tree_ids(&mut ids, file, &[inode]);
             ancestry.insert(inode, tree_ids(file));
         }
-        // Direct shares are root-level aliases, but they can also be children of
-        // another shared folder. Attach every account file beneath every known
-        // alias of its parents, repeating until a pass adds nothing new so the
-        // result does not depend on the order Drive listed the files in.
-        //
-        // Termination: `seen` deduplicates (remote file id, parent inode) pairs
-        // and every created inode is one such pair, while `ancestry` refuses to
-        // revisit a remote id already on the path. Since that path can only grow
-        // and never repeats an id, cycles cannot recurse and the DAG is walked
-        // finitely. Keying on the listing id (not the slice index) also keeps a
-        // duplicated listing entry from creating a second child under a parent.
+        self.expand_tree_aliases(&mut ids, &mut ancestry, files);
+    }
+
+    // Attach every listed file beneath every known alias of its parents,
+    // repeating until a pass adds nothing new so the result does not depend on
+    // the order Drive listed the files in. Direct shares are also seeded as
+    // aliases here (rather than attached once and forgotten) so a child listed
+    // before a second alias of its parent is still replayed under that alias.
+    //
+    // Termination: `seen` deduplicates (remote file id, parent inode) pairs and
+    // every created inode is one such pair, while `ancestry` refuses to revisit
+    // a remote id already on the path. Since that path can only grow and never
+    // repeats an id, cycles cannot recurse. `MAX_ALIAS_DEPTH` and
+    // `MAX_ALIAS_NODES` additionally stop nested shortcuts and diamond DAGs from
+    // multiplying without bound. Keying on the listing id (not the slice index)
+    // also keeps a duplicated listing entry from creating a second child.
+    fn expand_tree_aliases(
+        &mut self,
+        ids: &mut HashMap<String, HashSet<u64>>,
+        ancestry: &mut HashMap<u64, Vec<String>>,
+        files: &[DriveFile],
+    ) {
         let mut seen: HashSet<(&str, u64)> = HashSet::new();
+        let mut created = 0_usize;
         loop {
             let mut added = false;
             for file in files {
-                for parent in tree_parents(file, &ids) {
+                for parent in tree_parents(file, ids) {
                     if !seen.insert((file.id.as_str(), parent)) {
                         continue;
+                    }
+                    if created >= MAX_ALIAS_NODES {
+                        eprintln!(
+                            "drive: stopping alias expansion after {MAX_ALIAS_NODES} nodes; \
+                             some shared descendants may be omitted"
+                        );
+                        return;
                     }
                     let Some(parent_ancestry) = ancestry.get(&parent) else {
                         continue;
@@ -486,11 +502,16 @@ impl GoogleDrive {
                     if file_ids.iter().any(|id| parent_ancestry.contains(id)) {
                         continue;
                     }
+                    // Do not descend past the configured alias depth.
+                    if parent_ancestry.len() >= MAX_ALIAS_DEPTH {
+                        continue;
+                    }
                     let mut chain = parent_ancestry.clone();
                     chain.extend(file_ids.iter().cloned());
                     let inode = self.add_drive_file(parent, file);
                     ancestry.insert(inode, chain);
-                    register_tree_ids(&mut ids, file, &[inode]);
+                    register_tree_ids(ids, file, &[inode]);
+                    created += 1;
                     added = true;
                 }
             }
@@ -740,11 +761,12 @@ fn effective_file(file: &DriveFile) -> (&str, &str, u64, &Capabilities, &str) {
     )
 }
 
-fn tree_parents(file: &DriveFile, ids: &HashMap<String, Vec<u64>>) -> Vec<u64> {
+fn tree_parents(file: &DriveFile, ids: &HashMap<String, HashSet<u64>>) -> Vec<u64> {
     let mut output = Vec::new();
+    let mut seen = HashSet::new();
     for parent in file.parents.iter().filter_map(|id| ids.get(id)) {
         for inode in parent {
-            if !output.contains(inode) {
+            if seen.insert(*inode) {
                 output.push(*inode);
             }
         }
@@ -760,18 +782,14 @@ fn tree_ids(file: &DriveFile) -> Vec<String> {
     ids
 }
 
-fn register_tree_ids(ids: &mut HashMap<String, Vec<u64>>, file: &DriveFile, inodes: &[u64]) {
+fn register_tree_ids(ids: &mut HashMap<String, HashSet<u64>>, file: &DriveFile, inodes: &[u64]) {
     let mut keys = vec![file.id.as_str()];
     if let Some(target) = &file.resolved_target {
         keys.push(&target.id);
     }
     for key in keys {
         let values = ids.entry(key.to_owned()).or_default();
-        for inode in inodes {
-            if !values.contains(inode) {
-                values.push(*inode);
-            }
-        }
+        values.extend(inodes.iter().copied());
     }
 }
 
@@ -802,13 +820,25 @@ fn portable_name(name: &str) -> Vec<u8> {
         "_".clone_into(&mut output);
     }
     let stem = output.split('.').next().unwrap_or_default();
+    // Windows also reserves the superscript forms of the numbered devices, so
+    // compare a normalised stem against the plain names.
+    let normalized_stem: String = stem
+        .chars()
+        .map(|character| match character {
+            '¹' => '1',
+            '²' => '2',
+            '³' => '3',
+            other => other,
+        })
+        .collect();
     let reserved = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$", "COM1", "COM2", "COM3", "COM4",
+        "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+        "LPT7", "LPT8", "LPT9",
     ];
     if reserved
         .iter()
-        .any(|value| stem.eq_ignore_ascii_case(value))
+        .any(|value| normalized_stem.eq_ignore_ascii_case(value))
     {
         output.insert(0, '_');
     }
@@ -1185,11 +1215,34 @@ mod tests {
         assert_eq!(portable_name("CON"), b"_CON");
         assert_eq!(portable_name("trailing. "), b"trailing");
         assert!(portable_name(&"x".repeat(300)).len() <= 240);
-        assert!(portable_name(&format!("CON.{}", "x".repeat(300))).len() <= 240);
+        let long_con = portable_name(&format!("CON.{}", "x".repeat(300)));
+        assert!(long_con.starts_with(b"_CON"));
+        assert!(long_con.len() <= 240);
+        assert!(!long_con.ends_with(b" ") && !long_con.ends_with(b"."));
+        // Prepending `_` makes this 241 bytes, so re-truncation exposes the
+        // separator that follows `CON` and the trailing trim must remove it.
+        let prefixed = portable_name(&format!("CON.{} x", " ".repeat(234)));
+        assert_eq!(prefixed, b"_CON");
+        assert!(!prefixed.ends_with(b" ") && !prefixed.ends_with(b"."));
         let truncated_space = portable_name(&format!("{} {}", "x".repeat(239), "y".repeat(50)));
         assert_eq!(truncated_space, "x".repeat(239).into_bytes());
         assert!(!truncated_space.ends_with(b" "));
+        // Truncating a multibyte name must not split a character.
+        let multibyte = portable_name(&("a".to_owned() + &"€".repeat(80)));
+        assert!(multibyte.starts_with(b"a"));
+        assert!(std::str::from_utf8(&multibyte).is_ok());
+        assert!(multibyte.len() <= 240);
+        assert_eq!(multibyte.len(), 1 + 79 * 3);
         assert_eq!(portable_name(&" ".repeat(300)), b"_");
+        // Windows reserves the console/clock device aliases and the superscript
+        // forms of the numbered ports.
+        assert_eq!(portable_name("CONIN$"), b"_CONIN$");
+        assert_eq!(portable_name("conout$"), b"_conout$");
+        assert_eq!(portable_name("CLOCK$"), b"_CLOCK$");
+        assert_eq!(portable_name("COM¹"), b"_COM\xC2\xB9");
+        assert_eq!(portable_name("com²"), b"_com\xC2\xB2");
+        assert_eq!(portable_name("LPT³"), b"_LPT\xC2\xB3");
+        assert_eq!(portable_name("COM10"), b"COM10");
         assert!(names_equal("É".as_bytes(), "é".as_bytes()));
         assert!(names_equal("é".as_bytes(), "e\u{301}".as_bytes()));
     }
@@ -1197,15 +1250,30 @@ mod tests {
     #[test]
     fn collision_suffixes_stay_within_portable_name_limit() {
         let mut filesystem = filesystem();
-        let long_name = "é".repeat(120);
-        let first = filesystem.add_node(ROOT_INODE, &long_name, FileType::File, 0, None, false);
-        let second = filesystem.add_node(ROOT_INODE, &long_name, FileType::File, 0, None, false);
+        // A three-byte character means the 236-byte truncation target for a
+        // ` (n)` suffix falls inside a character, so byte-level truncation
+        // would produce invalid UTF-8.
+        let long_name = "€".repeat(80);
+        let inodes: Vec<_> = (0..13)
+            .map(|_| filesystem.add_node(ROOT_INODE, &long_name, FileType::File, 0, None, false))
+            .collect();
+        let names: Vec<&[u8]> = inodes
+            .iter()
+            .map(|inode| {
+                filesystem.nodes[inode_index(*inode).unwrap()]
+                    .name
+                    .as_slice()
+            })
+            .collect();
 
-        assert!(filesystem.nodes[inode_index(first).unwrap()].name.len() <= 240);
-        let second_name = &filesystem.nodes[inode_index(second).unwrap()].name;
-        assert!(second_name.len() <= 240);
-        assert!(second_name.ends_with(b" (2)"));
-        assert!(std::str::from_utf8(second_name).is_ok());
+        for name in &names {
+            assert!(name.len() <= 240);
+            assert!(std::str::from_utf8(name).is_ok());
+        }
+        assert!(names[9].ends_with(b" (10)"));
+        assert!(names[10].ends_with(b" (11)"));
+        let unique: HashSet<&[u8]> = names.iter().copied().collect();
+        assert_eq!(unique.len(), names.len());
     }
 
     #[test]
@@ -1263,6 +1331,126 @@ mod tests {
         let (shared_folder, _) = filesystem.lookup(shared, b"folder").expect("shared folder");
         assert!(filesystem.lookup(shared, b"child").is_ok());
         assert!(filesystem.lookup(shared_folder, b"child").is_ok());
+    }
+
+    #[test]
+    fn duplicated_direct_shares_create_one_root_alias() {
+        let mut filesystem = filesystem();
+        let shared = filesystem.add_node(
+            ROOT_INODE,
+            "Shared with me",
+            FileType::Directory,
+            0,
+            None,
+            false,
+        );
+        let mut folder = file(FOLDER, false);
+        folder.id = "folder".to_owned();
+        folder.name = "folder".to_owned();
+        let mut child = file("text/plain", false);
+        child.id = "child".to_owned();
+        child.name = "child".to_owned();
+        child.parents = vec!["folder".to_owned()];
+
+        // Pagination can overlap, listing the same share more than once.
+        let roots = [folder.clone(), folder.clone(), child.clone(), child];
+        filesystem.add_shared_tree(shared, &roots, &roots);
+
+        let (folder_inode, _) = filesystem.lookup(shared, b"folder").expect("folder alias");
+        assert!(filesystem.lookup(shared, b"folder (2)").is_err());
+        assert!(filesystem.lookup(shared, b"child").is_ok());
+        assert!(filesystem.lookup(shared, b"child (2)").is_err());
+        assert!(filesystem.lookup(folder_inode, b"child").is_ok());
+        assert!(filesystem.lookup(folder_inode, b"child (2)").is_err());
+    }
+
+    #[test]
+    fn shortcut_alias_expansion_is_bounded() {
+        // Each folder contains both its child folder and a shortcut to that
+        // child, so the unbounded walk would create roughly 2^20 aliases.
+        const DEPTH: usize = 20;
+
+        let mut filesystem = filesystem();
+        let shared = filesystem.add_node(
+            ROOT_INODE,
+            "Shared with me",
+            FileType::Directory,
+            0,
+            None,
+            false,
+        );
+
+        let mut root = file(FOLDER, false);
+        root.id = "F0".to_owned();
+        root.name = "F0".to_owned();
+        let mut files = vec![root.clone()];
+        for level in 0..DEPTH {
+            let child_id = format!("F{}", level + 1);
+            let mut child = file(FOLDER, false);
+            child.id.clone_from(&child_id);
+            child.name.clone_from(&child_id);
+            child.parents = vec![format!("F{level}")];
+            let mut shortcut = file(SHORTCUT, false);
+            shortcut.id = format!("S{}", level + 1);
+            shortcut.name.clone_from(&shortcut.id);
+            shortcut.parents = vec![format!("F{level}")];
+            shortcut.resolved_target = Some(ShortcutTarget {
+                id: child_id,
+                mime_type: FOLDER.to_owned(),
+                size: 0,
+                capabilities: Capabilities::default(),
+                version: "1".to_owned(),
+            });
+            files.push(child);
+            files.push(shortcut);
+        }
+
+        let start = std::time::Instant::now();
+        filesystem.add_shared_tree(shared, &[root], &files);
+        let elapsed = start.elapsed();
+
+        // The filesystem root and the "Shared with me" node, one directly
+        // shared alias, and at most the node cap.
+        assert!(filesystem.nodes.len() <= MAX_ALIAS_NODES + 3);
+        assert!(filesystem.nodes.len() > 1_000);
+        assert!(elapsed < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn alias_depth_is_bounded() {
+        // A linear chain long enough to pass the depth limit but far too small
+        // to hit the node limit, so this isolates the depth bound.
+        const DEPTH: usize = 70;
+
+        let mut filesystem = filesystem();
+        let shared = filesystem.add_node(
+            ROOT_INODE,
+            "Shared with me",
+            FileType::Directory,
+            0,
+            None,
+            false,
+        );
+
+        let mut root = file(FOLDER, false);
+        root.id = "F0".to_owned();
+        root.name = "F0".to_owned();
+        let mut files = vec![root.clone()];
+        for level in 0..DEPTH {
+            let id = format!("F{}", level + 1);
+            let mut child = file(FOLDER, false);
+            child.id.clone_from(&id);
+            child.name = id;
+            child.parents = vec![format!("F{level}")];
+            files.push(child);
+        }
+
+        filesystem.add_shared_tree(shared, &[root], &files);
+
+        // Filesystem root, "Shared with me", and one alias per level up to the
+        // depth limit. The first directly shared alias already counts as depth
+        // one because its own remote id is on the path.
+        assert_eq!(filesystem.nodes.len(), 2 + MAX_ALIAS_DEPTH);
     }
 
     #[test]
@@ -1359,7 +1547,9 @@ mod tests {
         child.id = "child".to_owned();
         child.parents = vec!["target".to_owned()];
 
-        filesystem.add_tree(root, "root-id", &[folder, shortcut, child]);
+        // Deliberately list the child before the shortcut: a one-shot attach
+        // would leave it missing beneath the shortcut's alias of the target.
+        filesystem.add_tree(root, "root-id", &[folder, child, shortcut]);
         let (folder_inode, _) = filesystem.lookup(root, b"name").expect("real folder");
         let (shortcut_inode, _) = filesystem.lookup(root, b"name (2)").expect("shortcut");
         assert!(filesystem.lookup(folder_inode, b"name").is_ok());
@@ -1453,6 +1643,7 @@ mod tests {
             .expect("sizes")
             .insert("id".to_owned(), 125);
         let stats = filesystem.statfs().expect("statfs");
+        assert_eq!(stats.total_bytes, 2_000);
         assert_eq!(stats.free_bytes, 1_000);
         assert_eq!(stats.available_bytes, 1_000);
     }
