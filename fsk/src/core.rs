@@ -79,10 +79,14 @@ pub struct DirectoryEntry<'a> {
     pub name: &'a [u8],
     pub inode: u64,
     pub kind: FileType,
+    /// Opaque cursor at which the next call should resume.
     pub next_cookie: u64,
 }
 
+/// Receives entries without requiring the backend to allocate a result vector.
 pub trait DirectorySink {
+    /// Returns `false` when the caller-provided output buffers are full; the
+    /// backend should stop pushing further entries for this call.
     fn push(&mut self, entry: DirectoryEntry<'_>) -> bool;
 }
 

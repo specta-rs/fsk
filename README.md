@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo-light.svg" alt="FSK logo" width="132">
+  </picture>
+</p>
+
 # FSK
 
 Build cross-platform virtual file systems with ease

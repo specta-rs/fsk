@@ -222,6 +222,10 @@ impl Service {
                 if max_entries > 65_536 || max_names > MAX_FRAME {
                     return Err(Error::INVALID);
                 }
+                // The client rejects any response frame above `MAX_FRAME` as a
+                // protocol violation, so never build a batch whose packed
+                // records and names cannot fit in one.
+                let max_names = max_names.min(readdir_name_budget(max_entries));
                 let mut sink = PackedDirectorySink::new(max_entries, max_names);
                 let result = fs.read_directory(inode, cookie, verifier, &mut sink)?;
                 Ok(sink.finish(result))
@@ -401,6 +405,20 @@ struct PackedDirectorySink {
     max_names: usize,
 }
 
+/// Response bytes outside the packed names: verifier (8), next cookie (8),
+/// end-of-directory flag (1), entry count (4), and name count (4).
+const READDIR_FIXED_LEN: usize = 25;
+/// inode (8), next cookie (8), name offset (4), name length (2), kind (1).
+const READDIR_ENTRY_LEN: usize = 23;
+
+/// Largest names payload a `READDIR` response can carry for `max_entries`
+/// records while staying inside [`MAX_FRAME`].
+fn readdir_name_budget(max_entries: usize) -> usize {
+    MAX_FRAME
+        .saturating_sub(READDIR_FIXED_LEN)
+        .saturating_sub(max_entries.saturating_mul(READDIR_ENTRY_LEN))
+}
+
 impl PackedDirectorySink {
     fn new(max_entries: usize, max_names: usize) -> Self {
         Self {
@@ -412,7 +430,9 @@ impl PackedDirectorySink {
     }
 
     fn finish(self, result: ReadDirectoryResult) -> Vec<u8> {
-        let mut output = Encoder::with_capacity(32 + self.records.len() * 24 + self.names.len());
+        let mut output = Encoder::with_capacity(
+            READDIR_FIXED_LEN + self.records.len() * READDIR_ENTRY_LEN + self.names.len(),
+        );
         output.u64(result.verifier);
         output.u64(result.next_cookie);
         output.u8(u8::from(result.eof));
@@ -633,6 +653,21 @@ mod tests {
         send_request(&mut client, 1, opcode::HELLO, &[8; 32]);
         assert_eq!(read_test_response(&mut client).0, libc::EACCES);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn readdir_batches_stay_within_the_frame_limit() {
+        // The client aborts the connection on an oversized response, so the
+        // worst case for every legal entry count must fit in one frame.
+        for entries in [0, 1, 512, 65_536] {
+            let names = readdir_name_budget(entries);
+            assert!(
+                READDIR_FIXED_LEN + entries * READDIR_ENTRY_LEN + names <= MAX_FRAME,
+                "entries={entries}"
+            );
+        }
+        // A normal client request is unaffected.
+        assert_eq!(readdir_name_budget(512).min(64 * 1024), 64 * 1024);
     }
 
     #[test]

@@ -112,6 +112,14 @@ struct RustDirectoryBatch {
         let end = start + Int(entry.name_length)
         return names.subdata(in: start..<end)
     }
+
+    /// Whether the page either ends the directory or advances enumeration.
+    ///
+    /// An empty page that isn't the end gives FSKit no new `nextCookie`, so it
+    /// would request the same cookie forever.
+    var madeProgress: Bool {
+        eof || !entries.isEmpty
+    }
 }
 
 struct RustBackendConfiguration: Sendable {
@@ -228,13 +236,21 @@ final class RustBackend: @unchecked Sendable {
             )
         }
         let names = try decoder.data(count: nameCount)
-        return RustDirectoryBatch(
+        let batch = RustDirectoryBatch(
             entries: entries,
             names: names,
             verifier: resultVerifier,
             nextCookie: nextCookie,
             eof: eof
         )
+        guard batch.madeProgress else {
+            // The server refused every entry without reaching the end (for
+            // example because none fit). `fsk_readdir` reports that as
+            // `ERANGE` so the caller grows its buffers instead of looping on
+            // the same cookie; mirror it over IPC.
+            throw RustBackendError.posix(ERANGE)
+        }
+        return batch
     }
 
     func read(inode: UInt64, offset: UInt64, into buffer: UnsafeMutableRawBufferPointer) throws -> Int {

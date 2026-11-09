@@ -130,6 +130,11 @@ impl MountSession {
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
         let listener = UnixListener::bind(&socket_path)?;
+        // Any early return below must not leave the bound socket behind.
+        let mut socket_cleanup = SocketCleanup {
+            path: socket_path.clone(),
+            armed: true,
+        };
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
 
@@ -152,6 +157,10 @@ impl MountSession {
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(5));
                         }
+                        Err(error) if retryable_accept_error(&error) => {
+                            // A single aborted handshake must not stop a
+                            // mounted volume from accepting connections.
+                        }
                         Err(_) => break,
                     }
                 }
@@ -166,17 +175,23 @@ impl MountSession {
         if !options.mount_options.is_empty() {
             command.arg("-o").arg(options.mount_options.join(","));
         }
-        let output = command.arg(&resource).arg(&mount_path).output()?;
+        // `?` here would return with the accept thread and its listener still
+        // alive, so both failure modes shut the service down first.
+        let output = match command.arg(&resource).arg(&mount_path).output() {
+            Ok(output) => output,
+            Err(error) => {
+                stop_accepting(&stop, &socket_path, accept_thread);
+                return Err(error);
+            }
+        };
         if !output.status.success() {
-            stop.store(true, Ordering::Release);
-            let _ = UnixStream::connect(&socket_path);
-            let _ = accept_thread.join();
-            let _ = fs::remove_file(&socket_path);
+            stop_accepting(&stop, &socket_path, accept_thread);
             return Err(io::Error::other(format!(
                 "FSKit mount failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
+        socket_cleanup.armed = false;
 
         Ok(Self {
             mount_path,
@@ -204,10 +219,8 @@ impl MountSession {
         } else {
             Ok(())
         };
-        self.stop.store(true, Ordering::Release);
-        let _ = UnixStream::connect(&self.socket_path);
         if let Some(thread) = self.accept_thread.take() {
-            let _ = thread.join();
+            stop_accepting(&self.stop, &self.socket_path, thread);
         }
         let _ = fs::remove_file(&self.socket_path);
         result
@@ -218,6 +231,38 @@ impl Drop for MountSession {
     fn drop(&mut self) {
         let _ = self.unmount_inner();
     }
+}
+
+/// Removes a bound socket unless startup completed and a [`MountSession`] now
+/// owns the cleanup.
+struct SocketCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Stops the polling accept loop and waits for it to finish.
+fn stop_accepting(stop: &AtomicBool, socket_path: &Path, accept_thread: JoinHandle<()>) {
+    stop.store(true, Ordering::Release);
+    // The listener is non-blocking, so wake the loop in case it is sleeping.
+    let _ = UnixStream::connect(socket_path);
+    let _ = accept_thread.join();
+}
+
+/// `accept` can fail for one aborted handshake without the listener being
+/// broken; those errors must not shut the service down permanently.
+fn retryable_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+    )
 }
 
 fn prepare_mount_path(path: &Path) -> io::Result<PathBuf> {
@@ -285,5 +330,39 @@ mod tests {
         let path = Path::new("/tmp");
         let canonical = prepare_mount_path(path).unwrap();
         assert_eq!(canonical, Path::new("/private/tmp"));
+    }
+
+    #[test]
+    fn aborted_handshakes_do_not_stop_the_accept_loop() {
+        for kind in [io::ErrorKind::Interrupted, io::ErrorKind::ConnectionAborted] {
+            assert!(retryable_accept_error(&io::Error::from(kind)));
+        }
+        for kind in [
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+        ] {
+            assert!(!retryable_accept_error(&io::Error::from(kind)));
+        }
+    }
+
+    #[test]
+    fn socket_cleanup_removes_only_an_armed_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("test.sock");
+
+        fs::write(&socket, b"").unwrap();
+        drop(SocketCleanup {
+            path: socket.clone(),
+            armed: true,
+        });
+        assert!(!socket.exists());
+
+        fs::write(&socket, b"").unwrap();
+        drop(SocketCleanup {
+            path: socket.clone(),
+            armed: false,
+        });
+        assert!(socket.exists());
     }
 }

@@ -1,0 +1,46 @@
+{
+  "fill": {
+    "solid": "srgb:0.93333,0.95294,0.97255,1.00000"
+  },
+  "fill-specializations": [
+    {
+      "value": {
+        "solid": "srgb:0.93333,0.95294,0.97255,1.00000"
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": {
+        "solid": "srgb:0.07843,0.09412,0.11373,1.00000"
+      }
+    }
+  ],
+  "groups": [
+    {
+      "layers": [
+        {
+          "glass": false,
+          "name": "FSK",
+          "image-name": "FSK-light.svg",
+          "image-name-specializations": [
+            {
+              "value": "FSK-light.svg"
+            },
+            {
+              "appearance": "dark",
+              "value": "FSK-dark.svg"
+            }
+          ]
+        }
+      ],
+      "name": "FSK",
+      "blur-material": 0,
+      "specular": false
+    }
+  ],
+  "supported-platforms": {
+    "squares": [
+      "macOS"
+    ]
+  }
+}
