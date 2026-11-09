@@ -235,6 +235,7 @@ dependencies = [
  "fuser",
  "libc",
  "parking_lot",
+ "serde_json",
  "tempfile",
  "windows-sys 0.61.2",
 ]

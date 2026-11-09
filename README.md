@@ -321,13 +321,22 @@ match fsk::authorization_status()? {
         fsk::launch_app()?;
     }
 }
-
-// Later, when your application no longer needs the extension:
-let removed = fsk::uninstall_app()?;
 # Ok::<(), std::io::Error>(())
 ```
 
-Set `FSK_APP_PATH` while testing an app outside `/Applications`.
+Later, when your application no longer needs the extension:
+
+```rust
+let removed = fsk::uninstall_app()?;
+println!("FSK app removed: {removed}");
+# Ok::<(), std::io::Error>(())
+```
+
+The default download uses the public GitHub release for this repository. If the
+release is private, set `GITHUB_TOKEN` or `GH_TOKEN` and the SDK resolves the
+asset through the GitHub API, or set `FSK_RELEASE_BASE_URL` to a mirror that
+serves `{base}/v0.0.9/FSK-v0.0.9.zip`. Set `FSK_APP_PATH` while testing an app
+outside `/Applications`.
 
 ### Windows
 
