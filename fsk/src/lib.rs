@@ -34,6 +34,10 @@ pub use authorization::{
     AppInstallOutcome, AuthorizationStatus, authorization_status, download_and_install_app,
     launch_app, uninstall_app,
 };
+// Re-exporting the deprecated alias would otherwise trip `-D warnings` here.
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+pub use authorization::open_authorization_app;
 pub use core::{
     DirectoryEntry, DirectorySink, Error, FileType, Filesystem, Metadata, ROOT_INODE,
     ReadDirectoryResult, Result, SetMetadata, StatFs, now_ns,

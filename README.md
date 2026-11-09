@@ -304,7 +304,10 @@ signing `com.apple.developer.fskit.fsmodule`.
 The Rust SDK can download and install the matching `FSK.app` release without
 opening it. Run the blocking installation call on your background executor,
 then launch the app separately when the user is ready to authorize it under
-**System Settings → General → Login Items & Extensions → File System Extensions**:
+**System Settings → General → Login Items & Extensions → File System Extensions**.
+Copying the app into place does not register its extension, so
+`authorization_status()` may still report `NotInstalled` until the app has been
+launched once:
 
 ```rust
 let outcome = fsk::download_and_install_app()?;
@@ -312,11 +315,8 @@ println!("FSK app installation: {outcome:?}");
 
 match fsk::authorization_status()? {
     fsk::AuthorizationStatus::Authorized => {}
-    fsk::AuthorizationStatus::NeedsApproval => {
+    fsk::AuthorizationStatus::NeedsApproval | fsk::AuthorizationStatus::NotInstalled => {
         fsk::launch_app()?;
-    }
-    fsk::AuthorizationStatus::NotInstalled => {
-        unreachable!("the matching app was just installed");
     }
 }
 

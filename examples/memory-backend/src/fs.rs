@@ -224,13 +224,22 @@ impl MemoryFileSystem {
         if additional == 0 {
             return Ok(());
         }
-        self.used_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(additional)
-                    .filter(|total| *total <= self.capacity)
-            })
-            .map(|_| ())
-            .map_err(|_| Error(errno::ENOSPC))
+        let mut used = self.used_bytes.load(Ordering::Relaxed);
+        loop {
+            let total = used
+                .checked_add(additional)
+                .filter(|total| *total <= self.capacity)
+                .ok_or(Error(errno::ENOSPC))?;
+            match self.used_bytes.compare_exchange_weak(
+                used,
+                total,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => used = actual,
+            }
+        }
     }
 
     fn update_usage(&self, old: u64, new: u64) -> Result<()> {

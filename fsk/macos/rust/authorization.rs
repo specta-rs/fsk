@@ -45,6 +45,10 @@ pub enum AuthorizationStatus {
 /// left alone. Set `FSK_APP_PATH` to choose a different destination during
 /// development.
 ///
+/// The release is selected using this crate's version, so a build from git
+/// between releases reports the last released version and treats that released
+/// app as current.
+///
 /// # Errors
 ///
 /// Returns an error if the release cannot be downloaded, unpacked, validated,
@@ -143,6 +147,18 @@ pub fn launch_app() -> io::Result<()> {
     }
 }
 
+/// Open the `FSK` companion app directly in its authorization guide.
+///
+/// This is the old name for [`launch_app`].
+///
+/// # Errors
+///
+/// Returns an error when the app is missing or macOS cannot open it.
+#[deprecated(note = "renamed to `launch_app`")]
+pub fn open_authorization_app() -> io::Result<()> {
+    launch_app()
+}
+
 fn install_from_release(temporary: &Path, destination: &Path) -> io::Result<()> {
     let archive = temporary.join("FSK.zip");
     let extracted = temporary.join("extracted");
@@ -157,6 +173,15 @@ fn install_from_release(temporary: &Path, destination: &Path) -> io::Result<()> 
                 "--location",
                 "--silent",
                 "--show-error",
+                "--retry",
+                "3",
+                "--retry-delay",
+                "2",
+                "--retry-connrefused",
+                "--connect-timeout",
+                "30",
+                "--max-time",
+                "600",
                 "--output",
             ])
             .arg(&archive)
@@ -226,7 +251,9 @@ fn replace_app(staging: &Path, destination: &Path, backup: &Path) -> io::Result<
         }
         return Err(error);
     }
-    remove_path(backup)?;
+    // The new app is in place, so a stale backup is not an installation
+    // failure. Leave it behind rather than reporting a false error.
+    let _ = remove_path(backup);
     Ok(())
 }
 
