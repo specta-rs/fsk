@@ -599,8 +599,11 @@ impl GoogleDrive {
                     let file_ids = tree_ids(file);
                     // A remote id may appear at most once on a path; seeing one
                     // again means the listing contains a cycle, so do not recurse.
-                    // Record it so later passes do not retry the same pair.
-                    if file_ids.iter().any(|id| parent_ancestry.contains(id)) {
+                    // The first mount is still created: a shortcut may target its
+                    // own parent, and #7 mounted that shortcut once under the
+                    // parent. Only re-mounts under an alias are refused.
+                    // Record the rejected pair so later passes do not retry it.
+                    if alias && file_ids.iter().any(|id| parent_ancestry.contains(id)) {
                         seen.insert((file.id.as_str(), parent));
                         continue;
                     }
@@ -1553,6 +1556,39 @@ mod tests {
 
         assert!(filesystem.lookup(root, b"shortcut").is_ok());
         assert!(filesystem.lookup(root, b"target").is_ok());
+        assert_eq!(filesystem.nodes.len(), 1 + 1 + 2);
+    }
+
+    #[test]
+    fn shortcut_targeting_its_parent_is_mounted_once() {
+        // A shortcut whose resolved target is its own parent is still a first
+        // mount. It must appear once under the parent, but it must not be
+        // re-expanded under its own alias.
+        let mut filesystem = filesystem();
+        let root = filesystem.add_node(ROOT_INODE, "My Drive", FileType::Directory, 0, None, false);
+        let mut folder = file(FOLDER, false);
+        folder.id = "folder".to_owned();
+        folder.name = "folder".to_owned();
+        folder.parents = vec!["root".to_owned()];
+        let mut shortcut = file(SHORTCUT, false);
+        shortcut.id = "shortcut".to_owned();
+        shortcut.name = "shortcut".to_owned();
+        shortcut.parents = vec!["folder".to_owned()];
+        shortcut.resolved_target = Some(ShortcutTarget {
+            id: "folder".to_owned(),
+            mime_type: FOLDER.to_owned(),
+            size: 0,
+            capabilities: Capabilities::default(),
+            version: "1".to_owned(),
+        });
+
+        filesystem.add_tree(root, "root", &[folder, shortcut]);
+
+        let (folder_inode, _) = filesystem.lookup(root, b"folder").expect("parent folder");
+        let (shortcut_inode, _) = filesystem
+            .lookup(folder_inode, b"shortcut")
+            .expect("shortcut under its target parent");
+        assert!(filesystem.lookup(shortcut_inode, b"shortcut").is_err());
         assert_eq!(filesystem.nodes.len(), 1 + 1 + 2);
     }
 
