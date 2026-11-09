@@ -184,8 +184,8 @@ jobs:
           # Assert the archive really contains the app bundle, not just a file
           # with the expected name. Listing to a file avoids a SIGPIPE from
           # `grep -q` failing the pipeline under `pipefail`.
-          unzip -l "$asset" > "$RUNNER_TEMP/asset-listing.txt"
-          grep -q 'FSK\.app/' "$RUNNER_TEMP/asset-listing.txt"
+          unzip -Z1 "$asset" > "$RUNNER_TEMP/asset-listing.txt"
+          grep -qx 'FSK.app/' "$RUNNER_TEMP/asset-listing.txt"
           gh release create "$GITHUB_REF_NAME" \
             "$asset" \
             --title "FSK $GITHUB_REF_NAME" \
