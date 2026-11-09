@@ -61,7 +61,7 @@ struct RustBackendTests {
         defer { try? FileManager.default.removeItem(at: url) }
 
         let item = FSKItem(inode: 99, kind: .file)
-        try item.install(
+        item.install(
             RustOpenFile(
                 lease: 7,
                 generation: 1,
@@ -75,6 +75,65 @@ struct RustBackendTests {
         #expect(count == 10)
         #expect(String(decoding: bytes, as: UTF8.self) == "downloaded")
         #expect(item.releaseOpenState() == 7)
+    }
+
+    @Test("a second open reuses the first lease instead of failing")
+    func duplicateOpenSharesLease() {
+        let item = FSKItem(inode: 99, kind: .file)
+        #expect(
+            item.install(RustOpenFile(lease: 7, generation: 1, localPath: nil))
+        )
+        #expect(
+            !item.install(RustOpenFile(lease: 8, generation: 1, localPath: nil))
+        )
+        #expect(item.releaseOpenState() == 7)
+        #expect(item.releaseOpenState() == nil)
+    }
+
+    @Test("an unreadable local file falls back to backend reads")
+    func unreadableLocalFileFallsBack() throws {
+        let missing = FileManager.default.temporaryDirectory
+            .appending(path: "fsk-missing-\(UUID().uuidString)")
+        let item = FSKItem(inode: 99, kind: .file)
+        // The lease stays usable even though the cached path can't be opened.
+        #expect(
+            item.install(
+                RustOpenFile(
+                    lease: 9,
+                    generation: 1,
+                    localPath: Data(missing.path.utf8)
+                )
+            )
+        )
+        var bytes = [UInt8](repeating: 0, count: 4)
+        let count = try bytes.withUnsafeMutableBytes {
+            try item.readLocal(offset: 0, length: $0.count, into: $0)
+        }
+        #expect(count == nil)
+        #expect(item.releaseOpenState() == 9)
+    }
+
+    @Test("an empty non-final directory page is not progress")
+    func emptyDirectoryPageDoesNotLoop() {
+        func batch(eof: Bool, entries: [FSKDirEntry]) -> RustDirectoryBatch {
+            RustDirectoryBatch(
+                entries: entries,
+                names: Data(),
+                verifier: 1,
+                nextCookie: 0,
+                eof: eof
+            )
+        }
+        let entry = FSKDirEntry(
+            inode: 2,
+            next_cookie: 1,
+            name_offset: 0,
+            name_length: 0,
+            kind: FSK_KIND_FILE
+        )
+        #expect(!batch(eof: false, entries: []).madeProgress)
+        #expect(batch(eof: true, entries: []).madeProgress)
+        #expect(batch(eof: false, entries: [entry]).madeProgress)
     }
 
     @Test("volume exposes the FSKit lifecycle protocol and selectors")

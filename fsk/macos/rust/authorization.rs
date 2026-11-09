@@ -961,8 +961,13 @@ fn temporary_directory() -> io::Result<PathBuf> {
         .unwrap_or_default()
         .as_nanos();
     let path = env::temp_dir().join(format!("fsk-install-{}-{nonce}", std::process::id()));
-    fs::create_dir(&path)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    // Create the directory private from the first instant. Creating it with the
+    // default mode would briefly expose it (and later the curl token config)
+    // when `TMPDIR` names a shared directory.
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&path)
+        .map_err(|error| fs_error("create", &path, &error))?;
     Ok(path)
 }
 

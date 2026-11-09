@@ -20,16 +20,22 @@ final class FSKItem: FSItem, @unchecked Sendable {
         super.init()
     }
 
-    func install(_ opened: RustOpenFile) throws {
-        let descriptor = try opened.localPath.map { path -> Int32 in
+    /// Installs the open state for `opened`.
+    ///
+    /// Returns `false` when another open already holds this item's lease; the
+    /// caller then owns (and must release) the duplicate lease.
+    ///
+    /// A local file that can't be opened — because it was evicted, isn't UTF-8,
+    /// or the sandbox denies a path outside the extension's container — is
+    /// ignored so reads fall back to the backend instead of failing the open.
+    @discardableResult
+    func install(_ opened: RustOpenFile) -> Bool {
+        let descriptor = opened.localPath.flatMap { path -> Int32? in
             guard let pathString = String(data: path, encoding: .utf8) else {
-                throw POSIXError(.EILSEQ)
+                return nil
             }
             let value = Darwin.open(pathString, O_RDONLY)
-            guard value >= 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
-            return value
+            return value >= 0 ? value : nil
         }
         let installed = openState.withLockUnchecked { state -> Bool in
             guard state == nil else {
@@ -38,12 +44,10 @@ final class FSKItem: FSItem, @unchecked Sendable {
             state = OpenState(lease: opened.lease, localDescriptor: descriptor)
             return true
         }
-        if !installed {
-            if let descriptor {
-                Darwin.close(descriptor)
-            }
-            throw POSIXError(.EBUSY)
+        if !installed, let descriptor {
+            Darwin.close(descriptor)
         }
+        return installed
     }
 
     func readLocal(

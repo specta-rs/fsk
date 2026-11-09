@@ -55,7 +55,9 @@ final class FSKVolume: FSVolume,
         result.totalBytes = stat.total_bytes
         result.freeBytes = stat.free_bytes
         result.availableBytes = stat.available_bytes
-        result.usedBytes = stat.total_bytes - stat.free_bytes
+        result.usedBytes = stat.total_bytes >= stat.free_bytes
+            ? stat.total_bytes - stat.free_bytes
+            : 0
         result.totalFiles = stat.files
         result.freeFiles = stat.free_files
         return result
@@ -464,11 +466,14 @@ final class FSKVolume: FSVolume,
         }
         do {
             let opened = try backend.open(inode: item.inode, writable: modes.contains(.write))
-            do {
-                try item.install(opened)
-            } catch {
+            guard item.install(opened) else {
+                // A second open of the same file shares the lease the first
+                // one created. Reads and writes go through the backend, so
+                // this open needs no extra state; only the duplicate lease
+                // has to be released.
                 try? backend.close(lease: opened.lease)
-                throw error
+                replyHandler(nil)
+                return
             }
             replyHandler(nil)
         } catch {

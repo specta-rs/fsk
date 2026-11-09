@@ -121,8 +121,17 @@ impl MountSession {
     }
 
     /// Unmount now. Dropping the session has the same effect.
+    ///
+    /// The call waits for the FUSE dispatcher thread to stop so file leases are
+    /// released before this returns.
     pub fn unmount(mut self) {
-        self.session.take();
+        self.stop();
+    }
+
+    fn stop(&mut self) {
+        if let Some(session) = self.session.take() {
+            let _ = session.umount_and_join();
+        }
     }
 
     fn start(backend: Backend, mount_path: &Path, options: &MountOptions) -> io::Result<Self> {
@@ -150,6 +159,12 @@ impl MountSession {
             mount_path: mount_path.to_owned(),
             session: Some(session),
         })
+    }
+}
+
+impl Drop for MountSession {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -246,8 +261,13 @@ impl FuseAdapter {
         }
     }
 
-    fn attr(&self, inode: u64) -> crate::Result<FileAttr> {
-        Ok(to_fuse_attr(self.backend.filesystem().metadata(inode)?))
+    fn attr(&self, inode: u64) -> crate::Result<(FileAttr, Generation)> {
+        let metadata = self.backend.filesystem().metadata(inode)?;
+        Ok(entry(metadata))
+    }
+
+    fn allocate_handle(&self) -> FileHandle {
+        next_handle(&self.next_handle)
     }
 
     fn opened_local(&self, handle: u64) -> Option<File> {
@@ -281,7 +301,7 @@ impl fuser::Filesystem for FuseAdapter {
             .lookup(parent.0, name.as_bytes())
             .and_then(|(inode, _)| self.attr(inode))
         {
-            Ok(attr) => reply.entry(&self.ttl, &attr, Generation(attr.ino.0)),
+            Ok((attr, generation)) => reply.entry(&self.ttl, &attr, generation),
             Err(error) => reply.error(errno(error)),
         }
     }
@@ -292,7 +312,7 @@ impl fuser::Filesystem for FuseAdapter {
             return;
         }
         match self.attr(ino.0) {
-            Ok(attr) => reply.attr(&self.ttl, &attr),
+            Ok((attr, _)) => reply.attr(&self.ttl, &attr),
             Err(error) => reply.error(errno(error)),
         }
     }
@@ -407,7 +427,7 @@ impl fuser::Filesystem for FuseAdapter {
             )
             .and_then(|inode| self.attr(inode))
         {
-            Ok(attr) => reply.entry(&self.ttl, &attr, Generation(attr.ino.0)),
+            Ok((attr, generation)) => reply.entry(&self.ttl, &attr, generation),
             Err(error) => reply.error(errno(error)),
         }
     }
@@ -419,7 +439,7 @@ impl fuser::Filesystem for FuseAdapter {
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: RenameFlags,
+        flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         if let Err(error) = self.before(req, Operation::Rename, 0, 0) {
@@ -431,6 +451,10 @@ impl fuser::Filesystem for FuseAdapter {
             .lookup(newparent.0, newname.as_bytes())
             .ok()
             .map(|value| value.0);
+        if let Some(error) = rename_constraint(flags, replaced.is_some()) {
+            reply.error(error);
+            return;
+        }
         match fs.rename(
             parent.0,
             name.as_bytes(),
@@ -465,16 +489,16 @@ impl fuser::Filesystem for FuseAdapter {
                         }
                     },
                 };
-                let handle = self.next_handle.fetch_add(1, Ordering::Relaxed).max(1);
+                let handle = self.allocate_handle();
                 self.open_files.lock().insert(
-                    handle,
+                    handle.0,
                     OpenFile {
                         inode: ino.0,
                         network_file,
                         local,
                     },
                 );
-                reply.opened(FileHandle(handle), FopenFlags::empty());
+                reply.opened(handle, FopenFlags::empty());
             }
             Err(error) => reply.error(errno(error)),
         }
@@ -654,16 +678,18 @@ impl fuser::Filesystem for FuseAdapter {
         }
         match self.backend.filesystem().statfs() {
             Ok(value) => {
-                let block_size = u64::from(value.block_size.max(1));
+                let (blocks, free, available, block_size) = statfs_units(value);
+                // Block counts are in `frsize` units, so both reported sizes must
+                // match the unit used for the division above.
                 reply.statfs(
-                    value.total_bytes / block_size,
-                    value.free_bytes / block_size,
-                    value.available_bytes / block_size,
+                    blocks,
+                    free,
+                    available,
                     value.files,
                     value.free_files,
-                    value.block_size,
+                    block_size,
                     255,
-                    value.io_size,
+                    block_size,
                 );
             }
             Err(error) => reply.error(errno(error)),
@@ -690,13 +716,16 @@ impl fuser::Filesystem for FuseAdapter {
             .create(parent.0, name.as_bytes(), FileType::File, mode)
             .and_then(|inode| self.attr(inode))
         {
-            Ok(attr) => reply.created(
-                &self.ttl,
-                &attr,
-                Generation(attr.ino.0),
-                FileHandle(attr.ino.0),
-                FopenFlags::empty(),
-            ),
+            Ok((attr, generation)) => {
+                // Local handles are stateless inode values, matching `open`.
+                // Network handles share the counter namespace so a create handle
+                // can never be mistaken for a different file's lease.
+                let handle = match &self.backend {
+                    Backend::Local(_) => FileHandle(attr.ino.0),
+                    Backend::Network(_) => self.allocate_handle(),
+                };
+                reply.created(&self.ttl, &attr, generation, handle, FopenFlags::empty());
+            }
             Err(error) => reply.error(errno(error)),
         }
     }
@@ -722,7 +751,7 @@ impl FuseAdapter {
             .create(parent.0, name.as_bytes(), kind, mode)
             .and_then(|inode| self.attr(inode))
         {
-            Ok(attr) => reply.entry(&self.ttl, &attr, Generation(attr.ino.0)),
+            Ok((attr, generation)) => reply.entry(&self.ttl, &attr, generation),
             Err(error) => reply.error(errno(error)),
         }
     }
@@ -772,6 +801,38 @@ impl DirectorySink for FuseDirectorySink {
     }
 }
 
+fn entry(metadata: Metadata) -> (FileAttr, Generation) {
+    (to_fuse_attr(metadata), Generation(metadata.generation))
+}
+
+fn next_handle(counter: &AtomicU64) -> FileHandle {
+    FileHandle(counter.fetch_add(1, Ordering::Relaxed).max(1))
+}
+
+fn rename_constraint(flags: RenameFlags, destination_exists: bool) -> Option<Errno> {
+    // Only NOREPLACE maps onto the portable rename contract. Exchange, whiteout,
+    // and future flags cannot be honoured safely, so reject them instead of
+    // silently degrading to a plain rename.
+    if !(flags & !RenameFlags::RENAME_NOREPLACE).is_empty() {
+        return Some(Errno::EINVAL);
+    }
+    if flags.contains(RenameFlags::RENAME_NOREPLACE) && destination_exists {
+        return Some(Errno::EEXIST);
+    }
+    None
+}
+
+fn statfs_units(value: crate::StatFs) -> (u64, u64, u64, u32) {
+    let block_size = value.block_size.max(1);
+    let units = u64::from(block_size);
+    (
+        value.total_bytes / units,
+        value.free_bytes / units,
+        value.available_bytes / units,
+        block_size,
+    )
+}
+
 fn errno(error: Error) -> Errno {
     let native = match error {
         Error::NOT_SUPPORTED => libc::ENOTSUP,
@@ -779,6 +840,8 @@ fn errno(error: Error) -> Errno {
         Error::STALE => libc::ESTALE,
         Error(value) => value,
     };
+    // `Errno::from_i32` maps zero and negative values to `EIO`, so a malformed
+    // `Error(0)` can never become a successful empty FUSE reply.
     Errno::from_i32(native)
 }
 
@@ -835,9 +898,8 @@ fn raw_flags(flags: OpenFlags) -> u32 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn attributes_preserve_inode_size_and_kind_without_allocation() {
-        let metadata = Metadata {
+    fn sample_metadata() -> Metadata {
+        Metadata {
             inode: 42,
             parent: 1,
             size: 4097,
@@ -851,8 +913,12 @@ mod tests {
             gid: 20,
             link_count: 1,
             kind: FileType::File,
-        };
-        let attr = to_fuse_attr(metadata);
+        }
+    }
+
+    #[test]
+    fn attributes_preserve_inode_size_and_kind_without_allocation() {
+        let attr = to_fuse_attr(sample_metadata());
         assert_eq!(attr.ino.0, 42);
         assert_eq!(attr.size, 4097);
         assert_eq!(attr.blocks, 8);
@@ -861,10 +927,78 @@ mod tests {
     }
 
     #[test]
+    fn entry_generation_comes_from_metadata_not_the_inode() {
+        let (attr, generation) = entry(sample_metadata());
+        assert_eq!(attr.ino.0, 42);
+        assert_eq!(generation.0, 2);
+    }
+
+    #[test]
     fn portable_errors_are_translated_to_linux_errno_values() {
         assert_eq!(errno(Error::NOT_SUPPORTED).code(), libc::ENOTSUP);
         assert_eq!(errno(Error::DIRECTORY_NOT_EMPTY).code(), libc::ENOTEMPTY);
         assert_eq!(errno(Error::STALE).code(), libc::ESTALE);
         assert_eq!(errno(Error(2)).code(), libc::ENOENT);
+        // Non-positive portable errors must not become successful replies.
+        assert_eq!(errno(Error(0)).code(), libc::EIO);
+        assert_eq!(errno(Error(-2)).code(), libc::EIO);
+    }
+
+    #[test]
+    fn statfs_block_counts_are_in_the_reported_fragment_size() {
+        let value = crate::StatFs {
+            block_size: 4096,
+            io_size: 131_072,
+            total_bytes: 8192,
+            free_bytes: 4096,
+            available_bytes: 4096,
+            files: 2,
+            free_files: 1,
+        };
+        let (blocks, free, available, block_size) = statfs_units(value);
+        assert_eq!(blocks, 2);
+        assert_eq!(free, 1);
+        assert_eq!(available, 1);
+        assert_eq!(block_size, 4096);
+        assert_ne!(block_size, value.io_size);
+    }
+
+    #[test]
+    fn rename_rejects_flags_the_portable_model_cannot_express() {
+        assert_eq!(
+            rename_constraint(RenameFlags::empty(), false).map(Errno::code),
+            None
+        );
+        assert_eq!(
+            rename_constraint(RenameFlags::RENAME_NOREPLACE, false).map(Errno::code),
+            None
+        );
+        assert_eq!(
+            rename_constraint(RenameFlags::RENAME_NOREPLACE, true).map(Errno::code),
+            Some(libc::EEXIST)
+        );
+        assert_eq!(
+            rename_constraint(RenameFlags::RENAME_EXCHANGE, false).map(Errno::code),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(
+            rename_constraint(RenameFlags::RENAME_WHITEOUT, false).map(Errno::code),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(
+            rename_constraint(RenameFlags::from_bits_retain(1 << 31), false).map(Errno::code),
+            Some(libc::EINVAL)
+        );
+    }
+
+    #[test]
+    fn file_handles_are_unique_and_never_zero() {
+        let counter = AtomicU64::new(1);
+        assert_eq!(next_handle(&counter).0, 1);
+        assert_eq!(next_handle(&counter).0, 2);
+
+        let wrapped = AtomicU64::new(u64::MAX);
+        assert_eq!(next_handle(&wrapped).0, u64::MAX);
+        assert_eq!(next_handle(&wrapped).0, 1);
     }
 }

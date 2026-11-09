@@ -412,27 +412,35 @@ struct PackedSink<'a> {
     names: &'a mut [u8],
     entry_count: usize,
     name_count: usize,
+    /// Set when the caller's buffers refused an entry. A page that refused its
+    /// very first entry made no progress and must be reported as `ERANGE`.
+    overflowed: bool,
 }
 
 impl DirectorySink for PackedSink<'_> {
     fn push(&mut self, entry: DirectoryEntry<'_>) -> bool {
+        let name_end = self.name_count.saturating_add(entry.name.len());
+        let Ok(name_offset) = u32::try_from(self.name_count) else {
+            self.overflowed = true;
+            return false;
+        };
         if self.entry_count == self.entries.len()
             || entry.name.len() > u16::MAX as usize
-            || self.name_count + entry.name.len() > self.names.len()
+            || name_end > self.names.len()
         {
+            self.overflowed = true;
             return false;
         }
-        let name_offset = self.name_count;
-        self.names[name_offset..name_offset + entry.name.len()].copy_from_slice(entry.name);
+        self.names[self.name_count..name_end].copy_from_slice(entry.name);
         self.entries[self.entry_count] = FskDirEntry {
             inode: entry.inode,
             next_cookie: entry.next_cookie,
-            name_offset: u32::try_from(name_offset).unwrap_or(u32::MAX),
+            name_offset,
             name_length: u16::try_from(entry.name.len()).unwrap_or(u16::MAX),
             kind: entry.kind as u8,
             reserved: 0,
         };
-        self.name_count += entry.name.len();
+        self.name_count = name_end;
         self.entry_count += 1;
         true
     }
@@ -477,13 +485,20 @@ pub unsafe extern "C" fn fsk_readdir(
             names,
             entry_count: 0,
             name_count: 0,
+            overflowed: false,
         };
         let ReadDirectoryResult {
             verifier,
             next_cookie,
             eof,
         } = unsafe { volume(pointer)? }.read_directory(inode, cookie, verifier, &mut sink)?;
-        if sink.entry_count == 0 && !eof && (entry_capacity == 0 || name_capacity == 0) {
+        // A page that packed nothing, is not the end, and had an entry refused
+        // made no progress: the caller must retry with larger buffers instead
+        // of seeing a successful empty page (and looping on the same cookie).
+        if sink.entry_count == 0
+            && !eof
+            && (sink.overflowed || entry_capacity == 0 || name_capacity == 0)
+        {
             return Err(Error(ERANGE));
         }
         unsafe {
@@ -814,5 +829,123 @@ mod tests {
         assert_eq!(unsafe { fsk_close_file(pointer, opened.lease) }, 0);
         assert_eq!(closes.load(Ordering::Relaxed), 1);
         unsafe { fsk_volume_destroy(pointer) };
+    }
+
+    /// One directory page containing a single short name, ending after it.
+    #[derive(Default)]
+    struct OneEntryFilesystem {
+        inner: TestFilesystem,
+    }
+
+    impl Filesystem for OneEntryFilesystem {
+        fn statfs(&self) -> crate::Result<StatFs> {
+            self.inner.statfs()
+        }
+
+        fn metadata(&self, inode: u64) -> crate::Result<Metadata> {
+            self.inner.metadata(inode)
+        }
+
+        fn lookup(&self, parent: u64, name: &[u8]) -> crate::Result<(u64, FileType)> {
+            self.inner.lookup(parent, name)
+        }
+
+        fn read_directory(
+            &self,
+            _inode: u64,
+            cookie: u64,
+            _verifier: u64,
+            sink: &mut dyn DirectorySink,
+        ) -> crate::Result<ReadDirectoryResult> {
+            if cookie != 0 {
+                return Ok(ReadDirectoryResult {
+                    verifier: 1,
+                    next_cookie: cookie,
+                    eof: true,
+                });
+            }
+            let pushed = sink.push(DirectoryEntry {
+                name: b"entry",
+                inode: 2,
+                kind: FileType::File,
+                next_cookie: 1,
+            });
+            Ok(ReadDirectoryResult {
+                verifier: 1,
+                next_cookie: u64::from(pushed),
+                eof: false,
+            })
+        }
+
+        fn read(&self, inode: u64, offset: u64, output: &mut [u8]) -> crate::Result<usize> {
+            self.inner.read(inode, offset, output)
+        }
+    }
+
+    struct ReadDirCall {
+        status: i32,
+        entry_count: usize,
+        name_count: usize,
+        next_cookie: u64,
+        eof: u8,
+        names: Vec<u8>,
+    }
+
+    fn read_dir_with_buffers(entry_capacity: usize, name_capacity: usize) -> ReadDirCall {
+        let pointer = create_volume(OneEntryFilesystem::default());
+        let mut entries = vec![FskDirEntry::default(); entry_capacity];
+        let mut names = vec![0_u8; name_capacity];
+        let (mut entry_count, mut name_count) = (usize::MAX, usize::MAX);
+        let (mut next_cookie, mut verifier, mut eof) = (u64::MAX, u64::MAX, u8::MAX);
+        // SAFETY: every pointer is derived from a live allocation of the stated
+        // length for the duration of the call.
+        let status = unsafe {
+            fsk_readdir(
+                pointer,
+                ROOT_INODE,
+                0,
+                1,
+                entries.as_mut_ptr(),
+                entries.len(),
+                names.as_mut_ptr(),
+                names.len(),
+                &raw mut entry_count,
+                &raw mut name_count,
+                &raw mut next_cookie,
+                &raw mut verifier,
+                &raw mut eof,
+            )
+        };
+        // SAFETY: the volume was created above and is not used again.
+        unsafe { fsk_volume_destroy(pointer) };
+        ReadDirCall {
+            status,
+            entry_count,
+            name_count,
+            next_cookie,
+            eof,
+            names,
+        }
+    }
+
+    #[test]
+    fn readdir_reports_erange_when_the_first_entry_cannot_fit() {
+        // Non-zero but too small: the old behaviour returned a successful
+        // empty page with `eof = 0`, which makes a caller retry the same
+        // cookie forever instead of growing its buffers.
+        let call = read_dir_with_buffers(4, 1);
+        assert_eq!(call.status, ERANGE);
+        assert_eq!(call.next_cookie, u64::MAX);
+    }
+
+    #[test]
+    fn readdir_packs_an_entry_when_the_buffers_fit() {
+        let call = read_dir_with_buffers(4, 32);
+        assert_eq!(call.status, 0);
+        assert_eq!(call.entry_count, 1);
+        assert_eq!(call.name_count, 5);
+        assert_eq!(call.next_cookie, 1);
+        assert_eq!(call.eof, 0);
+        assert_eq!(&call.names[..call.name_count], b"entry");
     }
 }

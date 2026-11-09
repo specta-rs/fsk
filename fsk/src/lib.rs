@@ -157,10 +157,7 @@ macro_rules! export_filesystem {
             _resource_length: usize,
             error_out: *mut i32,
         ) -> *mut ::core::ffi::c_void {
-            if !error_out.is_null() {
-                unsafe { *error_out = 0 };
-            }
-            $crate::__private::create_volume($factory())
+            unsafe { $crate::__private::create_volume_from_factory(error_out, $factory) }
         }
     };
 }
@@ -194,5 +191,64 @@ macro_rules! export_network_filesystem {
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub mod __private {
+    use crate::{Error, Filesystem};
+    use std::{
+        ffi::c_void,
+        panic::{AssertUnwindSafe, catch_unwind},
+        ptr,
+    };
+
     pub use crate::ffi::{create_network_volume_from_raw, create_volume};
+
+    /// Runs a backend factory, converting a panic into `EIO` before it can
+    /// unwind through the exported C function.
+    ///
+    /// # Safety
+    ///
+    /// `error_out`, when non-null, must be writable for one `i32`.
+    pub unsafe fn create_volume_from_factory<T: Filesystem>(
+        error_out: *mut i32,
+        factory: impl FnOnce() -> T,
+    ) -> *mut c_void {
+        if let Ok(filesystem) = catch_unwind(AssertUnwindSafe(factory)) {
+            if !error_out.is_null() {
+                unsafe { ptr::write(error_out, 0) };
+            }
+            create_volume(filesystem)
+        } else {
+            if !error_out.is_null() {
+                unsafe { ptr::write(error_out, Error::IO.0) };
+            }
+            ptr::null_mut()
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod export_tests {
+    use crate::{__private::create_volume_from_factory, Error, test_support::TestFilesystem};
+
+    #[test]
+    fn a_panicking_factory_is_reported_as_io() {
+        let mut error = 0;
+        // SAFETY: `error` is a writable `i32` for the duration of the call.
+        let volume = unsafe {
+            create_volume_from_factory(&raw mut error, || -> TestFilesystem {
+                panic!("factory panic");
+            })
+        };
+        assert!(volume.is_null());
+        assert_eq!(error, Error::IO.0);
+    }
+
+    #[test]
+    fn a_successful_factory_clears_the_error() {
+        let mut error = i32::MIN;
+        // SAFETY: `error` is a writable `i32` for the duration of the call.
+        let volume = unsafe { create_volume_from_factory(&raw mut error, TestFilesystem::default) };
+        assert!(!volume.is_null());
+        assert_eq!(error, 0);
+        // SAFETY: `volume` came from `create_volume_from_factory`.
+        unsafe { crate::ffi::fsk_volume_destroy(volume) };
+    }
 }

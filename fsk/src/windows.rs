@@ -21,8 +21,10 @@ use std::{
 use windows_sys::{
     Win32::{
         Foundation::{
-            ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
-            ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+            ERROR_ACCESS_DENIED, ERROR_DIR_NOT_EMPTY, ERROR_DIRECTORY, ERROR_DISK_FULL,
+            ERROR_FILE_EXISTS, ERROR_FILE_INVALID, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF,
+            ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+            ERROR_IO_DEVICE, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_SUPPORTED, ERROR_WRITE_PROTECT,
         },
         Storage::ProjectedFileSystem::*,
         System::Com::CoCreateGuid,
@@ -350,7 +352,10 @@ unsafe extern "system" fn start_directory(
                 if let Some(error) = sink.error {
                     return error_hresult(error);
                 }
-                if !result.eof && result.next_cookie == cookie {
+                // Every non-final page must advance the cursor. Comparing with
+                // `<=` also rejects a backend that rewinds, which would otherwise
+                // loop here forever while growing `entries` without bound.
+                if !result.eof && result.next_cookie <= cookie {
                     return error_hresult(Error::INVALID);
                 }
                 cookie = result.next_cookie;
@@ -411,6 +416,7 @@ unsafe extern "system" fn get_directory(
     if unsafe { (*callback).Flags } & PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN != 0 {
         session.index = 0;
     }
+    let mut added = false;
     while let Some(entry) = session.entries.get(session.index) {
         if !search_expression.is_null()
             // SAFETY: both are null-terminated UTF-16 strings.
@@ -424,11 +430,16 @@ unsafe extern "system" fn get_directory(
         let result =
             unsafe { PrjFillDirEntryBuffer(entry.name.as_ptr(), &raw const info, buffer_handle) };
         if result == hresult(ERROR_INSUFFICIENT_BUFFER) {
-            break;
+            // ProjFS requires this result when the buffer could not fit the
+            // first entry it was offered, so the caller retries with a larger
+            // buffer. Returning `S_OK` there would silently report an empty (or
+            // truncated) directory.
+            return if added { S_OK } else { result };
         }
         if result < 0 {
             return result;
         }
+        added = true;
         session.index += 1;
         // SAFETY: callback references initialized callback data.
         if unsafe { (*callback).Flags } & PRJ_CB_DATA_FLAG_ENUM_RETURN_SINGLE_ENTRY != 0 {
@@ -475,12 +486,20 @@ unsafe extern "system" fn get_file_data(
 ) -> HRESULT {
     // SAFETY: callback is valid for this invocation.
     let state = unsafe { WindowsState::from_callback(callback) };
+    if length == 0 {
+        // Nothing to hydrate, and allocating a zero-length aligned buffer can
+        // legitimately fail.
+        return S_OK;
+    }
     // SAFETY: ProjFS returns a suitably aligned buffer or null.
     let buffer = unsafe {
         PrjAllocateAlignedBuffer((*callback).NamespaceVirtualizationContext, length as usize)
     };
     let Some(pointer) = NonNull::new(buffer.cast::<u8>()) else {
-        return hresult(ERROR_INSUFFICIENT_BUFFER);
+        // `PrjAllocateAlignedBuffer` returns null when it cannot satisfy the
+        // request, which is an out-of-memory condition rather than a hint that
+        // the caller should retry with a larger buffer.
+        return hresult(ERROR_NOT_ENOUGH_MEMORY);
     };
     // SAFETY: the allocated buffer is writable for length bytes.
     let raw_buffer = unsafe { RawBuffer::new(pointer, length as usize, true) };
@@ -499,11 +518,9 @@ unsafe extern "system" fn get_file_data(
     };
     // SAFETY: buffer is live and writable until it is freed below.
     let bytes = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), length as usize) };
-    let count = match state
-        .filesystem
-        .read(inode, offset, bytes)
-        .and_then(|count| crate::core::checked_io_count(count, bytes.len()))
-    {
+    let count = match hydrate(offset, bytes, |position, output| {
+        state.filesystem.read(inode, position, output)
+    }) {
         Ok(value) => value,
         Err(error) => {
             // SAFETY: buffer came from PrjAllocateAlignedBuffer.
@@ -511,6 +528,13 @@ unsafe extern "system" fn get_file_data(
             return error_hresult(error);
         }
     };
+    if count != length as usize {
+        // SAFETY: buffer came from PrjAllocateAlignedBuffer.
+        unsafe { PrjFreeAlignedBuffer(buffer) };
+        // The callback must supply the whole requested range. A short read that
+        // cannot be resumed means the backend is shorter than the placeholder.
+        return hresult(ERROR_HANDLE_EOF);
+    }
     // SAFETY: callback GUID and buffer remain valid for the call.
     let result = unsafe {
         PrjWriteFileData(
@@ -518,12 +542,35 @@ unsafe extern "system" fn get_file_data(
             &raw const (*callback).DataStreamId,
             buffer,
             offset,
-            u32::try_from(count).unwrap_or(u32::MAX),
+            length,
         )
     };
     // SAFETY: buffer came from PrjAllocateAlignedBuffer.
     unsafe { PrjFreeAlignedBuffer(buffer) };
     result
+}
+
+/// Fills `bytes` with file data starting at `offset`.
+///
+/// `ProjFS` requires the provider to supply at least the requested range, but
+/// [`Filesystem::read`] may legally return a short read, so keep reading until
+/// the range is full or the backend reports end of file. Stopping after a short
+/// read would leave part of the hydrated range unwritten.
+fn hydrate(
+    offset: u64,
+    bytes: &mut [u8],
+    mut read: impl FnMut(u64, &mut [u8]) -> crate::Result<usize>,
+) -> crate::Result<usize> {
+    let mut filled = 0;
+    while filled < bytes.len() {
+        let position = offset.saturating_add(filled as u64);
+        let count = read(position, &mut bytes[filled..])?;
+        if count == 0 {
+            break;
+        }
+        filled += crate::core::checked_io_count(count, bytes.len() - filled)?;
+    }
+    Ok(filled)
 }
 
 unsafe extern "system" fn query_file_name(callback: *const PRJ_CALLBACK_DATA) -> HRESULT {
@@ -592,12 +639,25 @@ fn windows_time(nanoseconds: u64) -> i64 {
 }
 
 fn error_hresult(error: Error) -> HRESULT {
-    match error.0 {
-        2 => hresult(ERROR_FILE_NOT_FOUND),
-        13 => hresult(ERROR_ACCESS_DENIED),
-        22 => hresult(ERROR_INVALID_PARAMETER),
-        _ => hresult(ERROR_INVALID_FUNCTION),
-    }
+    // Portable codes use Darwin's POSIX values, so each one needs an explicit
+    // Win32 translation. Falling through to `ERROR_INVALID_FUNCTION` would turn
+    // every defaulted mutation into "Incorrect function" and hide the reason
+    // the provider rejected the callback.
+    let code = match error {
+        Error::IO => ERROR_IO_DEVICE,
+        Error::INVALID => ERROR_INVALID_PARAMETER,
+        Error::NOT_SUPPORTED => ERROR_NOT_SUPPORTED,
+        Error::DIRECTORY_NOT_EMPTY => ERROR_DIR_NOT_EMPTY,
+        Error::STALE => ERROR_FILE_INVALID,
+        Error(1 | 13 | 21) => ERROR_ACCESS_DENIED, // EPERM, EACCES, EISDIR
+        Error(2) => ERROR_FILE_NOT_FOUND,          // ENOENT
+        Error(17) => ERROR_FILE_EXISTS,            // EEXIST
+        Error(20) => ERROR_DIRECTORY,              // ENOTDIR
+        Error(28) => ERROR_DISK_FULL,              // ENOSPC
+        Error(30) => ERROR_WRITE_PROTECT,          // EROFS
+        _ => ERROR_INVALID_FUNCTION,
+    };
+    hresult(code)
 }
 
 fn hresult(code: u32) -> HRESULT {
@@ -720,9 +780,82 @@ fn push_utf8(output: &mut Vec<u8>, scalar: u32) {
 mod tests {
     use super::*;
 
+    fn win32_code(value: HRESULT) -> u32 {
+        u32::from_ne_bytes(value.to_ne_bytes()) & 0xffff
+    }
+
     #[test]
     fn wtf8_round_trips_unpaired_surrogates() {
         let value = [u16::from(b'a'), 0xd800, 0xd83d, 0xde80];
         assert_eq!(decode_wtf8(&encode_wtf8(&value)), value);
+    }
+
+    #[test]
+    fn portable_errors_keep_their_meaning_as_win32_codes() {
+        assert_eq!(win32_code(error_hresult(Error::IO)), ERROR_IO_DEVICE);
+        assert_eq!(
+            win32_code(error_hresult(Error::INVALID)),
+            ERROR_INVALID_PARAMETER
+        );
+        assert_eq!(
+            win32_code(error_hresult(Error::NOT_SUPPORTED)),
+            ERROR_NOT_SUPPORTED
+        );
+        assert_eq!(
+            win32_code(error_hresult(Error::DIRECTORY_NOT_EMPTY)),
+            ERROR_DIR_NOT_EMPTY
+        );
+        assert_eq!(win32_code(error_hresult(Error::STALE)), ERROR_FILE_INVALID);
+        assert_eq!(win32_code(error_hresult(Error(2))), ERROR_FILE_NOT_FOUND);
+        assert_eq!(win32_code(error_hresult(Error(13))), ERROR_ACCESS_DENIED);
+        assert_eq!(win32_code(error_hresult(Error(17))), ERROR_FILE_EXISTS);
+        assert_eq!(win32_code(error_hresult(Error(20))), ERROR_DIRECTORY);
+        assert_eq!(win32_code(error_hresult(Error(28))), ERROR_DISK_FULL);
+        assert_eq!(win32_code(error_hresult(Error(30))), ERROR_WRITE_PROTECT);
+        // An unknown code must still be a failure rather than a success.
+        assert!(error_hresult(Error(9999)) < 0);
+    }
+
+    #[test]
+    fn hydration_fills_the_range_across_short_reads() {
+        let source = *b"abcdefghij";
+        let mut output = [0_u8; 10];
+        let mut calls = 0;
+        let count = hydrate(0, &mut output, |position, target| {
+            calls += 1;
+            let start = usize::try_from(position).unwrap();
+            let available = &source[start..];
+            let chunk = available.len().min(3).min(target.len());
+            target[..chunk].copy_from_slice(&available[..chunk]);
+            Ok(chunk)
+        })
+        .unwrap();
+        assert_eq!(count, source.len());
+        assert_eq!(output, source);
+        assert!(calls > 1, "short reads should be resumed");
+    }
+
+    #[test]
+    fn hydration_stops_at_end_of_file() {
+        let source = *b"abc";
+        let mut output = [0_u8; 8];
+        let count = hydrate(0, &mut output, |position, target| {
+            let start = usize::try_from(position).unwrap();
+            let chunk = source.len().saturating_sub(start).min(target.len());
+            target[..chunk].copy_from_slice(&source[start..start + chunk]);
+            Ok(chunk)
+        })
+        .unwrap();
+        assert_eq!(count, source.len());
+        assert_eq!(&output[..count], &source);
+    }
+
+    #[test]
+    fn hydration_rejects_counts_beyond_the_remaining_range() {
+        let mut output = [0_u8; 4];
+        assert_eq!(
+            hydrate(0, &mut output, |_, target| Ok(target.len() + 1)),
+            Err(Error::INVALID)
+        );
     }
 }
