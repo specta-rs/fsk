@@ -303,24 +303,55 @@ signing `com.apple.developer.fskit.fsmodule`.
 ./fsk/macos/check.sh
 ```
 
-Install `FSK.app`, then enable it under **System Settings → General → Login
-Items & Extensions → File System Extensions**. A CLI can query and open the
-authorization guide:
+The Rust SDK can download and install the matching `FSK.app` release without
+opening it. Run the blocking installation call on your background executor,
+then launch the app separately when the user is ready to authorize it under
+**System Settings → General → Login Items & Extensions → File System Extensions**.
+Copying the app into place does not register its extension, so
+`authorization_status()` may still report `NotInstalled` until the app has been
+launched once:
 
 ```rust
+let outcome = fsk::download_and_install_app()?;
+println!("FSK app installation: {outcome:?}");
+
 match fsk::authorization_status()? {
     fsk::AuthorizationStatus::Authorized => {}
-    fsk::AuthorizationStatus::NeedsApproval => {
-        fsk::open_authorization_app()?;
-    }
-    fsk::AuthorizationStatus::NotInstalled => {
-        eprintln!("Install FSK.app in /Applications");
+    fsk::AuthorizationStatus::NeedsApproval | fsk::AuthorizationStatus::NotInstalled => {
+        fsk::launch_app()?;
     }
 }
 # Ok::<(), std::io::Error>(())
 ```
 
-Set `FSK_APP_PATH` while testing an app outside `/Applications`.
+Later, when your application no longer needs the extension:
+
+```rust
+let removed = fsk::uninstall_app()?;
+println!("FSK app removed: {removed}");
+# Ok::<(), std::io::Error>(())
+```
+
+The default download uses the public GitHub release for this repository. If the
+release is private, set `GITHUB_TOKEN` or `GH_TOKEN` and the SDK resolves the
+asset through the GitHub API, or set `FSK_RELEASE_BASE_URL` to a mirror that
+serves `{base}/v0.0.9/FSK-v0.0.9.zip`.
+
+The app is installed machine-wide at `/Applications/FSK.app` and shared by every
+process and SDK consumer on the machine. Installation requires an exact version
+match, so a program built against an older SDK can replace (downgrade) an app
+installed by a newer SDK. `uninstall_app()` likewise removes the app for all
+consumers, not just the current program. Both operations are serialized across
+cooperating processes with an advisory lock on the destination's parent
+directory; no lock file is created.
+
+Set `FSK_APP_PATH` to the full path of an `.app` bundle (for example
+`/Applications/FSK.app`) while testing an app outside `/Applications`. All four
+helpers — install, authorization status, launch, and uninstall — require a full
+bundle path; it is not a directory that contains the app. Uninstall removes
+directory bundles only when their `CFBundleIdentifier` is `dev.specta.fsk`
+(symlinks at the destination are removed without following them, and any other
+file or directory is refused), and it always refuses to delete a mount point.
 
 ### Windows
 

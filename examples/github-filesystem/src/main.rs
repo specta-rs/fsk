@@ -2,7 +2,7 @@ mod fs;
 
 use fsk::MountSession;
 #[cfg(target_os = "macos")]
-use fsk::{AuthorizationStatus, authorization_status, open_authorization_app};
+use fsk::{AuthorizationStatus, authorization_status, launch_app};
 use std::{
     env, io,
     path::PathBuf,
@@ -176,7 +176,7 @@ fn check_platform_authorization() -> io::Result<()> {
     match authorization_status()? {
         AuthorizationStatus::Authorized => Ok(()),
         AuthorizationStatus::NeedsApproval => {
-            open_authorization_app()?;
+            launch_app()?;
             Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "enable FSK in the window that opened, then run this command again",
