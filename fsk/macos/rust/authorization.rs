@@ -75,8 +75,9 @@ pub enum AuthorizationStatus {
 /// `{base}/v{version}/FSK-v{version}.zip`. Without either, the release must be
 /// publicly downloadable.
 ///
-/// The destination is only replaced when it is an existing `FSK.app` bundle;
-/// an unrelated directory or file is refused instead of being deleted.
+/// The destination is only replaced when it is an existing `FSK.app` bundle or
+/// a symlink; an unrelated directory or file is refused instead of being
+/// deleted.
 ///
 /// Concurrent installations and uninstalls are serialized in this process and,
 /// through an exclusive advisory lock on the destination's parent directory,
@@ -274,6 +275,7 @@ fn install_from_release(temporary: &Path, destination: &Path) -> io::Result<()> 
     )?;
 
     let source = extracted.join("FSK.app");
+    require_real_directory(&source)?;
     validate_app(&source, APP_VERSION)?;
 
     // The destination was validated in `download_and_install_app`, so it has a
@@ -294,7 +296,9 @@ fn install_from_release(temporary: &Path, destination: &Path) -> io::Result<()> 
     }
 
     // The bytes that get swapped into place must be the bytes we validated.
-    if let Err(error) = validate_app(&staged_app, APP_VERSION) {
+    let stage_check =
+        require_real_directory(&staged_app).and_then(|()| validate_app(&staged_app, APP_VERSION));
+    if let Err(error) = stage_check {
         let _ = remove_path(&staging);
         return Err(error);
     }
@@ -322,20 +326,32 @@ fn create_staging_directory(staging: &Path) -> io::Result<()> {
 }
 
 fn download_release(temporary: &Path, archive: &Path, tag: &str) -> io::Result<()> {
-    if let Some(base) = env::var_os("FSK_RELEASE_BASE_URL") {
-        let base = base.to_string_lossy();
-        let url = format!("{}/{tag}/FSK-{tag}.zip", base.trim_end_matches('/'));
-        return run(curl_download(archive).arg(url), "download FSK.app");
+    if let Some(base) = env::var("FSK_RELEASE_BASE_URL")
+        .ok()
+        .map(|base| base.trim().to_owned())
+        .filter(|base| !base.is_empty())
+    {
+        return run(
+            curl_download(archive).arg(mirror_url(&base, tag)),
+            "download FSK.app",
+        );
     }
     if let Some(token) = github_token() {
         return download_release_with_token(temporary, archive, tag, &token);
     }
-    let url = format!("{RELEASE_BASE_URL}/{tag}/FSK-{tag}.zip");
-    run(curl_download(archive).arg(url), "download FSK.app").map_err(|error| {
+    run(curl_download(archive).arg(public_release_url(tag)), "download FSK.app").map_err(|error| {
         io::Error::other(format!(
             "{error}. FSK.app releases must be publicly downloadable; for a private repository set GITHUB_TOKEN or FSK_RELEASE_BASE_URL"
         ))
     })
+}
+
+fn public_release_url(tag: &str) -> String {
+    format!("{RELEASE_BASE_URL}/{tag}/FSK-{tag}.zip")
+}
+
+fn mirror_url(base: &str, tag: &str) -> String {
+    format!("{}/{tag}/FSK-{tag}.zip", base.trim_end_matches('/'))
 }
 
 fn curl_download(archive: &Path) -> Command {
@@ -726,6 +742,17 @@ fn is_stale(created: SystemTime) -> bool {
         .is_ok_and(|age| age > STALE_ENTRY_AGE)
 }
 
+fn require_real_directory(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a real directory", path.display()),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_app(app: &Path, expected_version: &str) -> io::Result<()> {
     if app_version(app)?.as_deref() != Some(expected_version) {
         return Err(io::Error::new(
@@ -802,9 +829,11 @@ fn signing_identity_matches(display: &str) -> bool {
     identifier == Some(APP_BUNDLE_IDENTIFIER) && team_identifier == Some(APP_TEAM_IDENTIFIER)
 }
 
-/// Check that a destination is an FSK app bundle without requiring it to be
-/// current or correctly signed. This gates destructive operations so a
-/// misconfigured `FSK_APP_PATH` cannot remove an unrelated directory.
+/// Check that a destination is an FSK app bundle or a symlink. Symlinks are
+/// treated as removable links and are never followed by destructive
+/// operations. A directory must contain the app executable and a readable
+/// `CFBundleIdentifier` so a misconfigured `FSK_APP_PATH` cannot remove an
+/// unrelated directory.
 fn is_fsk_app(app: &Path) -> io::Result<bool> {
     let metadata = match fs::symlink_metadata(app) {
         Ok(metadata) => metadata,
@@ -818,21 +847,24 @@ fn is_fsk_app(app: &Path) -> io::Result<bool> {
     if !metadata.is_dir() || !app.join(APP_EXECUTABLE).is_file() {
         return Ok(false);
     }
-    Ok(app_bundle_identifier(app)?.as_deref() == Some(APP_BUNDLE_IDENTIFIER))
+    // A malformed or missing Info.plist is not a usable FSK app. Treat it as
+    // non-matching so the caller refuses instead of deleting the directory.
+    Ok(app_bundle_identifier(app).ok().flatten().as_deref() == Some(APP_BUNDLE_IDENTIFIER))
 }
 
 fn uninstall_app_at(app: &Path) -> io::Result<bool> {
-    let metadata = match fs::symlink_metadata(app) {
+    let app = normalize_app_path(app)?;
+    let metadata = match fs::symlink_metadata(&app) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(fs_error("inspect", app, &error)),
+        Err(error) => return Err(fs_error("inspect", &app, &error)),
     };
     if metadata.file_type().is_symlink() {
         // Remove the link itself, never its target.
-        fs::remove_file(app).map_err(|error| fs_error("remove", app, &error))?;
+        fs::remove_file(&app).map_err(|error| fs_error("remove", &app, &error))?;
         return Ok(true);
     }
-    if !is_fsk_app(app)? {
+    if !is_fsk_app(&app)? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -843,7 +875,7 @@ fn uninstall_app_at(app: &Path) -> io::Result<bool> {
     }
     // Refuse to recursively delete a mounted volume that happens to be named
     // like the app; a real bundle lives on its parent's device.
-    let parent = destination_parent(app)?;
+    let parent = destination_parent(&app)?;
     let parent_device = fs::metadata(parent)
         .map_err(|error| fs_error("inspect", parent, &error))?
         .dev();
@@ -856,7 +888,7 @@ fn uninstall_app_at(app: &Path) -> io::Result<bool> {
             ),
         ));
     }
-    fs::remove_dir_all(app).map_err(|error| fs_error("remove", app, &error))?;
+    fs::remove_dir_all(&app).map_err(|error| fs_error("remove", &app, &error))?;
     Ok(true)
 }
 
@@ -985,10 +1017,12 @@ fn fs_error(operation: &str, path: &Path, error: &io::Error) -> io::Error {
 }
 
 fn app_path() -> io::Result<PathBuf> {
-    let path = env::var_os("FSK_APP_PATH").map_or_else(
-        || Path::new("/Applications/FSK.app").to_owned(),
-        PathBuf::from,
-    );
+    let path = env::var_os("FSK_APP_PATH")
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+        .map_or_else(
+            || Path::new("/Applications/FSK.app").to_owned(),
+            PathBuf::from,
+        );
     normalize_app_path(&path)
 }
 
@@ -1640,6 +1674,91 @@ TeamIdentifier=68994Z5PT3
 
         assert!(uninstall_app_at(&app).unwrap());
         assert!(target.exists());
+        assert!(!app.exists());
+    }
+
+    #[test]
+    fn release_urls_use_the_release_tag_and_asset_name() {
+        assert_eq!(
+            public_release_url("v0.0.9"),
+            "https://github.com/specta-rs/fsk/releases/download/v0.0.9/FSK-v0.0.9.zip"
+        );
+        assert_eq!(
+            mirror_url("https://example.com/fsk/", "v0.0.9"),
+            "https://example.com/fsk/v0.0.9/FSK-v0.0.9.zip"
+        );
+    }
+
+    #[test]
+    fn temporary_directory_is_private() {
+        let directory = temporary_directory().unwrap();
+        assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn token_config_is_private() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = curl_token_config(directory.path(), "token").unwrap();
+        assert_eq!(fs::metadata(&config).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn uninstall_refuses_app_without_info_plist() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("FSK.app");
+        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        fs::write(app.join(APP_EXECUTABLE), b"").unwrap();
+
+        assert!(uninstall_app_at(&app).is_err());
+        assert!(app.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_fsk_app_accepts_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let app = directory.path().join("FSK.app");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &app).unwrap();
+
+        assert!(is_fsk_app(&app).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn require_real_directory_rejects_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(require_real_directory(&link).is_err());
+        assert!(require_real_directory(&target).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_removes_symlink_with_trailing_separator() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let app = directory.path().join("FSK.app");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), b"keep me").unwrap();
+        symlink(&target, &app).unwrap();
+        let app_with_slash = format!("{}/", app.display());
+
+        assert!(uninstall_app_at(Path::new(&app_with_slash)).unwrap());
+        assert!(target.exists());
+        assert_eq!(fs::read(target.join("keep")).unwrap(), b"keep me");
         assert!(!app.exists());
     }
 }
