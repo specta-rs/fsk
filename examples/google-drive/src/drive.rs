@@ -20,8 +20,11 @@ const MAX_BUFFERED_FILE_SIZE: u64 = 256 * 1024 * 1024;
 // whose aliases can multiply exponentially. Bound both the depth of a single
 // alias path and the total number of aliases one walk may create; realistic
 // trees stay well below these limits, while pathological shortcut graphs stop
-// quickly instead of exhausting memory.
-const MAX_ALIAS_DEPTH: usize = 64;
+// quickly instead of exhausting memory. These bounds only apply to repeated
+// mounts (aliases); the first mount of every remote file is always created.
+// A shortcut stores both its own id and its target's id on the path, so allow
+// enough room for a legitimate deep tree to also carry aliases.
+const MAX_ALIAS_DEPTH: usize = 256;
 const MAX_ALIAS_NODES: usize = 10_000;
 
 fn deserialize_u64_string<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
@@ -437,6 +440,20 @@ impl GoogleDrive {
         self.expand_tree_aliases(&mut ids, &mut ancestry, files);
     }
 
+    #[cfg(test)]
+    fn add_tree_with_limits(
+        &mut self,
+        root_inode: u64,
+        root_id: &str,
+        files: &[DriveFile],
+        max_nodes: usize,
+        max_depth: usize,
+    ) {
+        let mut ids = HashMap::from([(root_id.to_owned(), HashSet::from([root_inode]))]);
+        let mut ancestry = HashMap::from([(root_inode, Vec::new())]);
+        self.expand_tree_aliases_with(&mut ids, &mut ancestry, files, max_nodes, max_depth);
+    }
+
     fn add_shared_tree(&mut self, root_inode: u64, roots: &[DriveFile], files: &[DriveFile]) {
         let mut ids: HashMap<String, HashSet<u64>> = HashMap::new();
         // Every inode created below the "Shared with me" root records the remote
@@ -471,27 +488,37 @@ impl GoogleDrive {
     // `MAX_ALIAS_NODES` additionally stop nested shortcuts and diamond DAGs from
     // multiplying without bound. Keying on the listing id (not the slice index)
     // also keeps a duplicated listing entry from creating a second child.
+    //
+    // The caps apply only to aliases: a mount is an alias when one of the
+    // file's own remote ids is already reachable before the mount, so the first
+    // (and only) inode for each listed file is never counted or truncated.
     fn expand_tree_aliases(
         &mut self,
         ids: &mut HashMap<String, HashSet<u64>>,
         ancestry: &mut HashMap<u64, Vec<String>>,
         files: &[DriveFile],
     ) {
+        self.expand_tree_aliases_with(ids, ancestry, files, MAX_ALIAS_NODES, MAX_ALIAS_DEPTH);
+    }
+
+    fn expand_tree_aliases_with(
+        &mut self,
+        ids: &mut HashMap<String, HashSet<u64>>,
+        ancestry: &mut HashMap<u64, Vec<String>>,
+        files: &[DriveFile],
+        max_nodes: usize,
+        max_depth: usize,
+    ) {
         let mut seen: HashSet<(&str, u64)> = HashSet::new();
-        let mut created = 0_usize;
+        let mut aliases = 0_usize;
+        let mut node_cap_reached = false;
+        let mut depth_cap_reached = false;
         loop {
             let mut added = false;
             for file in files {
                 for parent in tree_parents(file, ids) {
                     if !seen.insert((file.id.as_str(), parent)) {
                         continue;
-                    }
-                    if created >= MAX_ALIAS_NODES {
-                        eprintln!(
-                            "drive: stopping alias expansion after {MAX_ALIAS_NODES} nodes; \
-                             some shared descendants may be omitted"
-                        );
-                        return;
                     }
                     let Some(parent_ancestry) = ancestry.get(&parent) else {
                         continue;
@@ -502,16 +529,43 @@ impl GoogleDrive {
                     if file_ids.iter().any(|id| parent_ancestry.contains(id)) {
                         continue;
                     }
-                    // Do not descend past the configured alias depth.
-                    if parent_ancestry.len() >= MAX_ALIAS_DEPTH {
-                        continue;
+                    // A first mount has no inode for any of the file's remote
+                    // ids yet; only repeated mounts are aliases, and only those
+                    // are bounded.
+                    let alias = file_ids
+                        .iter()
+                        .any(|id| ids.get(id).is_some_and(|inodes| !inodes.is_empty()));
+                    if alias {
+                        // Do not descend past the configured alias depth.
+                        if parent_ancestry.len() >= max_depth {
+                            if !depth_cap_reached {
+                                eprintln!(
+                                    "drive: stopping alias expansion at depth {max_depth}; \
+                                     some duplicate aliases may be omitted"
+                                );
+                                depth_cap_reached = true;
+                            }
+                            continue;
+                        }
+                        if node_cap_reached || aliases >= max_nodes {
+                            if !node_cap_reached {
+                                eprintln!(
+                                    "drive: stopping alias expansion after {max_nodes} aliases; \
+                                     some duplicate aliases may be omitted"
+                                );
+                                node_cap_reached = true;
+                            }
+                            continue;
+                        }
                     }
                     let mut chain = parent_ancestry.clone();
                     chain.extend(file_ids.iter().cloned());
                     let inode = self.add_drive_file(parent, file);
                     ancestry.insert(inode, chain);
                     register_tree_ids(ids, file, &[inode]);
-                    created += 1;
+                    if alias {
+                        aliases += 1;
+                    }
                     added = true;
                 }
             }
@@ -1243,6 +1297,10 @@ mod tests {
         assert_eq!(portable_name("com²"), b"_com\xC2\xB2");
         assert_eq!(portable_name("LPT³"), b"_LPT\xC2\xB3");
         assert_eq!(portable_name("COM10"), b"COM10");
+        // These only share a prefix with a reserved device; they must not be
+        // rewritten by a loose prefix match.
+        assert_eq!(portable_name("COM¹x"), b"COM\xC2\xB9x");
+        assert_eq!(portable_name("CLOCK$foo"), b"CLOCK$foo");
         assert!(names_equal("É".as_bytes(), "é".as_bytes()));
         assert!(names_equal("é".as_bytes(), "e\u{301}".as_bytes()));
     }
@@ -1365,6 +1423,107 @@ mod tests {
     }
 
     #[test]
+    fn first_mounts_are_not_limited_by_the_alias_cap() {
+        // A flat My Drive has one first mount per file and no aliases at all.
+        const FILES: usize = 50;
+
+        let mut filesystem = filesystem();
+        let root = filesystem.add_node(ROOT_INODE, "My Drive", FileType::Directory, 0, None, false);
+        let files: Vec<_> = (0..FILES)
+            .map(|index| {
+                let mut entry = file("text/plain", false);
+                entry.id = format!("id{index}");
+                entry.name = format!("file{index}");
+                entry.parents = vec!["root".to_owned()];
+                entry
+            })
+            .collect();
+
+        // The alias cap is far below the number of files, but none of these
+        // mounts is an alias, so every file still lands in the tree.
+        filesystem.add_tree_with_limits(root, "root", &files, 4, 4);
+
+        assert_eq!(filesystem.children[&root].len(), FILES);
+        assert_eq!(filesystem.nodes.len(), 2 + FILES);
+    }
+
+    #[test]
+    fn alias_expansion_stops_at_the_alias_cap() {
+        // One real folder is mounted first, then every shortcut repeats its
+        // remote id, so these are the only mounts the alias cap may drop.
+        let mut filesystem = filesystem();
+        let root = filesystem.add_node(ROOT_INODE, "My Drive", FileType::Directory, 0, None, false);
+        let mut target = file(FOLDER, false);
+        target.id = "target".to_owned();
+        target.name = "target".to_owned();
+        target.parents = vec!["root".to_owned()];
+        let mut files = vec![target];
+        for index in 0..10 {
+            let mut shortcut = file(SHORTCUT, false);
+            shortcut.id = format!("S{index}");
+            shortcut.name.clone_from(&shortcut.id);
+            shortcut.parents = vec!["root".to_owned()];
+            shortcut.resolved_target = Some(ShortcutTarget {
+                id: "target".to_owned(),
+                mime_type: FOLDER.to_owned(),
+                size: 0,
+                capabilities: Capabilities::default(),
+                version: "1".to_owned(),
+            });
+            files.push(shortcut);
+        }
+
+        filesystem.add_tree_with_limits(root, "root", &files, 3, MAX_ALIAS_DEPTH);
+
+        // Filesystem root, the mounted root, the target, and exactly three
+        // duplicate aliases.
+        assert_eq!(filesystem.nodes.len(), 6);
+        assert_eq!(filesystem.children[&root].len(), 4);
+        assert!(filesystem.lookup(root, b"target").is_ok());
+        for index in 0..3 {
+            assert!(
+                filesystem
+                    .lookup(root, format!("S{index}").as_bytes())
+                    .is_ok()
+            );
+        }
+        assert!(filesystem.lookup(root, b"S3").is_err());
+    }
+
+    #[test]
+    fn plain_deep_trees_are_not_truncated_by_alias_limits() {
+        // The alias limits are far below this chain's depth, but every level is
+        // a first mount, so the whole chain must still be created.
+        const DEPTH: usize = 70;
+
+        let mut filesystem = filesystem();
+        let root = filesystem.add_node(ROOT_INODE, "My Drive", FileType::Directory, 0, None, false);
+        let mut files = Vec::new();
+        for level in 0..DEPTH {
+            let mut folder = file(FOLDER, false);
+            folder.id = format!("F{level}");
+            folder.name.clone_from(&folder.id);
+            folder.parents = vec![if level == 0 {
+                "root".to_owned()
+            } else {
+                format!("F{}", level - 1)
+            }];
+            files.push(folder);
+        }
+
+        filesystem.add_tree_with_limits(root, "root", &files, 4, 4);
+
+        assert_eq!(filesystem.nodes.len(), 2 + DEPTH);
+        let mut parent = root;
+        for level in 0..DEPTH {
+            let (inode, _) = filesystem
+                .lookup(parent, format!("F{level}").as_bytes())
+                .expect("every level is mounted");
+            parent = inode;
+        }
+    }
+
+    #[test]
     fn shortcut_alias_expansion_is_bounded() {
         // Each folder contains both its child folder and a shortcut to that
         // child, so the unbounded walk would create roughly 2^20 aliases.
@@ -1405,22 +1564,19 @@ mod tests {
             files.push(shortcut);
         }
 
-        let start = std::time::Instant::now();
         filesystem.add_shared_tree(shared, &[root], &files);
-        let elapsed = start.elapsed();
 
-        // The filesystem root and the "Shared with me" node, one directly
-        // shared alias, and at most the node cap.
-        assert!(filesystem.nodes.len() <= MAX_ALIAS_NODES + 3);
-        assert!(filesystem.nodes.len() > 1_000);
-        assert!(elapsed < std::time::Duration::from_secs(10));
+        // Filesystem root, "Shared with me", the directly shared root, one
+        // first mount per level, and exactly the alias cap's worth of aliases.
+        assert_eq!(filesystem.nodes.len(), 3 + DEPTH + MAX_ALIAS_NODES);
     }
 
     #[test]
     fn alias_depth_is_bounded() {
-        // A linear chain long enough to pass the depth limit but far too small
-        // to hit the node limit, so this isolates the depth bound.
-        const DEPTH: usize = 70;
+        // The real folder chain must stay complete; only a chain of shortcuts
+        // to already-mounted folders runs into the alias depth limit.
+        const FOLDERS: usize = 10;
+        const MAX_DEPTH: usize = 6;
 
         let mut filesystem = filesystem();
         let shared = filesystem.add_node(
@@ -1432,25 +1588,53 @@ mod tests {
             false,
         );
 
-        let mut root = file(FOLDER, false);
-        root.id = "F0".to_owned();
-        root.name = "F0".to_owned();
-        let mut files = vec![root.clone()];
-        for level in 0..DEPTH {
-            let id = format!("F{}", level + 1);
-            let mut child = file(FOLDER, false);
-            child.id.clone_from(&id);
-            child.name = id;
-            child.parents = vec![format!("F{level}")];
-            files.push(child);
+        let mut files = Vec::new();
+        for index in 0..FOLDERS {
+            let mut folder = file(FOLDER, false);
+            folder.id = format!("A{index}");
+            folder.name.clone_from(&folder.id);
+            folder.parents = vec!["F0".to_owned()];
+            files.push(folder);
+        }
+        for index in 0..FOLDERS {
+            let mut shortcut = file(SHORTCUT, false);
+            shortcut.id = format!("S{index}");
+            shortcut.name.clone_from(&shortcut.id);
+            shortcut.parents = vec![if index == 0 {
+                "F0".to_owned()
+            } else {
+                format!("S{}", index - 1)
+            }];
+            shortcut.resolved_target = Some(ShortcutTarget {
+                id: format!("A{index}"),
+                mime_type: FOLDER.to_owned(),
+                size: 0,
+                capabilities: Capabilities::default(),
+                version: "1".to_owned(),
+            });
+            files.push(shortcut);
         }
 
-        filesystem.add_shared_tree(shared, &[root], &files);
+        // Treat the shared root inode as the remote folder `F0`, then run the
+        // walk with a depth limit small enough to truncate aliases only.
+        filesystem.add_tree_with_limits(shared, "F0", &files, MAX_ALIAS_NODES, MAX_DEPTH);
 
-        // Filesystem root, "Shared with me", and one alias per level up to the
-        // depth limit. The first directly shared alias already counts as depth
-        // one because its own remote id is on the path.
-        assert_eq!(filesystem.nodes.len(), 2 + MAX_ALIAS_DEPTH);
+        // Every real folder is a first mount and survives.
+        for index in 0..FOLDERS {
+            assert!(
+                filesystem
+                    .lookup(shared, format!("A{index}").as_bytes())
+                    .is_ok()
+            );
+        }
+        // A shortcut stores its own id and its target's id, so the chain grows
+        // by two per level. Three aliases fit below the depth limit; the fourth
+        // is truncated.
+        let (s0, _) = filesystem.lookup(shared, b"S0").expect("first alias");
+        let (s1, _) = filesystem.lookup(s0, b"S1").expect("second alias");
+        let (s2, _) = filesystem.lookup(s1, b"S2").expect("third alias");
+        assert!(filesystem.lookup(s2, b"S3").is_err());
+        assert_eq!(filesystem.nodes.len(), 2 + FOLDERS + 3);
     }
 
     #[test]
