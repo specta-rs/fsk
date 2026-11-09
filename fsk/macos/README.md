@@ -2,7 +2,8 @@
 
 `FSK.app` is the install-once companion application that hosts the FSKit
 extension. It is a setup utility, not a background service: it opens the File
-System Extensions pane, reports whether the extension is enabled, and quits.
+System Extensions pane, reports whether the extension is enabled, and waits for
+the user to choose **Done** or **Quit**.
 
 ## Setup flow
 
@@ -10,10 +11,11 @@ System Extensions pane, reports whether the extension is enabled, and quits.
    `/Applications`).
 2. The embedding application calls `fsk::launch_app()` when
    `fsk::authorization_status()` is not `Authorized`.
-3. `FSK.app` shows a single permission row. **Open Settings** calls
-   `FSClient.openFileSystemExtensionsSettings()`, which opens
+3. `FSK.app` shows a single permission row. **Open Settings** opens
    **System Settings → General → Login Items & Extensions → File System
-   Extensions** directly.
+   Extensions** directly. On macOS 27 it uses
+   `FSClient.openFileSystemExtensionsSettings()`; on macOS 26 it opens the same
+   pane with the File System Extensions deep link.
 4. The row updates as the user flips the FSK switch. When the extension is
    enabled, **Done** quits the app.
 

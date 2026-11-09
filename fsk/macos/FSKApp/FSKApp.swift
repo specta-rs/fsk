@@ -18,7 +18,7 @@ struct FSKApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("FSK Setup") {
+        Window("FSK Setup", id: "setup") {
             AuthorizationView(model: model)
         }
         .defaultSize(width: 440, height: 330)
@@ -30,8 +30,19 @@ struct FSKApp: App {
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // FSK is a background setup utility, so LSUIElement keeps it out of the
-        // Dock. The setup window still needs to come forward when it opens.
-        NSApp.activate()
+        // Dock. macOS may refuse a focus request from a newly launched
+        // background app for a couple of seconds, so retry until the setup
+        // window is actually key instead of giving up after one attempt.
+        Task { @MainActor in
+            for _ in 0..<12 {
+                NSApp.activate(ignoringOtherApps: true)
+                NSApp.windows.first?.makeKeyAndOrderFront(nil)
+                if NSApp.isActive {
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -58,9 +69,18 @@ private final class AuthorizationModel {
     func monitor() async {
         await refresh()
         while !Task.isCancelled {
-            try? await Task.sleep(for: .seconds(1))
+            do {
+                try await Task.sleep(for: .seconds(1))
+            } catch {
+                return
+            }
             await refresh()
         }
+    }
+
+    func retry() {
+        status = .checking
+        Task { await refresh() }
     }
 
     func refresh() async {
@@ -85,7 +105,9 @@ private final class AuthorizationModel {
         let url = URL(
             string: "x-apple.systempreferences:com.apple.ExtensionsPreferences?extensionPointIdentifier=com.apple.fskit.fsmodule"
         )!
-        NSWorkspace.shared.open(url)
+        if !NSWorkspace.shared.open(url) {
+            status = .failed("Could not open System Settings.")
+        }
     }
 
     func revealApp() {
@@ -125,6 +147,10 @@ private struct AuthorizationView: View {
         .padding(24)
         .frame(width: 440)
         .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear {
+            NSApp.activate(ignoringOtherApps: true)
+            NSApp.windows.first?.makeKeyAndOrderFront(nil)
+        }
         .task {
             await model.monitor()
         }
@@ -140,6 +166,7 @@ private struct AuthorizationView: View {
                 .foregroundStyle(.white)
                 .frame(width: 52, height: 52)
                 .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 13))
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 Text("FSK Setup")
                     .font(.title2.bold())
@@ -156,6 +183,7 @@ private struct AuthorizationView: View {
                 .font(.title3)
                 .foregroundStyle(statusColor)
                 .frame(width: 28)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 Text("File System Extension")
                     .font(.headline)
@@ -191,7 +219,7 @@ private struct AuthorizationView: View {
                 .foregroundStyle(.red)
         case .failed:
             Button("Retry") {
-                Task { await model.refresh() }
+                model.retry()
             }
         }
     }
@@ -205,12 +233,6 @@ private struct AuthorizationView: View {
             }
             .buttonStyle(.borderedProminent)
             .keyboardShortcut(.defaultAction)
-        case .checking:
-            Button("Open Settings") {
-                model.openSettings()
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(true)
         default:
             Button("Open Settings") {
                 model.openSettings()
