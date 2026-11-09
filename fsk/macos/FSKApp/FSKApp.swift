@@ -97,13 +97,11 @@ private final class AuthorizationModel {
         }
     }
 
-    /// Open the exact File System Extensions pane. FSKit exposes this action
-    /// so the app never has to guess at a System Settings URL.
+    /// Open the exact File System Extensions pane. The macOS 26 SDK does not
+    /// expose `FSClient.openFileSystemExtensionsSettings()`, so use the
+    /// documented pane identifier that works on both macOS 26 and 27.
     func openSettings() {
         actionError = nil
-        if #available(macOS 27.0, *), FSClient.shared.openFileSystemExtensionsSettings() {
-            return
-        }
         let url = URL(
             string: "x-apple.systempreferences:com.apple.ExtensionsPreferences?extensionPointIdentifier=com.apple.fskit.fsmodule"
         )!

@@ -13,9 +13,9 @@ the user to choose **Done** or **Quit**.
    `fsk::authorization_status()` is not `Authorized`.
 3. `FSK.app` shows a single permission row. **Open Settings** opens
    **System Settings → General → Login Items & Extensions → File System
-   Extensions** directly. On macOS 27 it uses
-   `FSClient.openFileSystemExtensionsSettings()`; on macOS 26 it opens the same
-   pane with the File System Extensions deep link.
+   Extensions** directly with the File System Extensions pane identifier. The
+   macOS 26 SDK does not expose `FSClient.openFileSystemExtensionsSettings()`,
+   so the same deep link is used on macOS 26 and 27.
 4. The row updates as the user flips the FSK switch. When the extension is
    enabled, **Done** quits the app.
 
