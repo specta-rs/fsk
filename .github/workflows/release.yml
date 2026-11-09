@@ -171,6 +171,25 @@ jobs:
             exit 1
           fi
           xcrun stapler staple "$RUNNER_TEMP/export/FSK.app"
+
+      - name: Verify Gatekeeper assessment and stapled ticket
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/export/FSK.app"
+
+          # The ticket must be attached to the bundle we are about to ship.
+          xcrun stapler validate "$app"
+
+          # Ask Gatekeeper the same question a user's Mac will ask. A stapled
+          # notarization ticket should make this succeed without a network
+          # round-trip, and the source proves it was not just locally signed.
+          assessment="$(spctl --assess --type execute --verbose=4 "$app" 2>&1)"
+          printf '%s\n' "$assessment"
+          grep -q '^source=Notarized Developer ID$' <<< "$assessment"
+
+      - name: Package application
+        run: |
+          set -euo pipefail
           ditto -c -k --keepParent "$RUNNER_TEMP/export/FSK.app" \
             "$RUNNER_TEMP/FSK-${GITHUB_REF_NAME}.zip"
 
