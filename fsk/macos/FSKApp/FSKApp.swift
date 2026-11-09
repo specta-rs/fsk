@@ -62,6 +62,7 @@ private final class AuthorizationModel {
     }
 
     var status: Status = .checking
+    var actionError: String?
 
     /// Keep the permission row live while the app is open. FSKit does not
     /// publish a change notification when the user flips the System Settings
@@ -99,6 +100,7 @@ private final class AuthorizationModel {
     /// Open the exact File System Extensions pane. FSKit exposes this action
     /// so the app never has to guess at a System Settings URL.
     func openSettings() {
+        actionError = nil
         if #available(macOS 27.0, *), FSClient.shared.openFileSystemExtensionsSettings() {
             return
         }
@@ -106,7 +108,7 @@ private final class AuthorizationModel {
             string: "x-apple.systempreferences:com.apple.ExtensionsPreferences?extensionPointIdentifier=com.apple.fskit.fsmodule"
         )!
         if !NSWorkspace.shared.open(url) {
-            status = .failed("Could not open System Settings.")
+            actionError = "Could not open System Settings."
         }
     }
 
@@ -126,6 +128,12 @@ private struct AuthorizationView: View {
         VStack(alignment: .leading, spacing: 20) {
             header
             permissionCard
+            if let actionError = model.actionError {
+                Text(actionError)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Spacer(minLength: 0)
             HStack(spacing: 10) {
                 Button("Quit") {
