@@ -91,7 +91,7 @@ pub enum AuthorizationStatus {
 /// Returns an error if the release cannot be downloaded, unpacked, validated,
 /// or installed. Installing in the chosen destination may require permission.
 /// Returns [`io::ErrorKind::InvalidInput`] if `FSK_APP_PATH` is relative,
-/// contains `..`, or names something that is not an `FSK.app` bundle.
+/// contains `..`, or does not name a folder ending in `.app`.
 pub fn download_and_install_app() -> io::Result<AppInstallOutcome> {
     let _mutation = APP_MUTATION.lock();
     let destination = app_path()?;
@@ -170,7 +170,11 @@ pub fn uninstall_app() -> io::Result<bool> {
     let _lock = AppLock::acquire(parent)?;
     let removed = uninstall_app_at(&app)?;
     let _ = cleanup_stale_entries(parent, name, "install");
-    let _ = cleanup_stale_entries(parent, name, "backup");
+    // Remove every backup for this destination, not just stale ones. A recent
+    // backup would otherwise be restored by a later install, making the
+    // uninstall non-durable. The parent lock means no cooperating process can
+    // own one right now.
+    let _ = remove_matching_entries(parent, name, "backup");
     Ok(removed)
 }
 
@@ -364,8 +368,7 @@ fn curl_download(archive: &Path) -> Command {
 fn github_token() -> Option<String> {
     ["GITHUB_TOKEN", "GH_TOKEN"]
         .into_iter()
-        .find_map(|key| env::var(key).ok())
-        .filter(|token| !token.trim().is_empty())
+        .find_map(|key| env::var(key).ok().filter(|token| !token.trim().is_empty()))
 }
 
 fn download_release_with_token(
@@ -378,6 +381,10 @@ fn download_release_with_token(
     let metadata = Command::new("/usr/bin/curl")
         .args([
             "--disable",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
             "--fail",
             "--location",
             "--silent",
@@ -626,6 +633,26 @@ fn cleanup_stale_entries(parent: &Path, name: &str, kind: &str) -> io::Result<()
     Ok(())
 }
 
+fn remove_matching_entries(parent: &Path, name: &str, kind: &str) -> io::Result<()> {
+    let prefix = entry_prefix(name, kind);
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(fs_error("read", parent, &error)),
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if file_name.starts_with(&prefix) {
+            let _ = remove_path(&entry.path());
+        }
+    }
+    Ok(())
+}
+
 fn newest_entry(parent: &Path, name: &str, kind: &str) -> io::Result<Option<PathBuf>> {
     let prefix = entry_prefix(name, kind);
     let entries = match fs::read_dir(parent) {
@@ -740,10 +767,10 @@ fn check_signing_identity(app: &Path) -> io::Result<()> {
         ));
     }
     let display = String::from_utf8_lossy(&output.stderr);
-    let (identifier, team_identifier) = signing_identity(&display);
-    if identifier == Some(APP_BUNDLE_IDENTIFIER) && team_identifier == Some(APP_TEAM_IDENTIFIER) {
+    if signing_identity_matches(&display) {
         Ok(())
     } else {
+        let (identifier, team_identifier) = signing_identity(&display);
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -770,7 +797,6 @@ fn signing_identity(display: &str) -> (Option<&str>, Option<&str>) {
     (identifier, team_identifier)
 }
 
-#[cfg(test)]
 fn signing_identity_matches(display: &str) -> bool {
     let (identifier, team_identifier) = signing_identity(display);
     identifier == Some(APP_BUNDLE_IDENTIFIER) && team_identifier == Some(APP_TEAM_IDENTIFIER)
@@ -967,8 +993,9 @@ fn app_path() -> io::Result<PathBuf> {
 }
 
 /// Normalize `FSK_APP_PATH` before any metadata, rename, or removal operation.
-/// Trailing separators and `.` components are removed, and `..` is rejected so
-/// the resolved path cannot escape the directory the caller chose.
+/// Trailing separators and `.` components are removed, `..` is rejected so the
+/// resolved path cannot escape the directory the caller chose, and the final
+/// component must be a folder ending in `.app`.
 fn normalize_app_path(path: &Path) -> io::Result<PathBuf> {
     if !path.is_absolute() {
         return Err(io::Error::new(
@@ -986,10 +1013,19 @@ fn normalize_app_path(path: &Path) -> io::Result<PathBuf> {
         ));
     }
     let normalized: PathBuf = path.components().collect();
-    if normalized.file_name().is_none() {
+    let Some(file_name) = normalized.file_name().and_then(|name| name.to_str()) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "FSK_APP_PATH must name an FSK.app bundle",
+        ));
+    };
+    let is_app_bundle = normalized
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("app"));
+    if !is_app_bundle || file_name.len() <= ".app".len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "FSK_APP_PATH must name a folder ending in `.app`",
         ));
     }
     Ok(normalized)
@@ -1069,6 +1105,17 @@ mod tests {
         assert!(normalize_app_path(Path::new("FSK.app")).is_err());
         assert!(normalize_app_path(Path::new("/Applications/../FSK.app")).is_err());
         assert!(normalize_app_path(Path::new("/")).is_err());
+        assert!(normalize_app_path(Path::new("/Applications")).is_err());
+        assert!(normalize_app_path(Path::new("/Applications/FSK")).is_err());
+        assert!(normalize_app_path(Path::new("/Applications/.app")).is_err());
+    }
+
+    #[test]
+    fn normalize_app_path_accepts_app_bundles_case_insensitively() {
+        assert_eq!(
+            normalize_app_path(Path::new("/Applications/FSK.APP")).unwrap(),
+            Path::new("/Applications/FSK.APP")
+        );
     }
 
     #[test]
@@ -1107,6 +1154,26 @@ TeamIdentifier=68994Z5PT3
 
         assert!(uninstall_app_at(&app).unwrap());
         assert!(!uninstall_app_at(&app).unwrap());
+    }
+
+    #[test]
+    fn uninstall_cleanup_removes_all_destination_backups() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path();
+        // A recent backup must also go: otherwise a later install would restore
+        // it and the uninstall would not be durable.
+        let young = new_entry_path(parent, "FSK.app", "backup");
+        fs::create_dir(&young).unwrap();
+        let legacy = parent.join(".FSK.app.backup-legacy");
+        fs::create_dir(&legacy).unwrap();
+        let unrelated = parent.join("Safari.app");
+        fs::create_dir(&unrelated).unwrap();
+
+        remove_matching_entries(parent, "FSK.app", "backup").unwrap();
+
+        assert!(!young.exists());
+        assert!(!legacy.exists());
+        assert!(unrelated.exists());
     }
 
     #[test]
