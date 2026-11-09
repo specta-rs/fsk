@@ -1,5 +1,5 @@
 import AppKit
-import ExtensionKit
+import Combine
 import FSKit
 // FSK's install-once macOS authorization application.
 import SwiftUI
@@ -8,6 +8,7 @@ private let extensionIdentifier = "dev.specta.fsk.extension"
 
 @main
 struct FSKApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model = AuthorizationModel()
 
     init() {
@@ -17,22 +18,42 @@ struct FSKApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        Window("FSK Setup", id: "setup") {
             AuthorizationView(model: model)
-                .frame(minWidth: 660, idealWidth: 720, minHeight: 570, idealHeight: 640)
-                .task {
-                    await model.refresh()
-                }
         }
-        .defaultSize(width: 720, height: 640)
-        .windowResizability(.contentMinSize)
+        .defaultSize(width: 440, height: 330)
+        .defaultPosition(.center)
+        .windowResizability(.contentSize)
+    }
+}
+
+private final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // FSK is a background setup utility, so LSUIElement keeps it out of the
+        // Dock. macOS may refuse a focus request from a newly launched
+        // background app for a couple of seconds, so retry until the setup
+        // window is actually key instead of giving up after one attempt.
+        Task { @MainActor in
+            for _ in 0..<12 {
+                NSApp.activate(ignoringOtherApps: true)
+                NSApp.windows.first?.makeKeyAndOrderFront(nil)
+                if NSApp.isActive {
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
     }
 }
 
 @MainActor
 @Observable
 private final class AuthorizationModel {
-    enum Status {
+    enum Status: Equatable {
         case checking
         case notInstalled
         case needsApproval
@@ -41,9 +62,29 @@ private final class AuthorizationModel {
     }
 
     var status: Status = .checking
+    var actionError: String?
+
+    /// Keep the permission row live while the app is open. FSKit does not
+    /// publish a change notification when the user flips the System Settings
+    /// switch, so a short poll is the reliable way to mirror that state.
+    func monitor() async {
+        await refresh()
+        while !Task.isCancelled {
+            do {
+                try await Task.sleep(for: .seconds(1))
+            } catch {
+                return
+            }
+            await refresh()
+        }
+    }
+
+    func retry() {
+        status = .checking
+        Task { await refresh() }
+    }
 
     func refresh() async {
-        status = .checking
         do {
             let modules = try await FSClient.shared.installedExtensions
             guard let module = modules.first(where: { $0.bundleIdentifier == extensionIdentifier }) else {
@@ -56,11 +97,25 @@ private final class AuthorizationModel {
         }
     }
 
-    func openSystemSettings() {
+    /// Open the exact File System Extensions pane. The macOS 26 SDK does not
+    /// expose `FSClient.openFileSystemExtensionsSettings()`, so use the
+    /// documented pane identifier that works on both macOS 26 and 27.
+    func openSettings() {
+        actionError = nil
         let url = URL(
-            string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension"
+            string: "x-apple.systempreferences:com.apple.ExtensionsPreferences?extensionPointIdentifier=com.apple.fskit.fsmodule"
         )!
-        NSWorkspace.shared.open(url)
+        if !NSWorkspace.shared.open(url) {
+            actionError = "Could not open System Settings."
+        }
+    }
+
+    func revealApp() {
+        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+    }
+
+    func quit() {
+        NSApplication.shared.terminate(nil)
     }
 }
 
@@ -68,182 +123,165 @@ private struct AuthorizationView: View {
     let model: AuthorizationModel
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                header
-                statusCard
-                if case .authorized = model.status {
-                    readyCard
-                } else {
-                    permissionCard
-                    steps
-                }
-                footer
+        VStack(alignment: .leading, spacing: 20) {
+            header
+            permissionCard
+            if let actionError = model.actionError {
+                Text(actionError)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(32)
+            Spacer(minLength: 0)
+            HStack(spacing: 10) {
+                Button("Quit") {
+                    model.quit()
+                }
+                .keyboardShortcut("q", modifiers: .command)
+
+                if case .notInstalled = model.status {
+                    Button("Show FSK.app") {
+                        model.revealApp()
+                    }
+                }
+
+                Spacer()
+                primaryAction
+            }
+            footer
         }
-        .background(
-            LinearGradient(
-                colors: [Color(nsColor: .windowBackgroundColor), Color.accentColor.opacity(0.05)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        )
+        .padding(24)
+        .frame(width: 440)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear {
+            NSApp.activate(ignoringOtherApps: true)
+            NSApp.windows.first?.makeKeyAndOrderFront(nil)
+        }
+        .task {
+            await model.monitor()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await model.refresh() }
+        }
     }
 
     private var header: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 14) {
             Image(systemName: "externaldrive.connected.to.line.below")
-                .font(.system(size: 34, weight: .medium))
+                .font(.system(size: 26, weight: .semibold))
                 .foregroundStyle(.white)
-                .frame(width: 64, height: 64)
-                .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 16))
-            VStack(alignment: .leading, spacing: 4) {
-                Text("FSK")
-                    .font(.largeTitle.bold())
-                Text("One bridge for every Rust filesystem")
-                    .font(.title3)
+                .frame(width: 52, height: 52)
+                .background(Color.accentColor.gradient, in: RoundedRectangle(cornerRadius: 13))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("FSK Setup")
+                    .font(.title2.bold())
+                Text("One-time permission for virtual filesystems")
+                    .font(.callout)
                     .foregroundStyle(.secondary)
             }
         }
     }
 
-    private var statusCard: some View {
-        HStack(spacing: 14) {
-            statusIcon
-                .font(.title2)
-                .frame(width: 36, height: 36)
+    private var permissionCard: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: "externaldrive.badge.checkmark")
+                .font(.title3)
+                .foregroundStyle(statusColor)
+                .frame(width: 28)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
-                Text(statusTitle).font(.headline)
-                Text(statusDetail).foregroundStyle(.secondary)
+                Text("File System Extension")
+                    .font(.headline)
+                Text(statusDetail)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            Spacer()
-            Button {
-                Task { await model.refresh() }
-            } label: {
-                Label("Check Again", systemImage: "arrow.clockwise")
-            }
-            .disabled(isChecking)
+            Spacer(minLength: 8)
+            statusBadge
         }
-        .padding(18)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .padding(14)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
     @ViewBuilder
-    private var permissionCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Allow the file system extension")
-                .font(.headline)
-            Text("Use the macOS control below to enable FSK. This permission lets the signed bridge receive filesystem requests; your Rust programs and their data stay separate.")
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            ExtensionBrowser()
-                .frame(height: 104)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).stroke(.separator))
+    private var statusBadge: some View {
+        switch model.status {
+        case .checking:
+            ProgressView()
+                .controlSize(.small)
+        case .authorized:
+            Text("Enabled")
+                .font(.callout.weight(.medium))
+                .foregroundStyle(.green)
+        case .needsApproval:
+            Text("Required")
+                .font(.callout.weight(.medium))
+                .foregroundStyle(.orange)
+        case .notInstalled:
+            Text("Missing")
+                .font(.callout.weight(.medium))
+                .foregroundStyle(.red)
+        case .failed:
+            Button("Retry") {
+                model.retry()
+            }
         }
     }
 
-    private var steps: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("If macOS asks you to use System Settings")
-                .font(.headline)
-            StepRow(number: 1, text: "Open Login Items & Extensions.")
-            StepRow(number: 2, text: "Open File System Extensions and enable FSK.")
-            StepRow(number: 3, text: "Return here and choose Check Again.")
-            Button {
-                model.openSystemSettings()
-            } label: {
-                Label("Open System Settings", systemImage: "gear")
+    @ViewBuilder
+    private var primaryAction: some View {
+        switch model.status {
+        case .authorized:
+            Button("Done") {
+                model.quit()
             }
             .buttonStyle(.borderedProminent)
+            .keyboardShortcut(.defaultAction)
+        default:
+            Button("Open Settings") {
+                model.openSettings()
+            }
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut(.defaultAction)
         }
-    }
-
-    private var readyCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label("Ready for mounts", systemImage: "checkmark.seal.fill")
-                .font(.title3.bold())
-                .foregroundStyle(.green)
-            Text("You can close this window. Start any Rust program using `MountSession`; FSK will connect it to the installed extension for the lifetime of that program.")
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(18)
-        .background(Color.green.opacity(0.09), in: RoundedRectangle(cornerRadius: 16))
     }
 
     private var footer: some View {
-        Text("FSK uses a private, authenticated Unix socket for each mount. Closing the Rust program unmounts its volume and removes the socket.")
+        Text("FSK.app only opens for setup. Enable the extension once; every Rust mount reuses it.")
             .font(.caption)
             .foregroundStyle(.tertiary)
             .fixedSize(horizontal: false, vertical: true)
     }
 
-    @ViewBuilder
-    private var statusIcon: some View {
+    private var statusColor: Color {
         switch model.status {
         case .checking:
-            ProgressView()
+            .secondary
         case .authorized:
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            .green
         case .needsApproval:
-            Image(systemName: "exclamationmark.shield.fill").foregroundStyle(.orange)
+            .orange
         case .notInstalled, .failed:
-            Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
-        }
-    }
-
-    private var statusTitle: String {
-        switch model.status {
-        case .checking: "Checking permission…"
-        case .authorized: "Extension enabled"
-        case .needsApproval: "Permission required"
-        case .notInstalled: "Extension not installed"
-        case .failed: "Couldn’t check permission"
+            .red
         }
     }
 
     private var statusDetail: String {
         switch model.status {
-        case .checking: "Asking FSKit for the current status."
-        case .authorized: "macOS is ready to mount FSK filesystems."
-        case .needsApproval: "Enable FSK once to use it from any Rust program."
-        case .notInstalled: "Move FSK.app to Applications, then open it again."
-        case let .failed(message): message
+        case .checking:
+            "Checking with macOS…"
+        case .authorized:
+            "Enabled. FSK can mount filesystems."
+        case .needsApproval:
+            "Turn on FSK under File System Extensions."
+        case .notInstalled:
+            "Not registered. Keep FSK.app in Applications, then open it again."
+        case let .failed(message):
+            message
         }
     }
-
-    private var isChecking: Bool {
-        if case .checking = model.status { true } else { false }
-    }
-}
-
-private struct StepRow: View {
-    let number: Int
-    let text: String
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Text("\(number)")
-                .font(.caption.bold())
-                .foregroundStyle(.white)
-                .frame(width: 24, height: 24)
-                .background(Color.accentColor, in: Circle())
-            Text(text)
-        }
-    }
-}
-
-private struct ExtensionBrowser: NSViewControllerRepresentable {
-    func makeNSViewController(context: Context) -> EXAppExtensionBrowserViewController {
-        EXAppExtensionBrowserViewController()
-    }
-
-    func updateNSViewController(
-        _ controller: EXAppExtensionBrowserViewController,
-        context: Context
-    ) {}
 }
 
 private func printAuthorizationStatusAndExit() -> Never {
