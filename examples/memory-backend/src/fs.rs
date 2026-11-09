@@ -224,20 +224,20 @@ impl MemoryFileSystem {
         if additional == 0 {
             return Ok(());
         }
-        let mut used = self.used_bytes.load(Ordering::Relaxed);
+        let mut current = self.used_bytes.load(Ordering::Relaxed);
         loop {
-            let total = used
+            let next = current
                 .checked_add(additional)
                 .filter(|total| *total <= self.capacity)
                 .ok_or(Error(errno::ENOSPC))?;
             match self.used_bytes.compare_exchange_weak(
-                used,
-                total,
+                current,
+                next,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => return Ok(()),
-                Err(actual) => used = actual,
+                Err(actual) => current = actual,
             }
         }
     }
