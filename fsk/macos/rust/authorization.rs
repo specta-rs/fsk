@@ -97,19 +97,12 @@ pub fn download_and_install_app() -> io::Result<AppInstallOutcome> {
     let _mutation = APP_MUTATION.lock();
     let destination = app_path()?;
     let parent = destination_parent(&destination)?;
-    // The fast path deliberately touches nothing beyond the destination, so a
-    // standard user where the app was installed by MDM or root still observes
-    // `AlreadyInstalled` instead of a permission error on the parent.
-    if validate_app(&destination, APP_VERSION).is_ok() {
-        return Ok(AppInstallOutcome::AlreadyInstalled);
-    }
     fs::create_dir_all(parent).map_err(|error| fs_error("create", parent, &error))?;
     // The lock is held on the directory itself, so no lock file is created and
     // only read permission on the parent is required.
     let _lock = AppLock::acquire(parent)?;
     recover_interrupted_install(&destination)?;
     let was_installed = path_present(&destination)?;
-    // Another process may have installed the app while we waited for the lock.
     if validate_app(&destination, APP_VERSION).is_ok() {
         return Ok(AppInstallOutcome::AlreadyInstalled);
     }
@@ -139,8 +132,10 @@ pub fn download_and_install_app() -> io::Result<AppInstallOutcome> {
 ///
 /// The app is installed machine-wide and shared by every process on the
 /// machine, so this removes it for all consumers, not just the current process.
-/// Leftover entries from an interrupted installation that are older than 24
-/// hours are removed best-effort; younger entries are left alone.
+/// Leftover staging entries from an interrupted installation that are older
+/// than 24 hours are removed best-effort. Every destination backup is removed
+/// so a later install cannot restore an app that was just uninstalled; a crash
+/// between removing the app and its backups can still leave one behind.
 ///
 /// This operation is synchronous and is serialized with installation calls in
 /// the same process and, through an exclusive lock on the destination's parent
@@ -326,11 +321,7 @@ fn create_staging_directory(staging: &Path) -> io::Result<()> {
 }
 
 fn download_release(temporary: &Path, archive: &Path, tag: &str) -> io::Result<()> {
-    if let Some(base) = env::var("FSK_RELEASE_BASE_URL")
-        .ok()
-        .map(|base| base.trim().to_owned())
-        .filter(|base| !base.is_empty())
-    {
+    if let Some(base) = release_base_from(env::var_os("FSK_RELEASE_BASE_URL"))? {
         return run(
             curl_download(archive).arg(mirror_url(&base, tag)),
             "download FSK.app",
@@ -344,6 +335,17 @@ fn download_release(temporary: &Path, archive: &Path, tag: &str) -> io::Result<(
             "{error}. FSK.app releases must be publicly downloadable; for a private repository set GITHUB_TOKEN or FSK_RELEASE_BASE_URL"
         ))
     })
+}
+
+fn release_base_from(configured: Option<std::ffi::OsString>) -> io::Result<Option<String>> {
+    match configured {
+        Some(value) if value.to_string_lossy().trim().is_empty() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "FSK_RELEASE_BASE_URL must not be empty",
+        )),
+        Some(value) => Ok(Some(value.to_string_lossy().trim().to_owned())),
+        None => Ok(None),
+    }
 }
 
 fn public_release_url(tag: &str) -> String {
@@ -454,6 +456,12 @@ fn download_release_with_token(
                 format!("FSK release asset {asset_name} has no API URL"),
             )
         })?;
+    if !asset_url.starts_with("https://api.github.com/") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("FSK release asset {asset_name} has an unexpected API URL"),
+        ));
+    }
 
     run(
         // `--disable` is first, then the shared download options, the token
@@ -616,7 +624,13 @@ fn validate_restored_app(app: &Path) -> io::Result<()> {
             .arg(app),
         "verify restored FSK.app signature",
     )?;
-    check_signing_identity(app)
+    check_signing_identity(app)?;
+    run(
+        Command::new("/usr/sbin/spctl")
+            .args(["--assess", "--type", "execute"])
+            .arg(app),
+        "validate restored FSK.app with Gatekeeper",
+    )
 }
 
 fn cleanup_stale_entries(parent: &Path, name: &str, kind: &str) -> io::Result<()> {
@@ -690,7 +704,7 @@ fn newest_entry(parent: &Path, name: &str, kind: &str) -> io::Result<Option<Path
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
-        if !metadata.file_type().is_dir() {
+        if !(metadata.file_type().is_dir() || metadata.file_type().is_symlink()) {
             continue;
         }
         let created = entry_time(file_name, &prefix, &metadata);
@@ -1017,12 +1031,20 @@ fn fs_error(operation: &str, path: &Path, error: &io::Error) -> io::Error {
 }
 
 fn app_path() -> io::Result<PathBuf> {
-    let path = env::var_os("FSK_APP_PATH")
-        .filter(|value| !value.to_string_lossy().trim().is_empty())
-        .map_or_else(
-            || Path::new("/Applications/FSK.app").to_owned(),
-            PathBuf::from,
-        );
+    app_path_from(env::var_os("FSK_APP_PATH"))
+}
+
+fn app_path_from(configured: Option<std::ffi::OsString>) -> io::Result<PathBuf> {
+    let path = match configured {
+        Some(value) if value.to_string_lossy().trim().is_empty() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "FSK_APP_PATH must not be empty",
+            ));
+        }
+        Some(value) => PathBuf::from(value),
+        None => Path::new("/Applications/FSK.app").to_owned(),
+    };
     normalize_app_path(&path)
 }
 
@@ -1687,6 +1709,53 @@ TeamIdentifier=68994Z5PT3
             mirror_url("https://example.com/fsk/", "v0.0.9"),
             "https://example.com/fsk/v0.0.9/FSK-v0.0.9.zip"
         );
+    }
+
+    #[test]
+    fn empty_overrides_are_rejected() {
+        assert!(app_path_from(Some("".into())).is_err());
+        assert!(app_path_from(Some("   ".into())).is_err());
+        assert_eq!(
+            app_path_from(None).unwrap(),
+            Path::new("/Applications/FSK.app")
+        );
+        assert!(release_base_from(Some("".into())).is_err());
+        assert!(release_base_from(Some("   ".into())).is_err());
+        assert_eq!(release_base_from(None).unwrap(), None);
+        assert_eq!(
+            release_base_from(Some("https://example.com/fsk/".into())).unwrap(),
+            Some("https://example.com/fsk/".to_owned())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_restores_a_symlink_backup() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("marker"), b"restored link").unwrap();
+        let destination = directory.path().join("FSK.app");
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backup = directory
+            .path()
+            .join(format!(".FSK.app.backup-{timestamp}-1"));
+        symlink(&target, &backup).unwrap();
+
+        recover_interrupted_install_with(&destination, |_| Ok(())).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!backup.exists());
     }
 
     #[test]
