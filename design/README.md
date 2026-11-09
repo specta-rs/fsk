@@ -4,9 +4,10 @@
 from the "1b - Filesystem Spins" section.
 
 - `../assets/logo-light.svg` and `../assets/logo-dark.svg` are the README marks.
-- `../assets/app-icon-light.svg` and `../assets/app-icon-dark.svg` are the
-  1024px app icon masters.
-- The Xcode asset catalog lives at
-  `../fsk/macos/FSKApp/Assets.xcassets/AppIcon.appiconset`.
+- `../fsk/macos/FSKApp/AppIcon.icon` is the native macOS app icon source
+  (Icon Composer, with light and dark appearances). Its `Assets/FSK-light.svg`
+  and `FSK-dark.svg` are the flattened 1024px layers.
+- `../assets/app-icon-light.svg` and `../assets/app-icon-dark.svg` are flat
+  1024px previews of the tile treatment.
 
 `logo-board.png` is the full exploration board.

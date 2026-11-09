@@ -9,9 +9,9 @@
 /* Begin PBXBuildFile section */
 		1199E312353A6E83B717644B /* FSKItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94E45A8E59B92828162DA336 /* FSKItem.swift */; };
 		222D05F349E9AE1464C6D834 /* RustBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1933626A4818DE15AE8E3838 /* RustBackend.swift */; };
-		31B076D555313ACFA5043785 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 85509AEEF62AF3FE6C296D81 /* Assets.xcassets */; };
 		42E43112DD207A690748820F /* FSKVolume.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8EB26A3B99E84188164CF57B /* FSKVolume.swift */; };
 		4DBA03AA120BF8C5EEE6E42B /* RustBackendTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20407439219DD9F12FC8D2CF /* RustBackendTests.swift */; };
+		5EF21C1C18A7458B379DA545 /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = 2E9E8C9DBC1130F839480383 /* AppIcon.icon */; };
 		77E35C7AB01B2FF5FB548E49 /* FSKFileSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15FB8A065DA33A296026195 /* FSKFileSystem.swift */; };
 		838EB499CA91357AA3851866 /* FSKExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93810A97BCBF93745B5A2FEB /* FSKExtension.swift */; };
 		89FB2A981ABE8C4EDE4A8050 /* FSKItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94E45A8E59B92828162DA336 /* FSKItem.swift */; };
@@ -49,8 +49,8 @@
 		1933626A4818DE15AE8E3838 /* RustBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustBackend.swift; sourceTree = "<group>"; };
 		1B0BA4CD4D9E6763A4FB4D2F /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		20407439219DD9F12FC8D2CF /* RustBackendTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustBackendTests.swift; sourceTree = "<group>"; };
+		2E9E8C9DBC1130F839480383 /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = wrapper.icon; path = AppIcon.icon; sourceTree = "<group>"; };
 		6A416689CFBEFEE77582AEB7 /* FSKExtensionTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FSKExtensionTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		85509AEEF62AF3FE6C296D81 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		8EB26A3B99E84188164CF57B /* FSKVolume.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FSKVolume.swift; sourceTree = "<group>"; };
 		9301429F6F6C4797BA68B6D9 /* FSKApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FSKApp.swift; sourceTree = "<group>"; };
 		93810A97BCBF93745B5A2FEB /* FSKExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FSKExtension.swift; sourceTree = "<group>"; };
@@ -88,7 +88,7 @@
 		5A28593522F39B3860330C0A /* FSKApp */ = {
 			isa = PBXGroup;
 			children = (
-				85509AEEF62AF3FE6C296D81 /* Assets.xcassets */,
+				2E9E8C9DBC1130F839480383 /* AppIcon.icon */,
 				9D103A2FD5E5008A6A580C1E /* FSKApp.entitlements */,
 				9301429F6F6C4797BA68B6D9 /* FSKApp.swift */,
 			);
@@ -209,7 +209,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				31B076D555313ACFA5043785 /* Assets.xcassets in Resources */,
+				5EF21C1C18A7458B379DA545 /* AppIcon.icon in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
