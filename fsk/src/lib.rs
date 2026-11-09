@@ -31,8 +31,7 @@ mod windows;
 
 #[cfg(target_os = "macos")]
 pub use authorization::{
-    AppInstallOutcome, AuthorizationStatus, authorization_status, download_and_install_app,
-    launch_app, uninstall_app,
+    AppInstallOutcome, AuthorizationStatus, authorization_status, install, launch_app, uninstall,
 };
 // Re-exporting the deprecated alias would otherwise trip `-D warnings` here.
 #[cfg(target_os = "macos")]

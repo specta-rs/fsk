@@ -8,9 +8,12 @@ the user to choose **Done** or **Quit**.
 ## Setup flow
 
 1. An embedding application installs `FSK.app` (or the user moves it to
-   `/Applications`).
+   `/Applications`). `fsk::authorization_status()` reports `NotInstalled` when
+   the matching app is missing, so
+   `fsk::install()` should run first.
 2. The embedding application calls `fsk::launch_app()` when
-   `fsk::authorization_status()` is not `Authorized`.
+   `fsk::authorization_status()` reports `NeedsApproval`. A freshly installed
+   app is not registered with `FSKit` until it has been launched once.
 3. `FSK.app` shows a single permission row. **Open Settings** opens
    **System Settings → General → Login Items & Extensions → File System
    Extensions** directly with the File System Extensions pane identifier. The

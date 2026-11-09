@@ -57,7 +57,7 @@ fn check_platform_authorization() -> io::Result<()> {
         }
         AuthorizationStatus::NotInstalled => Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "install FSK.app in /Applications before mounting",
+            "install FSK.app with fsk::install() before mounting",
         )),
     }
 }

@@ -39,17 +39,52 @@ pub enum AppInstallOutcome {
 }
 
 /// Whether macOS currently exposes the installed `FSK` module to `FSKit`.
+///
+/// Each status identifies the next setup step:
+///
+/// - [`NotInstalled`](Self::NotInstalled): call [`install`].
+/// - [`NeedsApproval`](Self::NeedsApproval): call [`launch_app`] so the user can
+///   register or enable the extension.
+/// - [`Authorized`](Self::Authorized): the filesystem can be mounted.
+///
+/// Installing does not register the extension, so a successful install is
+/// normally followed by [`launch_app`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthorizationStatus {
-    /// The app or its embedded extension is not installed.
+    /// No companion app matching this SDK version is installed.
+    ///
+    /// The app is missing, unreadable, or built for a different SDK version.
+    /// Call [`install`] to install the matching release.
     NotInstalled,
-    /// The extension is installed but disabled by the user.
+    /// The app is installed but its extension is not registered or not enabled.
+    ///
+    /// Call [`launch_app`] so the user can register the extension and enable it
+    /// under **System Settings → General → Login Items & Extensions → File
+    /// System Extensions**.
     NeedsApproval,
     /// The extension is installed and enabled.
     Authorized,
 }
 
+impl AuthorizationStatus {
+    /// Returns whether [`install`] should be called.
+    ///
+    /// This is `true` when the companion app matching this SDK version is not
+    /// installed. Installing does not authorize the extension, so the status is
+    /// normally [`NeedsApproval`](Self::NeedsApproval) afterwards and
+    /// [`launch_app`] is still needed.
+    #[must_use]
+    pub const fn needs_install(self) -> bool {
+        matches!(self, Self::NotInstalled)
+    }
+}
+
 /// Download and install the `FSK` companion app matching this SDK version.
+///
+/// Call this when [`authorization_status`] reports
+/// [`AuthorizationStatus::NotInstalled`] (or when
+/// [`AuthorizationStatus::needs_install`] returns `true`). Installing does not
+/// authorize the extension; launch the app with [`launch_app`] afterwards.
 ///
 /// The app is installed machine-wide at `/Applications/FSK.app` and shared by
 /// every process on the machine. Installation requires an exact version match,
@@ -93,7 +128,7 @@ pub enum AuthorizationStatus {
 /// or installed. Installing in the chosen destination may require permission.
 /// Returns [`io::ErrorKind::InvalidInput`] if `FSK_APP_PATH` is relative,
 /// contains `..`, or does not name a folder ending in `.app`.
-pub fn download_and_install_app() -> io::Result<AppInstallOutcome> {
+pub fn install() -> io::Result<AppInstallOutcome> {
     let _mutation = APP_MUTATION.lock();
     let destination = app_path()?;
     let parent = destination_parent(&destination)?;
@@ -154,7 +189,7 @@ pub fn download_and_install_app() -> io::Result<AppInstallOutcome> {
 /// the destination is refused unless it is an `FSK.app` bundle with the
 /// expected `CFBundleIdentifier`, and a mount point is always refused. Removing
 /// it from the chosen destination may require permission.
-pub fn uninstall_app() -> io::Result<bool> {
+pub fn uninstall() -> io::Result<bool> {
     let _mutation = APP_MUTATION.lock();
     let app = app_path()?;
     let parent = destination_parent(&app)?;
@@ -176,6 +211,15 @@ pub fn uninstall_app() -> io::Result<bool> {
 
 /// Ask the installed Swift app for the current `FSKit` authorization state.
 ///
+/// The returned [`AuthorizationStatus`] tells the caller which setup step to
+/// take next. [`AuthorizationStatus::NotInstalled`] means the matching
+/// companion app is missing (or is a different version) and
+/// [`install`] should be called;
+/// [`AuthorizationStatus::NeedsApproval`] means the app is installed but the
+/// extension is not registered or not enabled, so [`launch_app`] should be
+/// called. When the app is not installed, this function does not run anything
+/// and returns immediately.
+///
 /// Set `FSK_APP_PATH` to override the normal `/Applications/FSK.app`
 /// location, which is useful for development and app-local distributions. The
 /// value must be the full path of an `.app` bundle, not a directory that
@@ -186,8 +230,11 @@ pub fn uninstall_app() -> io::Result<bool> {
 /// Returns an error when the path is invalid, or when the app cannot be
 /// executed or returns invalid data.
 pub fn authorization_status() -> io::Result<AuthorizationStatus> {
-    let app = app_path()?;
-    if !app.exists() {
+    authorization_status_at(&app_path()?)
+}
+
+fn authorization_status_at(app: &Path) -> io::Result<AuthorizationStatus> {
+    if !app_matches_sdk(app) {
         return Ok(AuthorizationStatus::NotInstalled);
     }
     let output = Command::new(app.join(APP_EXECUTABLE))
@@ -200,8 +247,9 @@ pub fn authorization_status() -> io::Result<AuthorizationStatus> {
     }
     match String::from_utf8_lossy(&output.stdout).trim() {
         "authorized" => Ok(AuthorizationStatus::Authorized),
-        "needs-approval" => Ok(AuthorizationStatus::NeedsApproval),
-        "not-installed" => Ok(AuthorizationStatus::NotInstalled),
+        // The extension is not registered yet. Opening the app registers it,
+        // so this needs the same user action as a disabled extension.
+        "needs-approval" | "not-installed" => Ok(AuthorizationStatus::NeedsApproval),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unexpected FSK authorization response: {other}"),
@@ -209,7 +257,23 @@ pub fn authorization_status() -> io::Result<AuthorizationStatus> {
     }
 }
 
+/// Whether the app bundle at `app` is the release matching this SDK version.
+///
+/// This mirrors the version and bundle-identifier checks in [`validate_app`]
+/// without verifying the code signature: the status query only needs to decide
+/// whether [`install`] should run, and a development build
+/// selected through `FSK_APP_PATH` is not signed by the release identity.
+fn app_matches_sdk(app: &Path) -> bool {
+    app.join(APP_EXECUTABLE).is_file()
+        && app_version(app).ok().flatten().as_deref() == Some(APP_VERSION)
+        && app_bundle_identifier(app).ok().flatten().as_deref() == Some(APP_BUNDLE_IDENTIFIER)
+}
+
 /// Open the `FSK` companion app directly in its authorization guide.
+///
+/// Call this when [`authorization_status`] reports
+/// [`AuthorizationStatus::NeedsApproval`], including right after a fresh
+/// installation: copying the app into place does not register its extension.
 ///
 /// Set `FSK_APP_PATH` to override the normal `/Applications/FSK.app`
 /// location. The value must be the full path of an `.app` bundle, not a
@@ -273,7 +337,7 @@ fn install_from_release(temporary: &Path, destination: &Path) -> io::Result<()> 
     require_real_directory(&source)?;
     validate_app(&source, APP_VERSION)?;
 
-    // The destination was validated in `download_and_install_app`, so it has a
+    // The destination was validated in `install`, so it has a
     // parent and a final component.
     let parent = destination_parent(destination)?;
     fs::create_dir_all(parent).map_err(|error| fs_error("create", parent, &error))?;
@@ -1124,23 +1188,47 @@ mod tests {
     use super::*;
 
     fn app_fixture(directory: &Path) -> PathBuf {
+        app_fixture_with_version(directory, APP_VERSION)
+    }
+
+    fn app_fixture_with_version(directory: &Path, version: &str) -> PathBuf {
         let app = directory.join("FSK.app");
         fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
         fs::write(app.join(APP_EXECUTABLE), b"").unwrap();
+        write_app_plist(&app, version);
+        app
+    }
+
+    fn reporting_app_fixture(directory: &Path, status: &str) -> PathBuf {
+        let app = app_fixture(directory);
+        let executable = app.join(APP_EXECUTABLE);
+        fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf '%s\\n' '{status}'\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        app
+    }
+
+    fn write_app_plist(app: &Path, version: &str) {
         fs::write(
             app.join("Contents/Info.plist"),
-            br#"<?xml version="1.0" encoding="UTF-8"?>
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>dev.specta.fsk</string>
+    <string>{APP_BUNDLE_IDENTIFIER}</string>
+    <key>CFBundleShortVersionString</key>
+    <string>{version}</string>
 </dict>
 </plist>
-"#,
+"#
+            ),
         )
         .unwrap();
-        app
     }
 
     #[test]
@@ -1151,6 +1239,57 @@ mod tests {
             Path::new("/Applications/FSK.app").join(APP_EXECUTABLE),
             Path::new("/Applications/FSK.app/Contents/MacOS/FSK")
         );
+    }
+
+    #[test]
+    fn a_missing_app_needs_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let status = authorization_status_at(&directory.path().join("FSK.app")).unwrap();
+
+        assert_eq!(status, AuthorizationStatus::NotInstalled);
+        assert!(status.needs_install());
+    }
+
+    #[test]
+    fn an_app_for_another_sdk_version_needs_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = app_fixture_with_version(directory.path(), "0.0.0");
+        let status = authorization_status_at(&app).unwrap();
+
+        assert_eq!(status, AuthorizationStatus::NotInstalled);
+        assert!(status.needs_install());
+    }
+
+    #[test]
+    fn an_unregistered_extension_needs_approval_not_install() {
+        let directory = tempfile::tempdir().unwrap();
+        // The app reports `not-installed` when its extension is not registered,
+        // even though the app bundle itself is present.
+        let app = reporting_app_fixture(directory.path(), "not-installed");
+        let status = authorization_status_at(&app).unwrap();
+
+        assert_eq!(status, AuthorizationStatus::NeedsApproval);
+        assert!(!status.needs_install());
+    }
+
+    #[test]
+    fn a_disabled_extension_needs_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = reporting_app_fixture(directory.path(), "needs-approval");
+        let status = authorization_status_at(&app).unwrap();
+
+        assert_eq!(status, AuthorizationStatus::NeedsApproval);
+        assert!(!status.needs_install());
+    }
+
+    #[test]
+    fn an_enabled_extension_is_authorized() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = reporting_app_fixture(directory.path(), "authorized");
+        let status = authorization_status_at(&app).unwrap();
+
+        assert_eq!(status, AuthorizationStatus::Authorized);
+        assert!(!status.needs_install());
     }
 
     #[test]

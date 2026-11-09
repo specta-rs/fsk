@@ -314,19 +314,19 @@ The Rust SDK can download and install the matching `FSK.app` release without
 opening it. Run the blocking installation call on your background executor,
 then launch the app separately when the user is ready to authorize it under
 **System Settings → General → Login Items & Extensions → File System Extensions**.
-Copying the app into place does not register its extension, so
-`authorization_status()` may still report `NotInstalled` until the app has been
-launched once:
+`authorization_status()` reports `NotInstalled` when the matching app is missing,
+and `NeedsApproval` when the app is present but its extension is not registered
+or enabled. Copying the app into place does not register its extension, so a
+fresh installation reports `NeedsApproval` until the app has been launched once:
 
 ```rust
-let outcome = fsk::download_and_install_app()?;
-println!("FSK app installation: {outcome:?}");
-
-match fsk::authorization_status()? {
-    fsk::AuthorizationStatus::Authorized => {}
-    fsk::AuthorizationStatus::NeedsApproval | fsk::AuthorizationStatus::NotInstalled => {
-        fsk::launch_app()?;
-    }
+let status = fsk::authorization_status()?;
+if status.needs_install() {
+    let outcome = fsk::install()?;
+    println!("FSK app installation: {outcome:?}");
+}
+if status != fsk::AuthorizationStatus::Authorized {
+    fsk::launch_app()?;
 }
 # Ok::<(), std::io::Error>(())
 ```
@@ -334,7 +334,7 @@ match fsk::authorization_status()? {
 Later, when your application no longer needs the extension:
 
 ```rust
-let removed = fsk::uninstall_app()?;
+let removed = fsk::uninstall()?;
 println!("FSK app removed: {removed}");
 # Ok::<(), std::io::Error>(())
 ```
@@ -347,7 +347,7 @@ serves `{base}/v0.0.9/FSK-v0.0.9.zip`.
 The app is installed machine-wide at `/Applications/FSK.app` and shared by every
 process and SDK consumer on the machine. Installation requires an exact version
 match, so a program built against an older SDK can replace (downgrade) an app
-installed by a newer SDK. `uninstall_app()` likewise removes the app for all
+installed by a newer SDK. `uninstall()` likewise removes the app for all
 consumers, not just the current program. Both operations are serialized across
 cooperating processes with an advisory lock on the destination's parent
 directory; no lock file is created.
