@@ -34,7 +34,37 @@ cargo run -p fsk-network-backend -- /path/to/mount \
   "Content returned by origin.txt"
 ```
 
-On macOS, install and authorize `FSK.app` before running either CLI. Linux
+## `google-drive`
+
+A Google Drive mount backed by the Drive API. It exposes `My Drive`,
+`Shared with me`, and every shared drive available to the account. File bytes
+are fetched lazily on first access. Google Workspace documents are exported to
+portable formats while the mount is indexed because Drive does not publish
+their exported byte lengths. Ordinary files are writable when Drive reports
+`canModifyContent`; files without that capability and exported Google Workspace
+documents are exposed read-only through the platform's normal permission bits.
+On macOS and Linux, writes are uploaded to Drive. Windows ProjFS keeps edits in
+its local projection cache and does not currently provide portable write-back
+callbacks, but Drive read-only files still receive the Windows read-only
+attribute.
+
+Create an OAuth access token with the Drive scope, then run:
+
+```sh
+export GOOGLE_DRIVE_ACCESS_TOKEN="$(gcloud auth application-default print-access-token)"
+cargo run -p fsk-google-drive -- /path/to/mount
+```
+
+The token must include `https://www.googleapis.com/auth/drive` for writes.
+Application-default tokens from `gcloud` only work when the associated OAuth
+grant includes that scope; a token from any other OAuth flow works too.
+Access tokens are short-lived; restart the example with a refreshed token when
+the current token expires.
+For simplicity, this example stages ordinary file contents in memory and limits
+individual buffered files to 256 MiB. Uploads use Drive revisions and ETags to
+reject saves when another client changed the remote file after it was indexed.
+
+On macOS, install and authorize `FSK.app` before running a CLI. Linux
 requires FUSE, and Windows requires the Projected File System optional feature.
 
 ## `github-filesystem`
