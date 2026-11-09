@@ -449,29 +449,52 @@ impl GoogleDrive {
 
     fn add_shared_tree(&mut self, root_inode: u64, roots: &[DriveFile], files: &[DriveFile]) {
         let mut ids: HashMap<String, Vec<u64>> = HashMap::new();
+        // Every inode created below the "Shared with me" root records the remote
+        // ids on its path from that root. This lets the fixed point below stop at
+        // a cycle instead of unfolding one forever.
+        let mut ancestry: HashMap<u64, Vec<String>> = HashMap::from([(root_inode, Vec::new())]);
         for file in roots {
             let inode = self.add_drive_file(root_inode, file);
             register_tree_ids(&mut ids, file, &[inode]);
+            ancestry.insert(inode, tree_ids(file));
         }
         // Direct shares are root-level aliases, but they can also be children of
-        // another shared folder. Process every account file so those aliases are
-        // retained at the root and attached beneath each reachable parent.
-        let mut pending: Vec<_> = files.iter().collect();
+        // another shared folder. Attach every account file beneath every known
+        // alias of its parents, repeating until a pass adds nothing new so the
+        // result does not depend on the order Drive listed the files in.
+        //
+        // Termination: `seen` deduplicates (remote file id, parent inode) pairs
+        // and every created inode is one such pair, while `ancestry` refuses to
+        // revisit a remote id already on the path. Since that path can only grow
+        // and never repeats an id, cycles cannot recurse and the DAG is walked
+        // finitely. Keying on the listing id (not the slice index) also keeps a
+        // duplicated listing entry from creating a second child under a parent.
+        let mut seen: HashSet<(&str, u64)> = HashSet::new();
         loop {
-            let before = pending.len();
-            pending.retain(|file| {
-                let parents = tree_parents(file, &ids);
-                if parents.is_empty() {
-                    return true;
+            let mut added = false;
+            for file in files {
+                for parent in tree_parents(file, &ids) {
+                    if !seen.insert((file.id.as_str(), parent)) {
+                        continue;
+                    }
+                    let Some(parent_ancestry) = ancestry.get(&parent) else {
+                        continue;
+                    };
+                    let file_ids = tree_ids(file);
+                    // A remote id may appear at most once on a path; seeing one
+                    // again means the listing contains a cycle, so do not recurse.
+                    if file_ids.iter().any(|id| parent_ancestry.contains(id)) {
+                        continue;
+                    }
+                    let mut chain = parent_ancestry.clone();
+                    chain.extend(file_ids.iter().cloned());
+                    let inode = self.add_drive_file(parent, file);
+                    ancestry.insert(inode, chain);
+                    register_tree_ids(&mut ids, file, &[inode]);
+                    added = true;
                 }
-                let inodes: Vec<_> = parents
-                    .into_iter()
-                    .map(|parent| self.add_drive_file(parent, file))
-                    .collect();
-                register_tree_ids(&mut ids, file, &inodes);
-                false
-            });
-            if pending.is_empty() || pending.len() == before {
+            }
+            if !added {
                 break;
             }
         }
@@ -729,6 +752,14 @@ fn tree_parents(file: &DriveFile, ids: &HashMap<String, Vec<u64>>) -> Vec<u64> {
     output
 }
 
+fn tree_ids(file: &DriveFile) -> Vec<String> {
+    let mut ids = vec![file.id.clone()];
+    if let Some(target) = &file.resolved_target {
+        ids.push(target.id.clone());
+    }
+    ids
+}
+
 fn register_tree_ids(ids: &mut HashMap<String, Vec<u64>>, file: &DriveFile, inodes: &[u64]) {
     let mut keys = vec![file.id.as_str()];
     if let Some(target) = &file.resolved_target {
@@ -744,6 +775,12 @@ fn register_tree_ids(ids: &mut HashMap<String, Vec<u64>>, file: &DriveFile, inod
     }
 }
 
+fn trim_portable_tail(output: &mut String) {
+    while output.ends_with([' ', '.']) {
+        output.pop();
+    }
+}
+
 fn portable_name(name: &str) -> Vec<u8> {
     let mut output: String = name
         .chars()
@@ -753,12 +790,14 @@ fn portable_name(name: &str) -> Vec<u8> {
             _ => character,
         })
         .collect();
-    while output.ends_with([' ', '.']) {
-        output.pop();
-    }
+    trim_portable_tail(&mut output);
+    // `pop` removes a whole char, so truncation never splits UTF-8.
     while output.len() > 240 {
         output.pop();
     }
+    // Truncation can expose a trailing space or dot even when the original name
+    // did not end in one, so trim again before returning the name.
+    trim_portable_tail(&mut output);
     if output.is_empty() || matches!(output.as_str(), "." | "..") {
         "_".clone_into(&mut output);
     }
@@ -775,6 +814,11 @@ fn portable_name(name: &str) -> Vec<u8> {
     }
     while output.len() > 240 {
         output.pop();
+    }
+    // Prepending `_` and re-truncating can expose another trailing space or dot.
+    trim_portable_tail(&mut output);
+    if output.is_empty() || matches!(output.as_str(), "." | "..") {
+        "_".clone_into(&mut output);
     }
     output.into_bytes()
 }
@@ -1142,6 +1186,10 @@ mod tests {
         assert_eq!(portable_name("trailing. "), b"trailing");
         assert!(portable_name(&"x".repeat(300)).len() <= 240);
         assert!(portable_name(&format!("CON.{}", "x".repeat(300))).len() <= 240);
+        let truncated_space = portable_name(&format!("{} {}", "x".repeat(239), "y".repeat(50)));
+        assert_eq!(truncated_space, "x".repeat(239).into_bytes());
+        assert!(!truncated_space.ends_with(b" "));
+        assert_eq!(portable_name(&" ".repeat(300)), b"_");
         assert!(names_equal("É".as_bytes(), "é".as_bytes()));
         assert!(names_equal("é".as_bytes(), "e\u{301}".as_bytes()));
     }
@@ -1215,6 +1263,79 @@ mod tests {
         let (shared_folder, _) = filesystem.lookup(shared, b"folder").expect("shared folder");
         assert!(filesystem.lookup(shared, b"child").is_ok());
         assert!(filesystem.lookup(shared_folder, b"child").is_ok());
+    }
+
+    #[test]
+    fn directly_shared_chains_are_complete_regardless_of_listing_order() {
+        let mut filesystem = filesystem();
+        let shared = filesystem.add_node(
+            ROOT_INODE,
+            "Shared with me",
+            FileType::Directory,
+            0,
+            None,
+            false,
+        );
+        let mut outer = file(FOLDER, false);
+        outer.id = "outer".to_owned();
+        outer.name = "outer".to_owned();
+        let mut inner = file(FOLDER, false);
+        inner.id = "inner".to_owned();
+        inner.name = "inner".to_owned();
+        inner.parents = vec!["outer".to_owned()];
+        let mut leaf = file("text/plain", false);
+        leaf.id = "leaf".to_owned();
+        leaf.name = "leaf".to_owned();
+        leaf.parents = vec!["inner".to_owned()];
+
+        // Drive listing order is unspecified, so descendants may arrive first.
+        let listed = [leaf.clone(), inner.clone(), outer.clone()];
+        filesystem.add_shared_tree(shared, &listed, &listed);
+
+        // Every directly shared file is still an alias at the root.
+        let (outer_inode, _) = filesystem.lookup(shared, b"outer").expect("outer alias");
+        let (inner_alias, _) = filesystem.lookup(shared, b"inner").expect("inner alias");
+        let (leaf_alias, _) = filesystem.lookup(shared, b"leaf").expect("leaf alias");
+
+        // ...and the full chain is rebuilt beneath the shared ancestors.
+        let (inner_inode, _) = filesystem
+            .lookup(outer_inode, b"inner")
+            .expect("inner under outer");
+        let (leaf_inode, _) = filesystem
+            .lookup(inner_inode, b"leaf")
+            .expect("leaf under outer/inner");
+        assert!(filesystem.lookup(inner_alias, b"leaf").is_ok());
+        assert_ne!(inner_alias, inner_inode);
+        assert_ne!(leaf_alias, leaf_inode);
+    }
+
+    #[test]
+    fn cyclic_shared_listings_terminate() {
+        let mut filesystem = filesystem();
+        let shared = filesystem.add_node(
+            ROOT_INODE,
+            "Shared with me",
+            FileType::Directory,
+            0,
+            None,
+            false,
+        );
+        let mut left = file(FOLDER, false);
+        left.id = "left".to_owned();
+        left.name = "left".to_owned();
+        left.parents = vec!["right".to_owned()];
+        let mut right = file(FOLDER, false);
+        right.id = "right".to_owned();
+        right.name = "right".to_owned();
+        right.parents = vec!["left".to_owned()];
+
+        let listed = [left, right];
+        filesystem.add_shared_tree(shared, &listed, &listed);
+
+        let (left_inode, _) = filesystem.lookup(shared, b"left").expect("left alias");
+        let (right_inode, _) = filesystem.lookup(shared, b"right").expect("right alias");
+        assert!(filesystem.lookup(left_inode, b"right").is_ok());
+        assert!(filesystem.lookup(right_inode, b"left").is_ok());
     }
 
     #[test]
