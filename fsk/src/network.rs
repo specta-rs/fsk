@@ -4,6 +4,11 @@ use crate::{Filesystem, Result};
 use std::path::{Path, PathBuf};
 
 /// The resource supplied by macOS when mounting a network filesystem.
+///
+/// The resource is the opaque URL encoded in the `fsk://` mount resource that
+/// started the extension. Most backends only need [`resource_url`](Self::resource_url)
+/// or [`resource_url_bytes`](Self::resource_url_bytes); the interpretation is
+/// application-defined (for example, an OAuth token or a remote share name).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mount {
     resource_url: Vec<u8>,
@@ -88,12 +93,16 @@ impl LocalFile {
         }
     }
 
+    /// Path to the materialized file.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     /// A backend-defined value that changes when the local contents change.
+    ///
+    /// Pass the value to [`LocalFile::new`]. The adapter forwards it to the
+    /// kernel so cached data can be invalidated when the local file changes.
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
@@ -106,15 +115,38 @@ pub enum NetworkFile {
     /// Keep reads lazy and call [`Filesystem::read`].
     Remote,
     /// Let Swift use `pread` against a backend-managed local file.
+    ///
+    /// The backend must keep the path readable until
+    /// [`NetworkFilesystem::close_file`] is called.
     Local(LocalFile),
 }
 
 /// Additional lifecycle hooks for lazy network filesystems.
 ///
-/// Namespace operations remain demand-driven methods on the parent
-/// [`Filesystem`] trait. The open/close lease allows explicitly downloaded files
-/// to use local I/O without giving Swift ownership of cache eviction.
+/// A network backend implements [`Filesystem`] for namespace and data
+/// operations and this trait for the open/close lease that lets already
+/// downloaded files be read locally.
+///
+/// # Lazy versus materialized
+///
+/// With [`NetworkConfiguration::lazy`] enabled, the adapter resolves metadata
+/// and contents only when the kernel asks for them. Returning
+/// [`NetworkFile::Local`] from [`open_file`](Self::open_file) hands the kernel a
+/// path to a fully materialized file; subsequent reads bypass
+/// [`Filesystem::read`]. Return [`NetworkFile::Remote`] to keep reads flowing
+/// through the backend.
+///
+/// Ownership of cached files stays with the backend. The adapter only calls
+/// [`close_file`](Self::close_file) when the kernel is done with a lease.
+///
+/// See the [crate documentation](crate#defining-a-network-filesystem) for an
+/// example.
 pub trait NetworkFilesystem: Filesystem {
+    /// Describes laziness, local-file support, and the desired kernel cache
+    /// policy.
+    ///
+    /// The adapter reads this once when the volume starts. The default enables
+    /// lazy lookup, local files, and metadata-only caching.
     fn network_configuration(&self) -> NetworkConfiguration {
         NetworkConfiguration::default()
     }
@@ -122,7 +154,12 @@ pub trait NetworkFilesystem: Filesystem {
     /// Selects the data source for an open file.
     ///
     /// Returning [`NetworkFile::Remote`] leaves reads lazy. Returning
-    /// [`NetworkFile::Local`] guarantees the path remains valid until `close_file`.
+    /// [`NetworkFile::Local`] guarantees the path remains valid until
+    /// [`close_file`](Self::close_file).
+    ///
+    /// The default implementation always returns [`NetworkFile::Remote`]. Set
+    /// [`NetworkConfiguration::supports_local_files`] to `false` if this backend
+    /// never returns a local file.
     ///
     /// # Errors
     ///
@@ -134,7 +171,7 @@ pub trait NetworkFilesystem: Filesystem {
     /// Releases a file lease after Swift has closed any local descriptor.
     ///
     /// This is a suitable point to update last-access state or schedule cache
-    /// cleanup.
+    /// cleanup. The default implementation is a no-op.
     ///
     /// # Errors
     ///

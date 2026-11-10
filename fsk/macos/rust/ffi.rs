@@ -18,57 +18,98 @@ const EIO: i32 = 5;
 const EINVAL: i32 = 22;
 const ERANGE: i32 = 34;
 
+/// C ABI representation of [`Metadata`] used by the macOS bridge.
+///
+/// This is an internal ABI type exposed for bridge tests and compatibility
+/// clients. Its layout is versioned by [`ABI_VERSION`](crate::ABI_VERSION).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FskAttributes {
+    /// See [`Metadata::inode`].
     pub inode: u64,
+    /// See [`Metadata::parent`].
     pub parent: u64,
+    /// See [`Metadata::size`].
     pub size: u64,
+    /// See [`Metadata::allocated_size`].
     pub allocated_size: u64,
+    /// See [`Metadata::generation`].
     pub generation: u64,
+    /// See [`Metadata::created_ns`].
     pub created_ns: u64,
+    /// See [`Metadata::modified_ns`].
     pub modified_ns: u64,
+    /// See [`Metadata::accessed_ns`].
     pub accessed_ns: u64,
+    /// See [`Metadata::mode`].
     pub mode: u32,
+    /// See [`Metadata::uid`].
     pub uid: u32,
+    /// See [`Metadata::gid`].
     pub gid: u32,
+    /// See [`Metadata::link_count`].
     pub link_count: u32,
+    /// A [`FileType`] discriminant.
     pub kind: u8,
+    /// Reserved for future expansion. Must be zero.
     pub reserved: [u8; 7],
 }
 
+/// C ABI representation of [`SetMetadata`] used by the macOS bridge.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FskSetAttributes {
+    /// Bit mask of the fields that are present.
     pub valid: u32,
+    /// New permission bits.
     pub mode: u32,
+    /// New owner user ID.
     pub uid: u32,
+    /// New owner group ID.
     pub gid: u32,
+    /// New logical size.
     pub size: u64,
+    /// New access time in nanoseconds since the Unix epoch.
     pub accessed_ns: u64,
+    /// New modification time in nanoseconds since the Unix epoch.
     pub modified_ns: u64,
 }
 
+/// C ABI representation of [`StatFs`] used by the macOS bridge.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FskStatFs {
+    /// See [`StatFs::block_size`].
     pub block_size: u32,
+    /// See [`StatFs::io_size`].
     pub io_size: u32,
+    /// See [`StatFs::total_bytes`].
     pub total_bytes: u64,
+    /// See [`StatFs::free_bytes`].
     pub free_bytes: u64,
+    /// See [`StatFs::available_bytes`].
     pub available_bytes: u64,
+    /// See [`StatFs::files`].
     pub files: u64,
+    /// See [`StatFs::free_files`].
     pub free_files: u64,
 }
 
+/// C ABI representation of one packed [`DirectoryEntry`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FskDirEntry {
+    /// Inode the entry refers to.
     pub inode: u64,
+    /// Cursor at which the next entry should resume.
     pub next_cookie: u64,
+    /// Offset of the name in the response's name buffer.
     pub name_offset: u32,
+    /// Length of the name in bytes.
     pub name_length: u16,
+    /// A [`FileType`] discriminant.
     pub kind: u8,
+    /// Reserved for future expansion. Must be zero.
     pub reserved: u8,
 }
 
@@ -140,6 +181,10 @@ impl Drop for Volume {
     }
 }
 
+/// Creates an opaque volume handle for a local filesystem.
+///
+/// The returned pointer is owned by the caller and must be destroyed with
+/// `fsk_volume_destroy`.
 pub fn create_volume(filesystem: impl Filesystem) -> *mut c_void {
     Box::into_raw(Box::new(Volume::new(Backend::Local(Box::new(filesystem))))).cast()
 }

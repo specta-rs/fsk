@@ -38,11 +38,16 @@ const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 const WINDOWS_EPOCH_OFFSET_100NS: u64 = 116_444_736_000_000_000;
 
+/// Settings used when creating a `ProjFS` virtualization root on Windows.
 #[derive(Clone, Debug)]
 pub struct MountOptions {
+    /// Present the projection as read-only.
     pub read_only: bool,
+    /// Filesystem name used for diagnostics.
     pub filesystem_name: String,
+    /// Number of concurrent `ProjFS` callback threads.
     pub worker_threads: usize,
+    /// Remember names that were reported as absent to avoid repeated lookups.
     pub use_negative_path_cache: bool,
 }
 
@@ -120,11 +125,15 @@ impl MountSession {
         Self::start(Arc::new(filesystem), mount_path.as_ref(), options)
     }
 
+    /// Path of the virtualization root.
     #[must_use]
     pub fn mount_path(&self) -> &Path {
         &self.mount_path
     }
 
+    /// Stop the projection.
+    ///
+    /// Dropping the session has the same effect.
     pub fn unmount(self) {}
 
     fn start(

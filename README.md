@@ -371,6 +371,12 @@ Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
 
 ProjFS requires an empty or previously initialized virtualization root.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the platform architecture, how to
+develop and test the FSKit extension, the required Rust and Swift toolchains,
+and the `FSK_APP_PATH` development override.
+
 ## Releases
 
 Tags matching `v*` build, sign, notarize, staple, and upload `FSK.app`, then

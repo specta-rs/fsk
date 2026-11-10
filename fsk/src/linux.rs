@@ -33,12 +33,18 @@ thread_local! {
     static READ_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Settings used when mounting a filesystem through FUSE on Linux.
 #[derive(Clone, Debug)]
 pub struct MountOptions {
+    /// Mount the volume read-only.
     pub read_only: bool,
+    /// Filesystem name reported by `statfs` and visible in `/proc/mounts`.
     pub filesystem_name: String,
+    /// Number of FUSE dispatcher threads. Values below `1` are treated as `1`.
     pub worker_threads: usize,
+    /// Let the kernel enforce POSIX permissions instead of the backend.
     pub kernel_permissions: bool,
+    /// How long the kernel may cache metadata lookups.
     pub metadata_ttl: Duration,
 }
 
@@ -54,6 +60,10 @@ impl Default for MountOptions {
     }
 }
 
+/// An active FUSE mount backed by this process.
+///
+/// Dropping the value unmounts the filesystem and waits for dispatcher threads
+/// to stop. Keep it alive for as long as the filesystem should be available.
 pub struct MountSession {
     mount_path: PathBuf,
     session: Option<fuser::BackgroundSession>,
@@ -115,6 +125,7 @@ impl MountSession {
         )
     }
 
+    /// Path at which this filesystem is mounted.
     #[must_use]
     pub fn mount_path(&self) -> &Path {
         &self.mount_path

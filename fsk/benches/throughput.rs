@@ -1,3 +1,7 @@
+//! Throughput benchmark for portable filesystem operations.
+//!
+//! Run with `cargo bench -p fsk --bench throughput`.
+
 mod support;
 
 use fsk::{DirectoryEntry, DirectorySink, Filesystem, ROOT_INODE};

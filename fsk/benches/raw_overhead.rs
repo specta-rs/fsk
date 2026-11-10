@@ -1,3 +1,7 @@
+//! Measures the overhead of the opt-in raw event hook versus direct dispatch.
+//!
+//! Run with `cargo bench -p fsk --bench raw_overhead`.
+
 mod support;
 
 use fsk::{
