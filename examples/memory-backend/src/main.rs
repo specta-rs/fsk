@@ -1,10 +1,11 @@
 mod fs;
 
 use fsk::MountSession;
-#[cfg(target_os = "macos")]
-use fsk::{AuthorizationStatus, authorization_status, launch_app};
 use std::{
-    env, io,
+    env,
+    ffi::OsString,
+    fs as std_fs, io,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,15 +14,22 @@ use std::{
     time::Duration,
 };
 
-fn main() -> io::Result<()> {
-    let mount_path = env::args_os().nth(1).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "usage: fsk-memory-backend <mount-path>",
-        )
-    })?;
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+}
 
-    check_platform_authorization()?;
+fn run() -> io::Result<()> {
+    let mount_path = mount_path_from_args()?;
+
+    // The session creates the directory if it is missing, so create it here
+    // first. That makes an existing directory an error and lets us tell
+    // whether cleanup below owns the directory.
+    let mount_directory = MountDirectory::create(&mount_path)?;
+
+    fsk::ensure_authorization()?;
 
     let session = MountSession::mount(fs::filesystem(), &mount_path)?;
     println!(
@@ -37,31 +45,77 @@ fn main() -> io::Result<()> {
         thread::park_timeout(Duration::from_millis(250));
     }
 
-    // MountSession's Drop implementation unmounts and removes its socket.
+    // MountSession's Drop implementation unmounts and removes its socket, then
+    // MountDirectory's Drop removes the empty mount directory.
     drop(session);
+    drop(mount_directory);
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn check_platform_authorization() -> io::Result<()> {
-    match authorization_status()? {
-        AuthorizationStatus::Authorized => Ok(()),
-        AuthorizationStatus::NeedsApproval => {
-            launch_app()?;
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "enable FSK in the window that opened, then run this command again",
-            ))
-        }
-        AuthorizationStatus::NotInstalled => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "install FSK.app with fsk::install() before mounting",
+fn mount_path_from_args() -> io::Result<PathBuf> {
+    let mut args = env::args_os();
+    let program = args
+        .next()
+        .unwrap_or_else(|| OsString::from("fsk-memory-backend"));
+    match (args.next(), args.next()) {
+        (Some(path), None) => Ok(PathBuf::from(path)),
+        (None, _) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "missing mount directory\n\nusage: {} <mount-path>\n\n\
+                 <mount-path> is created when the mount starts and removed when it stops, \
+                 so it must not already exist.",
+                Path::new(&program).display()
+            ),
+        )),
+        (Some(_), Some(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "expected exactly one mount directory\n\nusage: {} <mount-path>",
+                Path::new(&program).display()
+            ),
         )),
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-#[allow(clippy::unnecessary_wraps)]
-fn check_platform_authorization() -> io::Result<()> {
-    Ok(())
+/// Owns the mount directory created by this process and removes it on exit.
+struct MountDirectory {
+    path: PathBuf,
+}
+
+impl MountDirectory {
+    fn create(path: &Path) -> io::Result<Self> {
+        match std_fs::create_dir(path) {
+            Ok(()) => Ok(Self {
+                path: path.to_owned(),
+            }),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "mount directory {} already exists; remove it or choose a different path",
+                    path.display()
+                ),
+            )),
+            Err(error) => Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "could not create mount directory {}: {error}",
+                    path.display()
+                ),
+            )),
+        }
+    }
+}
+
+impl Drop for MountDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = std_fs::remove_dir(&self.path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "warning: could not remove mount directory {}: {error}",
+                self.path.display()
+            );
+        }
+    }
 }

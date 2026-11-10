@@ -13,11 +13,16 @@ A writable in-memory filesystem and mount CLI. It demonstrates:
 - atomic cross-directory namespace mutations;
 - stable directory cookies and mutation verifiers;
 - sparse reads and writes;
+- logging namespace changes (`create`, `write`, `rename`, `remove`, …) to the
+  console;
 - mounting until Ctrl-C and then unmounting cleanly.
 
 ```sh
 cargo run -p fsk-memory-backend -- /path/to/mount
 ```
+
+The mount directory is created on startup and removed on exit, so it must not
+already exist.
 
 ## `network-backend`
 
@@ -26,6 +31,8 @@ A minimal immutable network filesystem and mount CLI. It demonstrates:
 - implementing `NetworkFilesystem: Filesystem`;
 - serving remote content lazily;
 - returning an explicitly downloaded `LocalFile`;
+- using `fsk::local_file_directory()` so the sandboxed macOS extension can
+  open the materialized file;
 - receiving close callbacks for activity tracking and eviction;
 - keeping network policy independent from the in-memory example.
 
@@ -33,6 +40,11 @@ A minimal immutable network filesystem and mount CLI. It demonstrates:
 cargo run -p fsk-network-backend -- /path/to/mount \
   "Content returned by origin.txt"
 ```
+
+On macOS this is a mounted volume. FSKit does not expose iCloud-style
+per-file download/evict controls; use a File Provider extension
+(`NSFileProviderReplicatedExtension`) when the goal is a folder that looks like
+iCloud Drive.
 
 ## `google-drive`
 
@@ -66,6 +78,8 @@ reject saves when another client changed the remote file after it was indexed.
 
 On macOS, install and authorize `FSK.app` before running a CLI. Linux
 requires FUSE, and Windows requires the Projected File System optional feature.
+The CLIs call `fsk::ensure_authorization()` to check these requirements and open
+the platform setup UI when possible.
 
 ## `github-filesystem`
 

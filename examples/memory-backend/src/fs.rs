@@ -49,7 +49,8 @@ struct OwnedEntry {
 /// Inode lookup is sharded by [`DashMap`]. File bytes and each directory are guarded
 /// independently, while namespace mutations take a short global mutex to make
 /// cross-directory rename atomic. Directory slots are stable between mutations, so a
-/// cookie is a direct index rather than an O(n) rescan.
+/// cookie is a direct index rather than an O(n) rescan. Changes are printed to stdout
+/// so the mount example shows what the kernel is doing.
 pub struct MemoryFileSystem {
     nodes: DashMap<u64, Arc<Node>>,
     next_inode: AtomicU64,
@@ -133,6 +134,59 @@ impl MemoryFileSystem {
             .ok_or(Error(errno::ENOENT))
     }
 
+    /// Resolve an inode to a readable path for the change log.
+    ///
+    /// Uses `try_read` so logging can never block or deadlock behind a mutation
+    /// that is already holding a node lock; the inode is shown instead.
+    fn path_for(&self, inode: u64) -> String {
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        let mut current = inode;
+        for _ in 0..self.nodes.len().saturating_add(1) {
+            if current == ROOT_INODE {
+                break;
+            }
+            let Some((parent, name)) = self.parent_and_name(current) else {
+                return format!("<inode {inode}>");
+            };
+            names.push(name);
+            current = parent;
+        }
+        names.reverse();
+        let mut path = String::from("/");
+        for (index, name) in names.iter().enumerate() {
+            if index > 0 {
+                path.push('/');
+            }
+            path.push_str(&String::from_utf8_lossy(name));
+        }
+        path
+    }
+
+    fn parent_and_name(&self, inode: u64) -> Option<(u64, Vec<u8>)> {
+        let node = self
+            .nodes
+            .get(&inode)
+            .map(|entry| Arc::clone(entry.value()))?;
+        let parent = node.state.try_read()?.metadata.parent;
+        if parent == inode {
+            return None;
+        }
+        let parent_node = self
+            .nodes
+            .get(&parent)
+            .map(|entry| Arc::clone(entry.value()))?;
+        let parent_state = parent_node.state.try_read()?;
+        let NodeData::Directory(directory) = &parent_state.data else {
+            return None;
+        };
+        let entry = directory
+            .slots
+            .iter()
+            .flatten()
+            .find(|entry| entry.inode == inode)?;
+        Some((parent, entry.name.clone()))
+    }
+
     fn validate_name(name: &[u8]) -> Result<()> {
         if name.is_empty()
             || name.len() > 255
@@ -191,6 +245,9 @@ impl MemoryFileSystem {
         bytes: Vec<u8>,
     ) -> Result<u64> {
         Self::validate_name(name)?;
+        let parent_path = self.path_for(parent);
+        let link_target =
+            (kind == FileType::Symlink).then(|| String::from_utf8_lossy(&bytes).into_owned());
         let _namespace = self.namespace.lock();
         let parent_node = self.node(parent)?;
         let mut parent_state = parent_node.state.write();
@@ -216,6 +273,17 @@ impl MemoryFileSystem {
         parent_state.metadata.modified_ns = now_ns();
         parent_state.metadata.generation = parent_state.metadata.generation.wrapping_add(1);
         self.nodes.insert(inode, node);
+        let path = join_path(&parent_path, name);
+        match kind {
+            FileType::File => println!("[fs] create {path}"),
+            FileType::Directory => println!("[fs] mkdir {path}"),
+            FileType::Symlink => {
+                println!(
+                    "[fs] symlink {path} -> {}",
+                    link_target.as_deref().unwrap_or_default()
+                );
+            }
+        }
         Ok(inode)
     }
 
@@ -272,6 +340,7 @@ impl Filesystem for MemoryFileSystem {
     }
 
     fn set_metadata(&self, inode: u64, update: SetMetadata) -> Result<Metadata> {
+        let path = self.path_for(inode);
         let node = self.node(inode)?;
         let mut state = node.state.write();
         if let Some(size) = update.size {
@@ -305,6 +374,22 @@ impl Filesystem for MemoryFileSystem {
             state.metadata.modified_ns = modified_ns;
         }
         state.metadata.generation = state.metadata.generation.wrapping_add(1);
+        let mut changes = Vec::new();
+        if let Some(size) = update.size {
+            changes.push(format!("size={size}"));
+        }
+        if let Some(mode) = update.mode {
+            changes.push(format!("mode={:04o}", mode & 0o7777));
+        }
+        if let Some(uid) = update.uid {
+            changes.push(format!("uid={uid}"));
+        }
+        if let Some(gid) = update.gid {
+            changes.push(format!("gid={gid}"));
+        }
+        if !changes.is_empty() {
+            println!("[fs] set {path}: {}", changes.join(", "));
+        }
         Ok(state.metadata)
     }
 
@@ -378,6 +463,7 @@ impl Filesystem for MemoryFileSystem {
     }
 
     fn write(&self, inode: u64, offset: u64, input: &[u8]) -> Result<usize> {
+        let path = self.path_for(inode);
         let node = self.node(inode)?;
         let mut state = node.state.write();
         let old_allocated = state.metadata.allocated_size;
@@ -398,6 +484,12 @@ impl Filesystem for MemoryFileSystem {
         state.metadata.allocated_size = allocated_size(state.metadata.size);
         state.metadata.modified_ns = now_ns();
         state.metadata.generation = state.metadata.generation.wrapping_add(1);
+        if !input.is_empty() {
+            println!(
+                "[fs] write {path} at offset {offset} ({} bytes)",
+                input.len()
+            );
+        }
         Ok(input.len())
     }
 
@@ -426,6 +518,7 @@ impl Filesystem for MemoryFileSystem {
     }
 
     fn remove(&self, parent: u64, name: &[u8], inode: u64) -> Result<()> {
+        let parent_path = self.path_for(parent);
         let _namespace = self.namespace.lock();
         let parent_node = self.node(parent)?;
         let child_node = self.node(inode)?;
@@ -447,10 +540,17 @@ impl Filesystem for MemoryFileSystem {
         directory.version = directory.version.wrapping_add(1).max(1);
         parent_state.metadata.modified_ns = now_ns();
         let removed = self.nodes.remove(&inode).ok_or(Error(errno::ENOENT))?.1;
-        self.used_bytes.fetch_sub(
-            removed.state.read().metadata.allocated_size,
-            Ordering::Relaxed,
-        );
+        let (removed_kind, removed_size) = {
+            let state = removed.state.read();
+            (state.metadata.kind, state.metadata.allocated_size)
+        };
+        self.used_bytes.fetch_sub(removed_size, Ordering::Relaxed);
+        let action = if removed_kind == FileType::Directory {
+            "rmdir"
+        } else {
+            "remove"
+        };
+        println!("[fs] {action} {}", join_path(&parent_path, name));
         Ok(())
     }
 
@@ -487,25 +587,7 @@ impl Filesystem for MemoryFileSystem {
         {
             return Err(Error(errno::EINVAL));
         }
-        if let Some(replaced) = replaced_inode {
-            let replacement = self.node(replaced)?;
-            let replacement_state = replacement.state.read();
-            if source_entry.kind == FileType::Directory
-                && replacement_state.metadata.kind != FileType::Directory
-            {
-                return Err(Error(errno::ENOTDIR));
-            }
-            if source_entry.kind != FileType::Directory
-                && replacement_state.metadata.kind == FileType::Directory
-            {
-                return Err(Error(errno::EISDIR));
-            }
-            if let NodeData::Directory(directory) = &replacement_state.data
-                && !directory.by_name.is_empty()
-            {
-                return Err(Error(errno::ENOTEMPTY));
-            }
-        }
+        self.validate_replacement(source_entry.kind, replaced_inode)?;
 
         if source_parent == destination_parent {
             let mut state = source_node.state.write();
@@ -561,11 +643,59 @@ impl Filesystem for MemoryFileSystem {
                     .fetch_sub(node.state.read().metadata.allocated_size, Ordering::Relaxed);
             }
         }
+        self.log_rename(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        );
         Ok(())
     }
 }
 
 impl MemoryFileSystem {
+    fn validate_replacement(
+        &self,
+        source_kind: FileType,
+        replaced_inode: Option<u64>,
+    ) -> Result<()> {
+        let Some(replaced) = replaced_inode else {
+            return Ok(());
+        };
+        let replacement = self.node(replaced)?;
+        let replacement_state = replacement.state.read();
+        if source_kind == FileType::Directory
+            && replacement_state.metadata.kind != FileType::Directory
+        {
+            return Err(Error(errno::ENOTDIR));
+        }
+        if source_kind != FileType::Directory
+            && replacement_state.metadata.kind == FileType::Directory
+        {
+            return Err(Error(errno::EISDIR));
+        }
+        if let NodeData::Directory(directory) = &replacement_state.data
+            && !directory.by_name.is_empty()
+        {
+            return Err(Error(errno::ENOTEMPTY));
+        }
+        Ok(())
+    }
+
+    fn log_rename(
+        &self,
+        source_parent: u64,
+        source_name: &[u8],
+        destination_parent: u64,
+        destination_name: &[u8],
+    ) {
+        println!(
+            "[fs] rename {} -> {}",
+            join_path(&self.path_for(source_parent), source_name),
+            join_path(&self.path_for(destination_parent), destination_name)
+        );
+    }
+
     fn is_descendant_of(&self, mut candidate: u64, ancestor: u64) -> Result<bool> {
         for _ in 0..self.nodes.len().saturating_add(1) {
             if candidate == ancestor {
@@ -623,6 +753,15 @@ fn remove_destination(
     }
 }
 
+fn join_path(parent: &str, name: &[u8]) -> String {
+    let name = String::from_utf8_lossy(name);
+    if parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
 const fn allocated_size(size: u64) -> u64 {
     size.div_ceil(BLOCK_SIZE).saturating_mul(BLOCK_SIZE)
 }
@@ -670,316 +809,7 @@ mod errno {
     pub const ESTALE: i32 = 70;
 }
 
+// Tests live under `tests/` to keep the example source focused.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use fsk::DirectorySink;
-    use std::sync::Arc;
-
-    #[derive(Default)]
-    struct VecSink {
-        capacity: usize,
-        entries: Vec<(Vec<u8>, u64, FileType, u64)>,
-    }
-
-    impl DirectorySink for VecSink {
-        fn push(&mut self, entry: DirectoryEntry<'_>) -> bool {
-            if self.entries.len() == self.capacity {
-                return false;
-            }
-            self.entries.push((
-                entry.name.to_vec(),
-                entry.inode,
-                entry.kind,
-                entry.next_cookie,
-            ));
-            true
-        }
-    }
-
-    #[test]
-    fn sparse_write_reads_zeroes_and_updates_metadata() {
-        let filesystem = MemoryFileSystem::new();
-        let inode = filesystem
-            .create(ROOT_INODE, b"data", FileType::File, 0o640)
-            .unwrap();
-        assert_eq!(filesystem.write(inode, 4, b"rust").unwrap(), 4);
-
-        let mut output = [0xff; 8];
-        assert_eq!(filesystem.read(inode, 0, &mut output).unwrap(), 8);
-        assert_eq!(&output, b"\0\0\0\0rust");
-        let metadata = filesystem.metadata(inode).unwrap();
-        assert_eq!(metadata.size, 8);
-        assert_eq!(metadata.allocated_size, BLOCK_SIZE);
-        assert_eq!(metadata.mode, 0o640);
-    }
-
-    #[test]
-    fn directory_cookies_resume_without_rescanning() {
-        let filesystem = MemoryFileSystem::new();
-        for name in [b"alpha".as_slice(), b"beta", b"gamma"] {
-            filesystem
-                .create(ROOT_INODE, name, FileType::File, 0o644)
-                .unwrap();
-        }
-
-        let mut first = VecSink {
-            capacity: 2,
-            ..VecSink::default()
-        };
-        let first_result = filesystem
-            .read_directory(ROOT_INODE, 0, 0, &mut first)
-            .unwrap();
-        assert_eq!(first.entries.len(), 2);
-        assert!(!first_result.eof);
-        assert_eq!(first_result.next_cookie, 2);
-
-        let mut second = VecSink {
-            capacity: 2,
-            ..VecSink::default()
-        };
-        let second_result = filesystem
-            .read_directory(
-                ROOT_INODE,
-                first_result.next_cookie,
-                first_result.verifier,
-                &mut second,
-            )
-            .unwrap();
-        assert_eq!(second.entries.len(), 1);
-        assert_eq!(second.entries[0].0, b"gamma");
-        assert!(second_result.eof);
-    }
-
-    #[test]
-    fn mutation_invalidates_an_active_directory_enumeration() {
-        let filesystem = MemoryFileSystem::new();
-        filesystem
-            .create(ROOT_INODE, b"before", FileType::File, 0o644)
-            .unwrap();
-        let mut sink = VecSink {
-            capacity: 1,
-            ..VecSink::default()
-        };
-        let result = filesystem
-            .read_directory(ROOT_INODE, 0, 0, &mut sink)
-            .unwrap();
-        filesystem
-            .create(ROOT_INODE, b"after", FileType::File, 0o644)
-            .unwrap();
-        let error = filesystem
-            .read_directory(ROOT_INODE, result.next_cookie, result.verifier, &mut sink)
-            .unwrap_err();
-        assert_eq!(error, Error(errno::ESTALE));
-    }
-
-    #[test]
-    fn cross_directory_rename_updates_parent_and_lookup_indexes() {
-        let filesystem = MemoryFileSystem::new();
-        let source = filesystem
-            .create(ROOT_INODE, b"source", FileType::Directory, 0o755)
-            .unwrap();
-        let destination = filesystem
-            .create(ROOT_INODE, b"destination", FileType::Directory, 0o755)
-            .unwrap();
-        let file = filesystem
-            .create(source, b"old", FileType::File, 0o644)
-            .unwrap();
-
-        filesystem
-            .rename(source, b"old", destination, b"new", None)
-            .unwrap();
-        assert_eq!(
-            filesystem.lookup(destination, b"new").unwrap(),
-            (file, FileType::File)
-        );
-        assert_eq!(
-            filesystem.lookup(source, b"old").unwrap_err(),
-            Error(errno::ENOENT)
-        );
-        assert_eq!(filesystem.metadata(file).unwrap().parent, destination);
-    }
-
-    #[test]
-    fn nonempty_directory_cannot_be_removed() {
-        let filesystem = MemoryFileSystem::new();
-        let directory = filesystem
-            .create(ROOT_INODE, b"directory", FileType::Directory, 0o755)
-            .unwrap();
-        filesystem
-            .create(directory, b"child", FileType::File, 0o644)
-            .unwrap();
-        assert_eq!(
-            filesystem
-                .remove(ROOT_INODE, b"directory", directory)
-                .unwrap_err(),
-            Error(errno::ENOTEMPTY)
-        );
-    }
-
-    #[test]
-    fn directory_cannot_be_moved_inside_itself() {
-        let filesystem = MemoryFileSystem::new();
-        let parent = filesystem
-            .create(ROOT_INODE, b"parent", FileType::Directory, 0o755)
-            .unwrap();
-        let child = filesystem
-            .create(parent, b"child", FileType::Directory, 0o755)
-            .unwrap();
-        assert_eq!(
-            filesystem
-                .rename(ROOT_INODE, b"parent", child, b"cycle", None)
-                .unwrap_err(),
-            Error(errno::EINVAL)
-        );
-    }
-
-    #[test]
-    fn rename_cannot_replace_a_nonempty_directory() {
-        let filesystem = MemoryFileSystem::new();
-        let source = filesystem
-            .create(ROOT_INODE, b"source", FileType::Directory, 0o755)
-            .unwrap();
-        let destination = filesystem
-            .create(ROOT_INODE, b"destination", FileType::Directory, 0o755)
-            .unwrap();
-        filesystem
-            .create(destination, b"child", FileType::File, 0o644)
-            .unwrap();
-        assert_eq!(
-            filesystem
-                .rename(
-                    ROOT_INODE,
-                    b"source",
-                    ROOT_INODE,
-                    b"destination",
-                    Some(destination),
-                )
-                .unwrap_err(),
-            Error(errno::ENOTEMPTY)
-        );
-        assert_eq!(filesystem.lookup(ROOT_INODE, b"source").unwrap().0, source);
-    }
-
-    #[test]
-    fn same_name_rename_is_a_noop_even_with_replacement_inode() {
-        let filesystem = MemoryFileSystem::new();
-        let inode = filesystem
-            .create(ROOT_INODE, b"same", FileType::File, 0o644)
-            .unwrap();
-
-        filesystem
-            .rename(ROOT_INODE, b"same", ROOT_INODE, b"same", Some(inode))
-            .unwrap();
-
-        assert_eq!(
-            filesystem.lookup(ROOT_INODE, b"same").unwrap(),
-            (inode, FileType::File)
-        );
-        assert_eq!(filesystem.metadata(inode).unwrap().inode, inode);
-    }
-
-    #[test]
-    fn capacity_is_enforced_across_files_and_failed_growth_is_atomic() {
-        let filesystem = MemoryFileSystem::with_capacity(BLOCK_SIZE * 2);
-        let first = filesystem
-            .create(ROOT_INODE, b"first", FileType::File, 0o644)
-            .unwrap();
-        let second = filesystem
-            .create(ROOT_INODE, b"second", FileType::File, 0o644)
-            .unwrap();
-        filesystem.write(first, 0, b"a").unwrap();
-        filesystem.write(second, 0, b"b").unwrap();
-
-        assert_eq!(
-            filesystem.write(first, BLOCK_SIZE, b"x").unwrap_err(),
-            Error(errno::ENOSPC)
-        );
-        assert_eq!(filesystem.metadata(first).unwrap().size, 1);
-        assert_eq!(filesystem.statfs().unwrap().free_bytes, 0);
-
-        filesystem
-            .set_metadata(
-                second,
-                SetMetadata {
-                    size: Some(0),
-                    ..SetMetadata::default()
-                },
-            )
-            .unwrap();
-        filesystem.write(first, BLOCK_SIZE, b"x").unwrap();
-        assert_eq!(filesystem.metadata(first).unwrap().size, BLOCK_SIZE + 1);
-    }
-
-    #[test]
-    fn concurrent_growth_cannot_overcommit_capacity() {
-        let filesystem = Arc::new(MemoryFileSystem::with_capacity(BLOCK_SIZE));
-        let first = filesystem
-            .create(ROOT_INODE, b"first", FileType::File, 0o644)
-            .unwrap();
-        let second = filesystem
-            .create(ROOT_INODE, b"second", FileType::File, 0o644)
-            .unwrap();
-        let barrier = Arc::new(std::sync::Barrier::new(3));
-        let threads: Vec<_> = [first, second]
-            .into_iter()
-            .map(|inode| {
-                let filesystem = Arc::clone(&filesystem);
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    filesystem.write(inode, 0, b"x")
-                })
-            })
-            .collect();
-        barrier.wait();
-        let results: Vec<_> = threads
-            .into_iter()
-            .map(|thread| thread.join().unwrap())
-            .collect();
-
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        assert_eq!(
-            results
-                .iter()
-                .filter(|result| **result == Err(Error(errno::ENOSPC)))
-                .count(),
-            1
-        );
-        assert_eq!(filesystem.statfs().unwrap().free_bytes, 0);
-    }
-
-    #[test]
-    fn independent_files_support_concurrent_io() {
-        let filesystem = Arc::new(MemoryFileSystem::new());
-        let inodes: Vec<_> = (0..8)
-            .map(|index| {
-                filesystem
-                    .create(
-                        ROOT_INODE,
-                        format!("file-{index}").as_bytes(),
-                        FileType::File,
-                        0o644,
-                    )
-                    .unwrap()
-            })
-            .collect();
-        let threads: Vec<_> = inodes
-            .into_iter()
-            .enumerate()
-            .map(|(index, inode)| {
-                let filesystem = Arc::clone(&filesystem);
-                std::thread::spawn(move || {
-                    let bytes = vec![u8::try_from(index).unwrap(); 64 * 1024];
-                    filesystem.write(inode, 0, &bytes).unwrap();
-                    let mut output = vec![0; bytes.len()];
-                    filesystem.read(inode, 0, &mut output).unwrap();
-                    assert_eq!(output, bytes);
-                })
-            })
-            .collect();
-        for thread in threads {
-            thread.join().unwrap();
-        }
-    }
-}
+#[path = "../tests/fs/mod.rs"]
+mod tests;

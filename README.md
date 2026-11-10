@@ -152,6 +152,12 @@ let mount = fsk::MountSession::mount_network(
 `NetworkFile::Local` leases an explicitly downloaded file until `close_file`,
 letting the backend track activity and perform its own eviction.
 
+Use `fsk::local_file_directory()` for materialized files. On macOS the FSKit
+extension is sandboxed to the `group.dev.specta.fsk` App Group, so a local file
+in the process temporary directory can't be opened by the extension and the
+mount falls back to remote reads (or fails to open on older extensions). Create
+a backend-specific subdirectory beneath the returned directory.
+
 - macOS reads leased local files with `pread`, bypassing IPC.
 - Linux reads the local descriptor directly on its FUSE worker.
 - Windows ProjFS manages its virtualization root as the local hydration cache.
@@ -370,6 +376,34 @@ Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
 ```
 
 ProjFS requires an empty or previously initialized virtualization root.
+
+### Platform authorization
+
+`fsk::authorization_status()` reports whether the host can mount:
+
+```rust
+match fsk::authorization_status()? {
+    fsk::AuthorizationStatus::Authorized => {}
+    fsk::AuthorizationStatus::NotInstalled => {
+        // macOS only: install the matching FSK.app release.
+        fsk::install()?;
+    }
+    fsk::AuthorizationStatus::NeedsApproval => {
+        // macOS: enable the FSK extension in System Settings.
+        // Windows: enable the Projected File System optional component.
+        // Linux: make FUSE available.
+    }
+}
+# Ok::<(), std::io::Error>(())
+```
+
+`fsk::ensure_authorization()` performs the same check and opens the relevant
+setup UI: `FSK.app` on macOS and **Windows Features** on Windows. It returns an
+actionable error when setup is still required. Linux has no setup UI, so the
+error describes the FUSE requirement.
+
+Linux additionally needs a working FUSE installation and access to
+`/dev/fuse`.
 
 ## Contributing
 

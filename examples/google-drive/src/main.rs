@@ -1,8 +1,6 @@
 mod drive;
 
 use fsk::MountSession;
-#[cfg(target_os = "macos")]
-use fsk::{AuthorizationStatus, authorization_status, launch_app};
 use std::{
     env, io,
     sync::{
@@ -26,7 +24,7 @@ fn main() -> io::Result<()> {
             "set GOOGLE_DRIVE_ACCESS_TOKEN to an OAuth token with the drive scope",
         )
     })?;
-    check_platform_authorization()?;
+    fsk::ensure_authorization()?;
     let filesystem = drive::GoogleDrive::connect(token)?;
     let session = MountSession::mount_network(filesystem, &mount_path)?;
     println!(
@@ -41,29 +39,5 @@ fn main() -> io::Result<()> {
         thread::park_timeout(Duration::from_millis(250));
     }
     drop(session);
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn check_platform_authorization() -> io::Result<()> {
-    match authorization_status()? {
-        AuthorizationStatus::Authorized => Ok(()),
-        AuthorizationStatus::NeedsApproval => {
-            launch_app()?;
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "enable FSK in the window that opened, then run this command again",
-            ))
-        }
-        AuthorizationStatus::NotInstalled => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "install FSK.app with fsk::install() before mounting",
-        )),
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-#[allow(clippy::unnecessary_wraps)]
-fn check_platform_authorization() -> io::Result<()> {
     Ok(())
 }

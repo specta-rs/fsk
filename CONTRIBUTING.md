@@ -104,7 +104,9 @@ Linux is a single-process FUSE adapter built on `fuser`.
   handle, open flags, and the read/write buffer.
 
 At runtime the machine needs a working FUSE installation and access to
-`/dev/fuse`.
+`/dev/fuse`. `authorization_status()` reports `NeedsApproval` when `/dev/fuse`
+is missing, and `ensure_authorization()` returns the FUSE requirement as an
+actionable error.
 
 ### Windows
 
@@ -126,7 +128,9 @@ Windows is a single-process ProjFS provider.
   command id, callback flags, and the hydration buffer for reads.
 
 At runtime the Projected File System optional component (`Client-ProjFS`) must
-be enabled.
+be enabled. `authorization_status()` checks whether `ProjectedFSLib.dll` is
+available, and `ensure_authorization()` opens **Windows Features** and returns
+the requirement when it is missing.
 
 ## Developing with the FSKit extension
 

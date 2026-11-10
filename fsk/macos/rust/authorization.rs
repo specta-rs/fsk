@@ -15,6 +15,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::authorization::AuthorizationStatus;
 use parking_lot::Mutex;
 
 const APP_BUNDLE_IDENTIFIER: &str = "dev.specta.fsk";
@@ -38,50 +39,9 @@ pub enum AppInstallOutcome {
     Updated,
 }
 
-/// Whether macOS currently exposes the installed `FSK` module to `FSKit`.
-///
-/// Each status identifies the next setup step:
-///
-/// - [`NotInstalled`](Self::NotInstalled): call [`install`].
-/// - [`NeedsApproval`](Self::NeedsApproval): call [`launch_app`] so the user can
-///   register or enable the extension.
-/// - [`Authorized`](Self::Authorized): the filesystem can be mounted.
-///
-/// Installing does not register the extension, so a successful install is
-/// normally followed by [`launch_app`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AuthorizationStatus {
-    /// No companion app matching this SDK version is installed.
-    ///
-    /// The app is missing, unreadable, or built for a different SDK version.
-    /// Call [`install`] to install the matching release.
-    NotInstalled,
-    /// The app is installed but its extension is not registered or not enabled.
-    ///
-    /// Call [`launch_app`] so the user can register the extension and enable it
-    /// under **System Settings → General → Login Items & Extensions → File
-    /// System Extensions**.
-    NeedsApproval,
-    /// The extension is installed and enabled.
-    Authorized,
-}
-
-impl AuthorizationStatus {
-    /// Returns whether [`install`] should be called.
-    ///
-    /// This is `true` when the companion app matching this SDK version is not
-    /// installed. Installing does not authorize the extension, so the status is
-    /// normally [`NeedsApproval`](Self::NeedsApproval) afterwards and
-    /// [`launch_app`] is still needed.
-    #[must_use]
-    pub const fn needs_install(self) -> bool {
-        matches!(self, Self::NotInstalled)
-    }
-}
-
 /// Download and install the `FSK` companion app matching this SDK version.
 ///
-/// Call this when [`authorization_status`] reports
+/// Call this when [`authorization_status`](crate::authorization_status) reports
 /// [`AuthorizationStatus::NotInstalled`] (or when
 /// [`AuthorizationStatus::needs_install`] returns `true`). Installing does not
 /// authorize the extension; launch the app with [`launch_app`] afterwards.
@@ -271,7 +231,7 @@ fn app_matches_sdk(app: &Path) -> bool {
 
 /// Open the `FSK` companion app directly in its authorization guide.
 ///
-/// Call this when [`authorization_status`] reports
+/// Call this when [`authorization_status`](crate::authorization_status) reports
 /// [`AuthorizationStatus::NeedsApproval`], including right after a fresh
 /// installation: copying the app into place does not register its extension.
 ///

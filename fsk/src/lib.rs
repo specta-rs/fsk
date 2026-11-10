@@ -329,15 +329,21 @@
 //!
 //! # Platform setup
 //!
+//! [`authorization_status`] reports whether the host is ready, and
+//! [`ensure_authorization`] performs the same check while opening any setup UI
+//! the platform provides.
+//!
 //! - **macOS** uses an `FSKit` extension hosted by the companion `FSK.app`. The
 //!   app must be installed and its extension enabled in **System Settings →
 //!   General → Login Items & Extensions → File System Extensions**. The SDK
-//!   exposes `authorization_status`, `install`, `launch_app`, and `uninstall` to
-//!   automate that setup. `FSK_APP_PATH` overrides the app location during
-//!   development.
-//! - **Linux** requires a working FUSE installation and permission to mount.
+//!   exposes `install`, `launch_app`, and `uninstall` to automate that setup.
+//!   `FSK_APP_PATH` overrides the app location during development.
+//! - **Linux** requires FUSE: `/dev/fuse` must exist and the mounting user must
+//!   be allowed to use it.
 //! - **Windows** requires the Projected File System optional component
-//!   (`Client-ProjFS`).
+//!   (`Client-ProjFS`). [`ensure_authorization`] opens **Windows Features** when
+//!   it is missing; it can also be enabled from an administrator shell with
+//!   `Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS`.
 //!
 //! # Examples
 //!
@@ -354,8 +360,6 @@
 //! indexing, caching, synchronization, consistency, and persistence belong to
 //! the downstream type implementing [`Filesystem`].
 
-#[cfg(target_os = "macos")]
-#[path = "../macos/rust/authorization.rs"]
 mod authorization;
 mod core;
 #[cfg(target_os = "macos")]
@@ -367,6 +371,9 @@ mod ipc;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
+#[path = "../macos/rust/authorization.rs"]
+mod macos_authorization;
+#[cfg(target_os = "macos")]
 #[path = "../macos/rust/mount.rs"]
 mod mount;
 mod network;
@@ -374,14 +381,10 @@ pub mod raw;
 #[cfg(target_os = "windows")]
 mod windows;
 
+pub use authorization::{AuthorizationStatus, authorization_status, ensure_authorization};
 #[cfg(target_os = "macos")]
-pub use authorization::{
-    AppInstallOutcome, AuthorizationStatus, authorization_status, install, launch_app, uninstall,
-};
+pub use macos_authorization::{AppInstallOutcome, install, launch_app, uninstall};
 // Re-exporting the deprecated alias would otherwise trip `-D warnings` here.
-#[cfg(target_os = "macos")]
-#[allow(deprecated)]
-pub use authorization::open_authorization_app;
 pub use core::{
     DirectoryEntry, DirectorySink, Error, FileType, Filesystem, Metadata, ROOT_INODE,
     ReadDirectoryResult, Result, SetMetadata, StatFs, now_ns,
@@ -391,9 +394,13 @@ pub use ffi::{FskAttributes, FskDirEntry, FskSetAttributes, FskStatFs};
 #[cfg(target_os = "linux")]
 pub use linux::{MountOptions, MountSession};
 #[cfg(target_os = "macos")]
+#[allow(deprecated)]
+pub use macos_authorization::open_authorization_app;
+#[cfg(target_os = "macos")]
 pub use mount::{MountOptions, MountSession};
 pub use network::{
     KernelCachePolicy, LocalFile, Mount, NetworkConfiguration, NetworkFile, NetworkFilesystem,
+    local_file_directory,
 };
 #[cfg(target_os = "windows")]
 pub use windows::{MountOptions, MountSession};

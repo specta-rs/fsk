@@ -3,6 +3,54 @@
 use crate::{Filesystem, Result};
 use std::path::{Path, PathBuf};
 
+/// Returns a directory where materialized [`LocalFile`] paths can live.
+///
+/// On macOS the backend and the `FSKit` extension run in different processes,
+/// and the extension is sandboxed to the `group.dev.specta.fsk` App Group. A
+/// local file in the process temporary directory, or anywhere else outside the
+/// app group, can't be opened by the extension. This function returns the
+/// shared `Caches` directory inside that app group instead.
+///
+/// On other platforms this returns the process temporary directory.
+///
+/// The directory is created if needed. Backends should create their own
+/// subdirectory so independent mounts don't collide.
+///
+/// # Errors
+///
+/// Returns an error if the directory can't be created or the home directory
+/// can't be located.
+pub fn local_file_directory() -> std::io::Result<PathBuf> {
+    imp::local_file_directory()
+}
+
+#[cfg(target_os = "macos")]
+mod imp {
+    use std::path::PathBuf;
+
+    pub(super) fn local_file_directory() -> std::io::Result<PathBuf> {
+        let home = std::env::var_os("HOME").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "could not locate the user home directory",
+            )
+        })?;
+        let path = PathBuf::from(home).join("Library/Group Containers/group.dev.specta.fsk/Caches");
+        std::fs::create_dir_all(&path)?;
+        Ok(path)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod imp {
+    use std::path::PathBuf;
+
+    #[allow(clippy::unnecessary_wraps)]
+    pub(super) fn local_file_directory() -> std::io::Result<PathBuf> {
+        Ok(std::env::temp_dir())
+    }
+}
+
 /// The resource supplied by macOS when mounting a network filesystem.
 ///
 /// The resource is the opaque URL encoded in the `fsk://` mount resource that
@@ -84,7 +132,9 @@ impl LocalFile {
     ///
     /// The path must remain readable until the matching
     /// [`NetworkFilesystem::close_file`] call completes and must be valid UTF-8
-    /// for Foundation to open it.
+    /// for Foundation to open it. On macOS the path must also be inside the
+    /// sandboxed extension's App Group; use [`local_file_directory`] to find a
+    /// suitable directory.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>, generation: u64) -> Self {
         Self {

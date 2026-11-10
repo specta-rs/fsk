@@ -1,8 +1,6 @@
 mod fs;
 
 use fsk::MountSession;
-#[cfg(target_os = "macos")]
-use fsk::{AuthorizationStatus, authorization_status, launch_app};
 use std::{
     env, io,
     sync::{
@@ -26,7 +24,7 @@ fn main() -> io::Result<()> {
         |value| value.to_string_lossy().into_owned(),
     );
 
-    check_platform_authorization()?;
+    fsk::ensure_authorization()?;
     let filesystem = fs::filesystem(resource.as_bytes())
         .map_err(|error| io::Error::from_raw_os_error(error.0))?;
     let session = MountSession::mount_network(filesystem, &mount_path)?;
@@ -44,29 +42,5 @@ fn main() -> io::Result<()> {
     }
 
     drop(session);
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn check_platform_authorization() -> io::Result<()> {
-    match authorization_status()? {
-        AuthorizationStatus::Authorized => Ok(()),
-        AuthorizationStatus::NeedsApproval => {
-            launch_app()?;
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "enable FSK in the window that opened, then run this command again",
-            ))
-        }
-        AuthorizationStatus::NotInstalled => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "install FSK.app with fsk::install() before mounting",
-        )),
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-#[allow(clippy::unnecessary_wraps)]
-fn check_platform_authorization() -> io::Result<()> {
     Ok(())
 }
