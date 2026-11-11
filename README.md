@@ -115,7 +115,8 @@ default to `ENOTSUP`. Methods run concurrently, so implementations must be
 FSK deliberately implements neither trait for you. It chooses no inode index,
 cache, locking model, transaction boundary, consistency policy, or storage
 engine — those decisions belong to the backend. The workspace's backends are
-examples only; copy their ideas or replace them entirely.
+examples only; copy their ideas or replace them entirely. See
+[`examples/README.md`](examples/README.md) for the catalog.
 
 ## Mount prerequisites
 
@@ -312,26 +313,6 @@ are borrowed in place:
   process, so the bridge never presents unsafe cross-process pointer values.
 
 Raw pointers and buffers are valid only for the synchronous hook call.
-
-## Examples
-
-The workspace includes four standalone backends. They are not part of the
-published crate and make different storage and consistency choices on purpose.
-
-| Example | Package | What it shows |
-|---|---|---|
-| [`memory-backend`](examples/memory-backend) | `fsk-memory-backend` | A complete writable filesystem: sharded inode lookup, per-node locking, atomic renames, sparse files, and clean unmount on Ctrl-C. |
-| [`network-backend`](examples/network-backend) | `fsk-network-backend` | Lazy remote reads, downloaded-file leases, and the App Group file directory required by the macOS extension. |
-| [`google-drive`](examples/google-drive) | `fsk-google-drive` | A Drive mount spanning `My Drive`, shared items, and shared drives, with OAuth and per-file write capability checks. |
-| [`github-filesystem`](examples/github-filesystem) | `fsk-github-filesystem` | A read-only GitHub tree with lazy API-backed directories, atomic downloads, and LRU cache cleanup. |
-
-```sh
-cargo run -p fsk-memory-backend -- /path/to/mount
-```
-
-Control-C performs an orderly unmount, and the same executable builds against
-the native adapter selected by its target OS. See
-[`examples/README.md`](examples/README.md) for credentials and options.
 
 ## Architecture
 
