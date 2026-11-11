@@ -51,39 +51,6 @@ mod imp {
     }
 }
 
-/// The resource supplied by macOS when mounting a network filesystem.
-///
-/// The resource is the opaque URL encoded in the `fsk://` mount resource that
-/// started the extension. Most backends only need [`resource_url`](Self::resource_url)
-/// or [`resource_url_bytes`](Self::resource_url_bytes); the interpretation is
-/// application-defined (for example, an OAuth token or a remote share name).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Mount {
-    resource_url: Vec<u8>,
-}
-
-impl Mount {
-    #[cfg(target_os = "macos")]
-    pub(crate) fn new(resource_url: Vec<u8>) -> Self {
-        Self { resource_url }
-    }
-
-    /// Returns the URL as its original UTF-8 bytes.
-    #[must_use]
-    pub fn resource_url_bytes(&self) -> &[u8] {
-        &self.resource_url
-    }
-
-    /// Returns the URL as UTF-8.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the resource URL isn't valid UTF-8.
-    pub fn resource_url(&self) -> std::result::Result<&str, std::str::Utf8Error> {
-        std::str::from_utf8(&self.resource_url)
-    }
-}
-
 /// The kernel caching behavior requested by a network backend.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

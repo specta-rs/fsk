@@ -3,7 +3,10 @@ import Darwin
 import Foundation
 
 private let ipcMagic: UInt32 = 0x4653_4249
-private let ipcVersion: UInt16 = 1
+// Keep these in sync with `PROTOCOL_MAJOR` and `PROTOCOL_MINOR` in
+// `fsk/macos/rust/ipc.rs`; the Rust tests check the declaration text.
+let ipcProtocolMajor: UInt16 = 1
+let ipcProtocolMinor: UInt16 = 1
 private let ipcHeaderLength = 24
 private let ipcMaximumFrame = 16 * 1024 * 1024
 
@@ -27,10 +30,17 @@ private enum IPCOperation: UInt16 {
     case close = 16
 }
 
-enum RustBackendError: Error, Equatable {
+enum RustBackendError: Error, Equatable, CustomStringConvertible {
     case posix(Int32)
     case invalidResource
     case invalidProtocol
+    case protocolMismatch(
+        serverMajor: UInt16,
+        serverMinor: UInt16,
+        clientMajor: UInt16,
+        clientMinor: UInt16
+    )
+    case protocolTooOld(required: UInt16, negotiated: UInt16)
 
     var asPOSIXError: POSIXError {
         let code: POSIXErrorCode = POSIXErrorCode(rawValue: posixCode) ?? .EIO
@@ -41,7 +51,27 @@ enum RustBackendError: Error, Equatable {
         switch self {
         case let .posix(code): code
         case .invalidResource: EINVAL
-        case .invalidProtocol: EPROTO
+        case .invalidProtocol, .protocolMismatch, .protocolTooOld: EPROTO
+        }
+    }
+
+    /// Whether the peer is healthy but negotiated an older protocol revision.
+    var isProtocolTooOld: Bool {
+        if case .protocolTooOld = self { true } else { false }
+    }
+
+    var description: String {
+        switch self {
+        case let .posix(code):
+            "POSIX error \(code)"
+        case .invalidResource:
+            "invalid FSK resource"
+        case .invalidProtocol:
+            "invalid FSK protocol frame"
+        case let .protocolMismatch(serverMajor, serverMinor, clientMajor, clientMinor):
+            "FSK.app (protocol \(clientMajor).\(clientMinor)) and this SDK (protocol \(serverMajor).\(serverMinor)) speak incompatible protocol versions; install or update FSK.app, or use a matching SDK"
+        case let .protocolTooOld(required, negotiated):
+            "FSK.app negotiated protocol revision \(negotiated) but this operation requires \(required); install or update FSK.app"
         }
     }
 }
@@ -381,12 +411,24 @@ private final class IPCConnectionPool: @unchecked Sendable {
         self.token = token
     }
 
-    func request(_ operation: IPCOperation, _ body: Data = Data()) throws -> Data {
+    /// Send a request. `minimumMinor` is the protocol revision the operation
+    /// needs; a connection that negotiated less throws `protocolTooOld` instead
+    /// of sending a frame an older SDK cannot interpret.
+    func request(
+        _ operation: IPCOperation,
+        _ body: Data = Data(),
+        minimumMinor: UInt16 = 0
+    ) throws -> Data {
         let connection = try checkout()
         var reusable = true
         defer { checkin(connection, reusable: reusable) }
         do {
-            return try connection.request(operation, body)
+            return try connection.request(operation, body, minimumMinor: minimumMinor)
+        } catch let error as RustBackendError {
+            // A minor-version refusal happens before anything is written, so
+            // the connection is still healthy.
+            reusable = !error.isProtocolTooOld
+            throw error
         } catch {
             reusable = false
             throw error
@@ -432,13 +474,16 @@ private final class IPCConnectionPool: @unchecked Sendable {
 private final class IPCConnection {
     private var descriptor: Int32
     private var nextRequestID: UInt64 = 2
+    /// Protocol revision agreed during `hello`: the lower of the two sides.
+    private(set) var negotiatedMinor: UInt16 = 0
 
     init(socketPath: String, token: Data) throws {
         descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw RustBackendError.posix(errno) }
         do {
             try connect(path: socketPath)
-            _ = try request(.hello, token, requestID: 1)
+            let hello = try requestRaw(.hello, token, requestID: 1)
+            negotiatedMinor = hello.minor
         } catch {
             Darwin.close(descriptor)
             descriptor = -1
@@ -452,31 +497,60 @@ private final class IPCConnection {
         }
     }
 
-    func request(_ operation: IPCOperation, _ body: Data) throws -> Data {
-        let requestID = nextRequestID
-        nextRequestID &+= 1
-        return try request(operation, body, requestID: requestID)
+    func request(
+        _ operation: IPCOperation,
+        _ body: Data = Data(),
+        minimumMinor: UInt16 = 0
+    ) throws -> Data {
+        guard negotiatedMinor >= minimumMinor else {
+            throw RustBackendError.protocolTooOld(
+                required: minimumMinor,
+                negotiated: negotiatedMinor
+            )
+        }
+        return try requestRaw(operation, body).body
     }
 
-    private func request(_ operation: IPCOperation, _ body: Data, requestID: UInt64) throws -> Data {
+    private func requestRaw(
+        _ operation: IPCOperation,
+        _ body: Data
+    ) throws -> (body: Data, minor: UInt16) {
+        let requestID = nextRequestID
+        nextRequestID &+= 1
+        return try requestRaw(operation, body, requestID: requestID)
+    }
+
+    private func requestRaw(
+        _ operation: IPCOperation,
+        _ body: Data,
+        requestID: UInt64
+    ) throws -> (body: Data, minor: UInt16) {
         guard body.count <= ipcMaximumFrame else { throw RustBackendError.posix(E2BIG) }
         var header = IPCEncoder(capacity: ipcHeaderLength)
         header.append(ipcMagic)
-        header.append(ipcVersion)
+        header.append(ipcProtocolMajor)
         header.append(operation.rawValue)
         header.append(requestID)
         header.append(UInt32(body.count))
-        header.append(UInt32(0))
+        header.append(ipcProtocolMinor)
+        header.append(UInt16(0))
         try writePair(header.data, body)
 
         let responseHeader = try readExactly(ipcHeaderLength)
         var decoder = IPCDecoder(responseHeader)
-        guard try decoder.uint32() == ipcMagic,
-              try decoder.uint16() == ipcVersion
-        else {
+        guard try decoder.uint32() == ipcMagic else {
             throw RustBackendError.invalidProtocol
         }
-        _ = try decoder.uint16()
+        let serverMajor = try decoder.uint16()
+        let serverMinor = try decoder.uint16()
+        guard serverMajor == ipcProtocolMajor else {
+            throw RustBackendError.protocolMismatch(
+                serverMajor: serverMajor,
+                serverMinor: serverMinor,
+                clientMajor: ipcProtocolMajor,
+                clientMinor: ipcProtocolMinor
+            )
+        }
         guard try decoder.uint64() == requestID else { throw RustBackendError.invalidProtocol }
         let status = try decoder.int32()
         let length = Int(try decoder.uint32())
@@ -485,7 +559,7 @@ private final class IPCConnection {
         if status != 0 {
             throw RustBackendError.posix(status)
         }
-        return response
+        return (response, serverMinor)
     }
 
     private func connect(path: String) throws {

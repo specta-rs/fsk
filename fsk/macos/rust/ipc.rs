@@ -17,7 +17,20 @@ use std::{
 };
 
 pub(crate) const MAGIC: u32 = 0x4653_4249;
-pub(crate) const VERSION: u16 = 1;
+/// Incompatible generation of the Rust <-> Swift protocol.
+///
+/// Peers must agree on the major version exactly. Bump it when an opcode is
+/// removed, an existing payload changes meaning, or the size or meaning of a
+/// non-reserved frame field changes. Reinterpreting bytes that older peers
+/// were required to write as zero is a minor change, not a major one.
+pub const PROTOCOL_MAJOR: u16 = 1;
+/// Additive revision of the Rust <-> Swift protocol.
+///
+/// Minor revisions only add opcodes, trailing fields, or meaning to previously
+/// reserved bytes. Peers use the lower of the two advertised minor versions, so
+/// an old app keeps working with a new SDK and vice versa. Bump it whenever an
+/// opcode or field is added.
+pub const PROTOCOL_MINOR: u16 = 1;
 pub(crate) const HEADER_LEN: usize = 24;
 pub(crate) const MAX_FRAME: usize = 16 * 1024 * 1024;
 
@@ -95,18 +108,25 @@ impl Service {
 
     pub(crate) fn serve_connection(&self, mut stream: UnixStream) -> io::Result<()> {
         stream.set_nonblocking(false)?;
-        let (request_id, operation, payload) = read_request(&mut stream)?;
-        if operation != opcode::HELLO || payload.as_slice() != self.token {
-            write_response(&mut stream, request_id, libc::EACCES, &[])?;
+        let request = Request::read(&mut stream)?;
+        if request.major != PROTOCOL_MAJOR {
+            write_response(&mut stream, request.id, PROTOCOL_MINOR, libc::EPROTO, &[])?;
+            return Err(protocol_mismatch(request.major, request.minor));
+        }
+        if request.operation != opcode::HELLO || request.payload.as_slice() != self.token {
+            write_response(&mut stream, request.id, PROTOCOL_MINOR, libc::EACCES, &[])?;
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "invalid FSK capability",
             ));
         }
-        write_response(&mut stream, request_id, 0, &[])?;
+        // The app and the SDK each advertise the newest revision they
+        // understand; both then restrict themselves to the lower one.
+        let negotiated_minor = request.minor.min(PROTOCOL_MINOR);
+        write_response(&mut stream, request.id, negotiated_minor, 0, &[])?;
 
         loop {
-            let (request_id, operation, payload) = match read_request(&mut stream) {
+            let request = match Request::read(&mut stream) {
                 Ok(value) => value,
                 Err(error)
                     if matches!(
@@ -120,13 +140,27 @@ impl Service {
                 }
                 Err(error) => return Err(error),
             };
+            // `HELLO` agreed the major version; a later frame that changes it
+            // is a protocol violation, not a request to dispatch.
+            if request.major != PROTOCOL_MAJOR {
+                write_response(&mut stream, request.id, PROTOCOL_MINOR, libc::EPROTO, &[])?;
+                return Err(protocol_mismatch(request.major, request.minor));
+            }
             let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.dispatch(request_id, operation, &payload)
+                self.dispatch(request.id, request.operation, &request.payload)
             }))
             .unwrap_or(Err(Error::IO));
             match response {
-                Ok(body) => write_response(&mut stream, request_id, 0, &body)?,
-                Err(error) => write_response(&mut stream, request_id, error.0.max(1), &[])?,
+                Ok(body) => {
+                    write_response(&mut stream, request.id, negotiated_minor, 0, &body)?;
+                }
+                Err(error) => write_response(
+                    &mut stream,
+                    request.id,
+                    negotiated_minor,
+                    error.0.max(1),
+                    &[],
+                )?,
             }
         }
     }
@@ -475,42 +509,70 @@ impl DirectorySink for PackedDirectorySink {
     }
 }
 
-fn read_request(stream: &mut UnixStream) -> io::Result<(u64, u16, Vec<u8>)> {
-    let mut header = [0; HEADER_LEN];
-    stream.read_exact(&mut header)?;
-    let mut input = Decoder::new(&header);
-    if input.u32_io()? != MAGIC || input.u16_io()? != VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid FSK frame",
-        ));
+struct Request {
+    major: u16,
+    operation: u16,
+    minor: u16,
+    id: u64,
+    payload: Vec<u8>,
+}
+
+impl Request {
+    fn read(stream: &mut UnixStream) -> io::Result<Self> {
+        let mut header = [0; HEADER_LEN];
+        stream.read_exact(&mut header)?;
+        let mut input = Decoder::new(&header);
+        if input.u32_io()? != MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid FSK frame",
+            ));
+        }
+        let major = input.u16_io()?;
+        let operation = input.u16_io()?;
+        let id = input.u64_io()?;
+        let length = usize::try_from(input.u32_io()?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "oversized frame"))?;
+        let minor = input.u16_io()?;
+        let _flags = input.u16_io()?;
+        if length > MAX_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversized frame",
+            ));
+        }
+        let mut payload = vec![0; length];
+        stream.read_exact(&mut payload)?;
+        Ok(Self {
+            major,
+            operation,
+            minor,
+            id,
+            payload,
+        })
     }
-    let operation = input.u16_io()?;
-    let request_id = input.u64_io()?;
-    let length = usize::try_from(input.u32_io()?)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "oversized frame"))?;
-    let _reserved = input.u32_io()?;
-    if length > MAX_FRAME {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "oversized frame",
-        ));
-    }
-    let mut payload = vec![0; length];
-    stream.read_exact(&mut payload)?;
-    Ok((request_id, operation, payload))
+}
+
+fn protocol_mismatch(client_major: u16, client_minor: u16) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "FSK protocol {client_major}.{client_minor} cannot talk to this SDK ({PROTOCOL_MAJOR}.{PROTOCOL_MINOR}); install or update FSK.app"
+        ),
+    )
 }
 
 fn write_response(
     stream: &mut UnixStream,
     request_id: u64,
+    minor: u16,
     status: i32,
     payload: &[u8],
 ) -> io::Result<()> {
     let mut header = Encoder::with_capacity(HEADER_LEN);
     header.u32(MAGIC);
-    header.u16(VERSION);
-    header.u16(0);
+    header.u16(PROTOCOL_MAJOR);
+    header.u16(minor);
     header.u64(request_id);
     header.i32(status);
     header.u32(u32::try_from(payload.len()).map_err(|_| {
@@ -629,10 +691,16 @@ mod tests {
         let (mut client, server) = UnixStream::pair().unwrap();
         let worker = std::thread::spawn(move || service.serve_connection(server).unwrap());
 
-        send_request(&mut client, 1, opcode::HELLO, &token);
-        assert_eq!(read_test_response(&mut client).0, 0);
-        send_request(&mut client, 2, opcode::GETATTR, &ROOT_INODE.to_le_bytes());
-        let (status, body) = read_test_response(&mut client);
+        send_request(&mut client, 1, opcode::HELLO, PROTOCOL_MINOR, &token);
+        assert_eq!(read_test_response(&mut client).1, 0);
+        send_request(
+            &mut client,
+            2,
+            opcode::GETATTR,
+            PROTOCOL_MINOR,
+            &ROOT_INODE.to_le_bytes(),
+        );
+        let (_, status, body) = read_test_response(&mut client);
         assert_eq!(status, 0);
         assert_eq!(
             u64::from_le_bytes(body[0..8].try_into().unwrap()),
@@ -650,9 +718,130 @@ mod tests {
         let worker = std::thread::spawn(move || {
             assert!(service.serve_connection(server).is_err());
         });
-        send_request(&mut client, 1, opcode::HELLO, &[8; 32]);
-        assert_eq!(read_test_response(&mut client).0, libc::EACCES);
+        send_request(&mut client, 1, opcode::HELLO, PROTOCOL_MINOR, &[8; 32]);
+        assert_eq!(read_test_response(&mut client).1, libc::EACCES);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn hello_negotiates_the_lower_minor_version() {
+        for client_minor in [0, PROTOCOL_MINOR, PROTOCOL_MINOR + 7] {
+            let service = Arc::new(Service::local(TestFilesystem::default(), [7; 32]));
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let worker = std::thread::spawn(move || service.serve_connection(server).unwrap());
+
+            send_request(&mut client, 1, opcode::HELLO, client_minor, &[7; 32]);
+            let (minor, status, _) = read_test_response(&mut client);
+            assert_eq!(status, 0, "client_minor={client_minor}");
+            assert_eq!(
+                minor,
+                client_minor.min(PROTOCOL_MINOR),
+                "client_minor={client_minor}"
+            );
+            drop(client);
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_different_protocol_major_is_rejected() {
+        let service = Arc::new(Service::local(TestFilesystem::default(), [7; 32]));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let error = service.serve_connection(server).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("cannot talk to this SDK"));
+        });
+
+        send_request_with_major(
+            &mut client,
+            1,
+            PROTOCOL_MAJOR + 1,
+            opcode::HELLO,
+            PROTOCOL_MINOR,
+            &[7; 32],
+        );
+        let (minor, status, body) = read_test_response(&mut client);
+        assert_eq!(status, libc::EPROTO);
+        assert_eq!(minor, PROTOCOL_MINOR);
+        assert_eq!(body, Vec::<u8>::new());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_major_change_after_hello_is_rejected() {
+        let service = Arc::new(Service::local(TestFilesystem::default(), [7; 32]));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let error = service.serve_connection(server).unwrap_err();
+            assert!(error.to_string().contains("cannot talk to this SDK"));
+        });
+
+        send_request(&mut client, 1, opcode::HELLO, PROTOCOL_MINOR, &[7; 32]);
+        assert_eq!(read_test_response(&mut client).1, 0);
+        send_request_with_major(
+            &mut client,
+            2,
+            PROTOCOL_MAJOR + 1,
+            opcode::GETATTR,
+            PROTOCOL_MINOR,
+            &ROOT_INODE.to_le_bytes(),
+        );
+        let (_, status, body) = read_test_response(&mut client);
+        assert_eq!(status, libc::EPROTO);
+        assert_eq!(body, Vec::<u8>::new());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn the_hello_frame_layout_is_stable() {
+        assert_eq!(HEADER_LEN, 24);
+        // A frame is fixed little-endian: magic, major, opcode, request id,
+        // body length, client minor, flags, then the body.
+        let mut expected = vec![0x49, 0x42, 0x53, 0x46]; // magic
+        expected.extend_from_slice(&PROTOCOL_MAJOR.to_le_bytes());
+        expected.extend_from_slice(&[0x00, 0x00]); // HELLO
+        expected.extend_from_slice(&1_u64.to_le_bytes()); // request id
+        expected.extend_from_slice(&3_u32.to_le_bytes()); // body length
+        expected.extend_from_slice(&PROTOCOL_MINOR.to_le_bytes());
+        expected.extend_from_slice(&[0x00, 0x00]); // flags
+        expected.extend_from_slice(b"abc");
+        assert_eq!(
+            encode_request(1, PROTOCOL_MAJOR, opcode::HELLO, PROTOCOL_MINOR, b"abc"),
+            expected
+        );
+    }
+
+    #[test]
+    fn the_swift_bridge_declares_the_same_protocol_version() {
+        // The extension cannot import the Rust constants, so guard the two
+        // hand-maintained copies against drift here.
+        let macos = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("macos");
+        let swift = macos.join("FSKExtension/RustBackend.swift");
+        if let Ok(source) = std::fs::read_to_string(&swift) {
+            assert!(
+                source.contains(&format!("ipcProtocolMajor: UInt16 = {PROTOCOL_MAJOR}")),
+                "RustBackend.swift must declare ipcProtocolMajor = {PROTOCOL_MAJOR}"
+            );
+            assert!(
+                source.contains(&format!("ipcProtocolMinor: UInt16 = {PROTOCOL_MINOR}")),
+                "RustBackend.swift must declare ipcProtocolMinor = {PROTOCOL_MINOR}"
+            );
+        }
+
+        let plist = macos.join("FSKExtension/Info.plist");
+        if let Ok(source) = std::fs::read_to_string(&plist) {
+            assert_eq!(
+                plist_integer(&source, "FSKProtocolMajor"),
+                Some(PROTOCOL_MAJOR),
+                "FSKExtension/Info.plist must declare FSKProtocolMajor = {PROTOCOL_MAJOR}"
+            );
+            assert_eq!(
+                plist_integer(&source, "FSKProtocolMinor"),
+                Some(PROTOCOL_MINOR),
+                "FSKExtension/Info.plist must declare FSKProtocolMinor = {PROTOCOL_MINOR}"
+            );
+        }
     }
 
     #[test]
@@ -695,8 +884,8 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        send_request(&mut client, 1, opcode::HELLO, &token);
-        assert_eq!(read_test_response(&mut client).0, 0);
+        send_request(&mut client, 1, opcode::HELLO, PROTOCOL_MINOR, &token);
+        assert_eq!(read_test_response(&mut client).1, 0);
         drop(client);
         worker.join().unwrap();
     }
@@ -709,8 +898,8 @@ mod tests {
         let service = Arc::new(Service::local(filesystem, token));
         let (mut client, server) = UnixStream::pair().unwrap();
         let worker = std::thread::spawn(move || service.serve_connection(server).unwrap());
-        send_request(&mut client, 1, opcode::HELLO, &token);
-        assert_eq!(read_test_response(&mut client).0, 0);
+        send_request(&mut client, 1, opcode::HELLO, PROTOCOL_MINOR, &token);
+        assert_eq!(read_test_response(&mut client).1, 0);
 
         let mut request = Encoder::with_capacity(13);
         request.u64(ROOT_INODE);
@@ -719,8 +908,14 @@ mod tests {
         let iterations = 100_000_u32;
         let start = std::time::Instant::now();
         for index in 0..iterations {
-            send_request(&mut client, u64::from(index) + 2, opcode::LOOKUP, &request);
-            assert_eq!(read_test_response(&mut client).0, 0);
+            send_request(
+                &mut client,
+                u64::from(index) + 2,
+                opcode::LOOKUP,
+                PROTOCOL_MINOR,
+                &request,
+            );
+            assert_eq!(read_test_response(&mut client).1, 0);
         }
         let elapsed = start.elapsed();
         eprintln!(
@@ -732,25 +927,49 @@ mod tests {
         worker.join().unwrap();
     }
 
-    fn send_request(stream: &mut UnixStream, id: u64, operation: u16, payload: &[u8]) {
+    fn send_request(stream: &mut UnixStream, id: u64, operation: u16, minor: u16, payload: &[u8]) {
+        send_request_with_major(stream, id, PROTOCOL_MAJOR, operation, minor, payload);
+    }
+
+    fn send_request_with_major(
+        stream: &mut UnixStream,
+        id: u64,
+        major: u16,
+        operation: u16,
+        minor: u16,
+        payload: &[u8],
+    ) {
+        let frame = encode_request(id, major, operation, minor, payload);
+        stream.write_all(&frame).unwrap();
+    }
+
+    fn encode_request(id: u64, major: u16, operation: u16, minor: u16, payload: &[u8]) -> Vec<u8> {
         let mut frame = Encoder::with_capacity(HEADER_LEN + payload.len());
         frame.u32(MAGIC);
-        frame.u16(VERSION);
+        frame.u16(major);
         frame.u16(operation);
         frame.u64(id);
         frame.u32(u32::try_from(payload.len()).unwrap());
-        frame.u32(0);
+        frame.u16(minor);
+        frame.u16(0);
         frame.bytes(payload);
-        stream.write_all(&frame.finish()).unwrap();
+        frame.finish()
     }
 
-    fn read_test_response(stream: &mut UnixStream) -> (i32, Vec<u8>) {
+    fn read_test_response(stream: &mut UnixStream) -> (u16, i32, Vec<u8>) {
         let mut header = [0; HEADER_LEN];
         stream.read_exact(&mut header).unwrap();
+        let minor = u16::from_le_bytes(header[6..8].try_into().unwrap());
         let status = i32::from_le_bytes(header[16..20].try_into().unwrap());
         let length = u32::from_le_bytes(header[20..24].try_into().unwrap()) as usize;
         let mut body = vec![0; length];
         stream.read_exact(&mut body).unwrap();
-        (status, body)
+        (minor, status, body)
+    }
+
+    fn plist_integer(source: &str, key: &str) -> Option<u16> {
+        let rest = source.split(&format!("<key>{key}</key>")).nth(1)?;
+        let value = rest.split("<integer>").nth(1)?;
+        value.split("</integer>").next()?.trim().parse().ok()
     }
 }

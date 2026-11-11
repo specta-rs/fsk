@@ -15,9 +15,9 @@ use std::io;
 /// [`authorization_status`] performs the platform-specific check.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthorizationStatus {
-    /// No companion app matching this SDK version is installed.
+    /// No companion app with a compatible protocol version is installed.
     ///
-    /// Only macOS returns this. Call `fsk::install()` to install the matching
+    /// Only macOS returns this. Call `fsk::install()` to install a compatible
     /// release, then launch the app to register its extension.
     NotInstalled,
     /// The platform component or extension needs a user action.
@@ -34,9 +34,10 @@ pub enum AuthorizationStatus {
 impl AuthorizationStatus {
     /// Returns whether `fsk::install()` should be called.
     ///
-    /// This is only `true` on macOS when the matching companion app is not
-    /// installed. Installing does not authorize the extension, so the status is
-    /// normally [`NeedsApproval`](Self::NeedsApproval) afterwards.
+    /// This is only `true` on macOS when the companion app is missing or speaks
+    /// an incompatible protocol version. Installing does not authorize the
+    /// extension, so the status is normally [`NeedsApproval`](Self::NeedsApproval)
+    /// afterwards.
     #[must_use]
     pub const fn needs_install(self) -> bool {
         matches!(self, Self::NotInstalled)

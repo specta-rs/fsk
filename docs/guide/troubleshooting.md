@@ -11,12 +11,13 @@ below before changing the backend.
 
 ### `authorization_status()` says `NotInstalled` after installing
 
-The status compares `CFBundleShortVersionString` with the crate version and the bundle
-identifier with `dev.specta.fsk`. Both must match exactly. An SDK built against a different
-release, or a git build between releases, reports against the last released version.
+The status reads `FSKProtocolMajor` from the embedded extension's `Info.plist` and the bundle
+identifier `dev.specta.fsk`. The app is compatible when the protocol major matches and the
+identifier is correct; the marketing version is irrelevant. An app with no protocol keys is
+treated as legacy protocol 1.0.
 
-Use the matching crate version, or point `FSK_APP_PATH` at a development build whose marketing
-version matches.
+Point `FSK_APP_PATH` at a development build, or run `fsk::install()` to replace an app whose
+protocol major does not match the SDK.
 
 ### `ensure_authorization()` returns `NotFound`
 

@@ -212,7 +212,8 @@ pub enum NativeRequest<'a> {
         /// Reserved native flags. Currently always `0`.
         flags: u64,
         /// The raw IPC request body. Its layout is an implementation detail of
-        /// the Rust/Swift bridge and may change between versions.
+        /// the Rust/Swift bridge. `PROTOCOL_MAJOR` changes only when that layout
+        /// changes incompatibly; prefer the portable operations.
         payload: &'a [u8],
     },
     /// Borrowed FUSE request. `request` points at fuser's request object and is

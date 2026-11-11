@@ -8,10 +8,11 @@ the user to enable it.
 ## Setup flow
 
 1. An embedding application installs `FSK.app` with `fsk::install()`.
-   `fsk::authorization_status()` reports `NotInstalled` when the matching app
-   is missing, so `install()` should run first. The app goes into a hidden
-   per-user directory, `~/Library/Application Support/dev.specta.fsk/FSK.app`,
-   and a legacy `/Applications/FSK.app` from an older SDK is removed.
+   `fsk::authorization_status()` reports `NotInstalled` when no app with a
+   compatible IPC protocol is installed, so `install()` should run first. The
+   app goes into a hidden per-user directory,
+   `~/Library/Application Support/dev.specta.fsk/FSK.app`, and a legacy
+   `/Applications/FSK.app` from an older SDK is removed.
 2. The embedding application calls `fsk::launch_app()` when
    `fsk::authorization_status()` reports `NeedsApproval`. A freshly installed
    app is not registered with `FSKit` until it has been launched once.

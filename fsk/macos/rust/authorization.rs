@@ -16,6 +16,7 @@ use std::{
 };
 
 use crate::authorization::AuthorizationStatus;
+use crate::ipc::PROTOCOL_MAJOR;
 use parking_lot::Mutex;
 
 const APP_BUNDLE_IDENTIFIER: &str = "dev.specta.fsk";
@@ -29,6 +30,12 @@ const APP_SUPPORT_DIRECTORY: &str = "Library/Application Support/dev.specta.fsk"
 /// hidden per-user install. It is migrated away by `install` and `uninstall`.
 const LEGACY_APP_PATH: &str = "/Applications/FSK.app";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Where Xcode embeds the `FSKit` extension inside the app bundle.
+const EXTENSION_INFO_PLIST: &str = "Contents/Extensions/FSKExtension.appex/Contents/Info.plist";
+const APP_PROTOCOL_MAJOR_KEY: &str = "FSKProtocolMajor";
+const APP_PROTOCOL_MINOR_KEY: &str = "FSKProtocolMinor";
+/// Releases made before protocol metadata existed speak protocol 1.0.
+const LEGACY_PROTOCOL_MAJOR: u16 = 1;
 const RELEASE_BASE_URL: &str = "https://github.com/specta-rs/fsk/releases/download";
 const RELEASE_API_URL: &str = "https://api.github.com/repos/specta-rs/fsk/releases/tags";
 const STALE_ENTRY_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -38,7 +45,7 @@ static ENTRY_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// The result of installing the companion application for this SDK version.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppInstallOutcome {
-    /// The matching application was already installed.
+    /// A compatible application was already installed.
     AlreadyInstalled,
     /// No application was present, so it was installed.
     Installed,
@@ -46,7 +53,7 @@ pub enum AppInstallOutcome {
     Updated,
 }
 
-/// Download and install the `FSK` companion app matching this SDK version.
+/// Download and install the `FSK` companion app for this SDK.
 ///
 /// Call this when [`authorization_status`](crate::authorization_status) reports
 /// [`AuthorizationStatus::NotInstalled`] (or when
@@ -56,9 +63,10 @@ pub enum AppInstallOutcome {
 /// The app is installed per-user in a hidden directory:
 /// `~/Library/Application Support/dev.specta.fsk/FSK.app`. It is not shared
 /// between users, does not appear in Applications or Launchpad, and needs no
-/// administrator permission. Installation requires an exact version match, so a
-/// program built against an older SDK can replace (downgrade) an app installed
-/// by a newer SDK.
+/// administrator permission. Compatibility is determined by the Rust <-> Swift
+/// protocol version, not by the app's marketing version: an installed app that
+/// speaks the same protocol major version is left alone even when its product
+/// version differs.
 ///
 /// When the default destination is used, a legacy machine-wide
 /// `/Applications/FSK.app` from an older SDK is removed (best-effort) after the
@@ -69,9 +77,9 @@ pub enum AppInstallOutcome {
 /// This operation is synchronous and never launches the application or presents
 /// UI, so callers can run it on a background thread or executor of their choice.
 /// The release is downloaded from GitHub, checked by macOS, and installed in the
-/// hidden per-user directory. An already installed, valid matching version is
-/// left alone. An interrupted previous installation is recovered before any
-/// download begins.
+/// hidden per-user directory. An already installed, valid, protocol-compatible
+/// version is left alone. An interrupted previous installation is recovered
+/// before any download begins.
 ///
 /// Set `FSK_APP_PATH` to the full path of an app bundle (for example
 /// `~/Library/Application Support/dev.specta.fsk/FSK.app`) to choose a different
@@ -115,7 +123,7 @@ pub fn install() -> io::Result<AppInstallOutcome> {
     let _lock = AppLock::acquire(parent)?;
     recover_interrupted_install(&destination)?;
     let was_installed = path_present(&destination)?;
-    let outcome = if validate_app(&destination, APP_VERSION).is_ok() {
+    let outcome = if validate_app(&destination).is_ok() {
         AppInstallOutcome::AlreadyInstalled
     } else {
         if was_installed && !is_fsk_app(&destination)? {
@@ -205,8 +213,8 @@ pub fn uninstall() -> io::Result<bool> {
 /// Ask the installed Swift app for the current `FSKit` authorization state.
 ///
 /// The returned [`AuthorizationStatus`] tells the caller which setup step to
-/// take next. [`AuthorizationStatus::NotInstalled`] means the matching
-/// companion app is missing (or is a different version) and
+/// take next. [`AuthorizationStatus::NotInstalled`] means the companion app is
+/// missing or its extension speaks an incompatible protocol version and
 /// [`install`] should be called;
 /// [`AuthorizationStatus::NeedsApproval`] means the app is installed but the
 /// extension is not registered or not enabled, so [`launch_app`] should be
@@ -250,16 +258,50 @@ fn authorization_status_at(app: &Path) -> io::Result<AuthorizationStatus> {
     }
 }
 
-/// Whether the app bundle at `app` is the release matching this SDK version.
+/// Whether the app bundle at `app` can serve this SDK.
 ///
-/// This mirrors the version and bundle-identifier checks in [`validate_app`]
+/// This mirrors the bundle-identifier and protocol checks in [`validate_app`]
 /// without verifying the code signature: the status query only needs to decide
-/// whether [`install`] should run, and a development build
-/// selected through `FSK_APP_PATH` is not signed by the release identity.
+/// whether [`install`] should run, and a development build selected through
+/// `FSK_APP_PATH` is not signed by the release identity.
 fn app_matches_sdk(app: &Path) -> bool {
     app.join(APP_EXECUTABLE).is_file()
-        && app_version(app).ok().flatten().as_deref() == Some(APP_VERSION)
         && app_bundle_identifier(app).ok().flatten().as_deref() == Some(APP_BUNDLE_IDENTIFIER)
+        && app_protocol(app)
+            .ok()
+            .flatten()
+            .is_some_and(|(major, _)| major == PROTOCOL_MAJOR)
+}
+
+/// The Rust <-> Swift protocol revision declared by the app's embedded
+/// extension, or `None` when the bundle has no extension.
+///
+/// Missing keys mean the app predates protocol metadata and speaks the legacy
+/// protocol 1.0, so old installs remain compatible when the major version has
+/// not changed.
+fn app_protocol(app: &Path) -> io::Result<Option<(u16, u16)>> {
+    let Some(info) = extension_info_plist(app) else {
+        return Ok(None);
+    };
+    let plist = plist_json(&info)?;
+    Ok(Some((
+        plist_integer(&plist, APP_PROTOCOL_MAJOR_KEY)?.unwrap_or(LEGACY_PROTOCOL_MAJOR),
+        plist_integer(&plist, APP_PROTOCOL_MINOR_KEY)?.unwrap_or(0),
+    )))
+}
+
+/// Locate the embedded extension's `Info.plist`.
+///
+/// `ExtensionKit` extensions live in `Contents/Extensions`; older app-extension
+/// bundles use `Contents/PlugIns`. Accept both so development builds and
+/// releases report the same protocol.
+fn extension_info_plist(app: &Path) -> Option<PathBuf> {
+    let extension = app.join(EXTENSION_INFO_PLIST);
+    if extension.is_file() {
+        return Some(extension);
+    }
+    let plugin = app.join("Contents/PlugIns/FSKExtension.appex/Contents/Info.plist");
+    plugin.is_file().then_some(plugin)
 }
 
 /// Open the `FSK` companion app directly in its authorization guide.
@@ -328,7 +370,7 @@ fn install_from_release(temporary: &Path, destination: &Path) -> io::Result<()> 
 
     let source = extracted.join("FSK.app");
     require_real_directory(&source)?;
-    validate_app(&source, APP_VERSION)?;
+    validate_app(&source)?;
 
     // The destination was validated in `install`, so it has a
     // parent and a final component.
@@ -348,8 +390,7 @@ fn install_from_release(temporary: &Path, destination: &Path) -> io::Result<()> 
     }
 
     // The bytes that get swapped into place must be the bytes we validated.
-    let stage_check =
-        require_real_directory(&staged_app).and_then(|()| validate_app(&staged_app, APP_VERSION));
+    let stage_check = require_real_directory(&staged_app).and_then(|()| validate_app(&staged_app));
     if let Err(error) = stage_check {
         let _ = remove_path(&staging);
         return Err(error);
@@ -824,12 +865,23 @@ fn require_real_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_app(app: &Path, expected_version: &str) -> io::Result<()> {
-    if app_version(app)?.as_deref() != Some(expected_version) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "FSK.app version does not match the Rust SDK",
-        ));
+fn validate_app(app: &Path) -> io::Result<()> {
+    match app_protocol(app)? {
+        Some((major, _)) if major == PROTOCOL_MAJOR => {}
+        Some((major, minor)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "FSK.app speaks protocol {major}.{minor} but this SDK requires {PROTOCOL_MAJOR}.x"
+                ),
+            ));
+        }
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FSK.app does not contain an FSKit extension",
+            ));
+        }
     }
     if app_bundle_identifier(app)?.as_deref() != Some(APP_BUNDLE_IDENTIFIER) {
         return Err(io::Error::new(
@@ -1004,13 +1056,6 @@ fn path_present(path: &Path) -> io::Result<bool> {
     }
 }
 
-fn app_version(app: &Path) -> io::Result<Option<String>> {
-    if !app.exists() {
-        return Ok(None);
-    }
-    plist_string(app, "CFBundleShortVersionString")
-}
-
 fn app_bundle_identifier(app: &Path) -> io::Result<Option<String>> {
     if !app.exists() {
         return Ok(None);
@@ -1029,6 +1074,42 @@ fn plist_string(app: &Path, key: &str) -> io::Result<Option<String>> {
     Ok(Some(
         String::from_utf8_lossy(&output.stdout).trim().to_owned(),
     ))
+}
+
+/// Parse a plist through `plutil`'s JSON conversion so a missing optional key
+/// can be distinguished from an unreadable or malformed bundle.
+fn plist_json(path: &Path) -> io::Result<serde_json::Value> {
+    let output = Command::new("/usr/bin/plutil")
+        .args(["-convert", "json", "-o", "-"])
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        return Err(command_error("read FSK.app Info.plist", &output.stderr));
+    }
+    serde_json::from_slice(&output.stdout).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not parse {}: {error}", path.display()),
+        )
+    })
+}
+
+fn plist_integer(plist: &serde_json::Value, key: &str) -> io::Result<Option<u16>> {
+    let Some(value) = plist.get(key) else {
+        return Ok(None);
+    };
+    let number = value.as_u64().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("FSK.app {key} must be a non-negative integer"),
+        )
+    })?;
+    u16::try_from(number).map(Some).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("FSK.app {key} must be at most {}", u16::MAX),
+        )
+    })
 }
 
 fn temporary_directory() -> io::Result<PathBuf> {
@@ -1222,16 +1303,26 @@ fn destination_parent(destination: &Path) -> io::Result<&Path> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::PROTOCOL_MINOR;
 
     fn app_fixture(directory: &Path) -> PathBuf {
         app_fixture_with_version(directory, APP_VERSION)
     }
 
     fn app_fixture_with_version(directory: &Path, version: &str) -> PathBuf {
+        let app = app_fixture_with_protocol(directory, Some(PROTOCOL_MAJOR));
+        write_app_plist(&app, version);
+        app
+    }
+
+    /// Build an app whose embedded extension declares `major`, or no protocol
+    /// metadata when `major` is `None`.
+    fn app_fixture_with_protocol(directory: &Path, major: Option<u16>) -> PathBuf {
         let app = directory.join("FSK.app");
         fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
         fs::write(app.join(APP_EXECUTABLE), b"").unwrap();
-        write_app_plist(&app, version);
+        write_app_plist(&app, APP_VERSION);
+        write_extension_plist(&app, major, major.map(|_| PROTOCOL_MINOR));
         app
     }
 
@@ -1267,6 +1358,31 @@ mod tests {
         .unwrap();
     }
 
+    fn write_extension_plist(app: &Path, major: Option<u16>, minor: Option<u16>) {
+        let info = app.join(EXTENSION_INFO_PLIST);
+        fs::create_dir_all(info.parent().unwrap()).unwrap();
+        let major_key = major.map_or_else(String::new, |major| {
+            format!("    <key>{APP_PROTOCOL_MAJOR_KEY}</key>\n    <integer>{major}</integer>\n")
+        });
+        let minor_key = minor.map_or_else(String::new, |minor| {
+            format!("    <key>{APP_PROTOCOL_MINOR_KEY}</key>\n    <integer>{minor}</integer>\n")
+        });
+        let keys = major_key + &minor_key;
+        fs::write(
+            &info,
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+{keys}</dict>
+</plist>
+"#
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn the_default_install_is_hidden_in_the_home_directory() {
         // The path resolver itself is deliberately deterministic; integration
@@ -1294,13 +1410,75 @@ mod tests {
     }
 
     #[test]
-    fn an_app_for_another_sdk_version_needs_install() {
+    fn an_app_with_an_incompatible_protocol_major_needs_install() {
         let directory = tempfile::tempdir().unwrap();
-        let app = app_fixture_with_version(directory.path(), "0.0.0");
+        let app = app_fixture_with_protocol(directory.path(), Some(PROTOCOL_MAJOR + 1));
         let status = authorization_status_at(&app).unwrap();
 
         assert_eq!(status, AuthorizationStatus::NotInstalled);
         assert!(status.needs_install());
+    }
+
+    #[test]
+    fn a_different_marketing_version_does_not_require_a_reinstall() {
+        // Compatibility follows the protocol version, not the product version.
+        let directory = tempfile::tempdir().unwrap();
+        let app = app_fixture_with_version(directory.path(), "99.0.0");
+
+        assert!(app_matches_sdk(&app));
+    }
+
+    #[test]
+    fn a_legacy_app_without_protocol_metadata_speaks_protocol_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = app_fixture_with_protocol(directory.path(), None);
+
+        assert_eq!(
+            app_protocol(&app).unwrap(),
+            Some((LEGACY_PROTOCOL_MAJOR, 0))
+        );
+    }
+
+    #[test]
+    fn an_invalid_protocol_declaration_is_rejected() {
+        for declaration in [
+            "<key>FSKProtocolMajor</key>\n    <string>2</string>",
+            "<key>FSKProtocolMajor</key>\n    <integer>70000</integer>",
+            "<key>FSKProtocolMinor</key>\n    <real>1.5</real>",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let app = app_fixture(directory.path());
+            let info = app.join(EXTENSION_INFO_PLIST);
+            fs::write(
+                &info,
+                format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    {declaration}
+</dict>
+</plist>
+"#
+                ),
+            )
+            .unwrap();
+
+            assert!(app_protocol(&app).is_err(), "declaration: {declaration}");
+            assert!(!app_matches_sdk(&app), "declaration: {declaration}");
+        }
+    }
+
+    #[test]
+    fn an_app_without_an_extension_cannot_serve_the_protocol() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("FSK.app");
+        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        fs::write(app.join(APP_EXECUTABLE), b"").unwrap();
+        write_app_plist(&app, APP_VERSION);
+
+        assert_eq!(app_protocol(&app).unwrap(), None);
+        assert!(!app_matches_sdk(&app));
     }
 
     #[test]

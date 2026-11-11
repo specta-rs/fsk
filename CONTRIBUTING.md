@@ -19,13 +19,11 @@ fsk/                     the published crate
   src/windows.rs         ProjFS adapter
   macos/rust/mount.rs    macOS mount session and IPC server startup
   macos/rust/ipc.rs      authenticated Rust<->Swift protocol
-  macos/rust/ffi.rs      in-process C ABI used by tests/compatibility clients
   macos/rust/authorization.rs  install/launch/authorize/uninstall helpers
   macos/FSKApp           Swift setup application
   macos/FSKExtension     Swift FSKit extension
   macos/FSKExtensionTests
   macos/project.yml      XcodeGen source of truth for the Xcode project
-  macos/include/fsk.h    C ABI definitions shared with the Swift bridge
 examples/                standalone backends (not part of the published crate)
 docs/                    the user guide, synced to the Specta website
 ```
@@ -231,9 +229,61 @@ Useful iteration tips:
 - Mount failures from the Rust process include the `mount(8)` stderr in the
   returned error; inspect it before assuming the extension is at fault.
 - The extension shares the app group with the setup app and speaks the IPC
-  protocol to the mounting Rust process. When changing that protocol, update
-  `fsk/macos/rust/ipc.rs`, `fsk/macos/FSKExtension/RustBackend.swift`, and the
-  C ABI in `fsk/macos/include/fsk.h` together.
+  protocol to the mounting Rust process. See
+  [Protocol versioning](#protocol-versioning) before changing
+  `fsk/macos/rust/ipc.rs` or `fsk/macos/FSKExtension/RustBackend.swift`.
+
+### Protocol versioning
+
+The Rust process and the installed FSKit extension are the only binary
+compatibility boundary in FSK. The crate's source API is governed by Cargo
+semver; the IPC protocol is governed by two integers, `PROTOCOL_MAJOR` and
+`PROTOCOL_MINOR`, defined in `fsk/macos/rust/ipc.rs` and mirrored in
+`fsk/macos/FSKExtension/RustBackend.swift`.
+
+| Change | Version bump |
+|---|---|
+| Add an opcode | `PROTOCOL_MINOR` |
+| Add a trailing field an old peer can ignore | `PROTOCOL_MINOR` |
+| Reinterpret bytes every old peer wrote as zero (reserved fields) | `PROTOCOL_MINOR` |
+| Change the size or meaning of a non-reserved header field | `PROTOCOL_MAJOR` |
+| Change an existing payload's meaning or layout | `PROTOCOL_MAJOR` |
+| Remove or renumber an opcode | `PROTOCOL_MAJOR` |
+
+The 24-byte request header is `magic`, major, opcode, request id, body length,
+minor, flags. The minor occupies the first half of the word that older peers
+wrote as zero, so reading it stays compatible with every released app. Responses
+carry the negotiated minor in the `u16` after the major version, which older
+peers ignore. `HELLO` rejects a different major with `EPROTO`, and a request that
+changes the major later in the same connection is rejected the same way.
+
+Peers use the lower of the two minor versions. When an operation needs a newer
+revision, the app passes `minimumMinor` to the Swift connection pool so it fails
+with `protocolTooOld` instead of sending a frame an older SDK cannot decode. No
+operation currently requires more than minor 0, but the plumbing exists so the
+first minor-gated opcode does not need a protocol redesign. Never reuse an
+opcode number for a different purpose.
+
+The embedded extension declares the protocol it implements in
+`FSKExtension/Info.plist` as `FSKProtocolMajor` and `FSKProtocolMinor`. The SDK
+reads those keys and treats a missing pair as legacy protocol 1.0, so
+`fsk::install()` replaces an app only when no installed copy speaks the current
+major version. Product versions (`CFBundleShortVersionString`) are never used
+for compatibility.
+
+Update all of these together and run `./fsk/macos/check.sh`; the Rust and Swift
+tests compare the constants against `RustBackend.swift` and `Info.plist`:
+
+- `fsk/macos/rust/ipc.rs` (`PROTOCOL_MAJOR`, `PROTOCOL_MINOR`);
+- `fsk/macos/FSKExtension/RustBackend.swift` (`ipcProtocolMajor`,
+  `ipcProtocolMinor`);
+- `fsk/macos/FSKExtension/Info.plist` (`FSKProtocolMajor`, `FSKProtocolMinor`).
+
+The plist keys only exist in apps built from this change onward. Until a release
+carries them, released apps are treated as legacy protocol 1.0, which stays
+compatible while the major version is 1; the release that first ships the keys
+must bump the crate, `project.yml`, and the extension `Info.plist` together as
+usual.
 
 ## `FSK_APP_PATH`
 
@@ -269,11 +319,11 @@ whichever location you use and enable it in System Settings. On the default
 path, `install()` and `uninstall()` also remove a legacy machine-wide
 `/Applications/FSK.app`; with an override, that copy is left alone.
 
-`install` still validates the downloaded bundle's version, bundle identifier,
+`install` validates the downloaded bundle's protocol major, bundle identifier,
 code signature, team, and Gatekeeper assessment; the override only changes the
-destination. A development app built with the same marketing version as the
-crate is accepted by `authorization_status` without requiring the release
-signing identity, which is what makes local extension development practical.
+destination. A development app that declares a compatible protocol is accepted
+by `authorization_status` without requiring the release signing identity, which
+is what makes local extension development practical.
 
 Related variables used by the installer:
 

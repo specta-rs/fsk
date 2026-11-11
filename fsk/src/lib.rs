@@ -304,8 +304,9 @@
 //! `FSKit` pointers. [`raw::NativeRequest::MacOS`] carries the IPC `request_id`,
 //! the `item_id` decoded from the payload, a reserved flags field, and the exact
 //! IPC request body in its `payload` field. The payload layout
-//! is bridge-internal and may change between SDK versions; prefer the portable
-//! operations. Buffer data is not attached to macOS events.
+//! is bridge-internal; it changes incompatibly only when `PROTOCOL_MAJOR`
+//! changes. Prefer the portable operations. Buffer data is not attached to
+//! macOS events.
 //!
 //! ## Linux
 //!
@@ -381,9 +382,6 @@
 mod authorization;
 mod core;
 #[cfg(target_os = "macos")]
-#[path = "../macos/rust/ffi.rs"]
-mod ffi;
-#[cfg(target_os = "macos")]
 #[path = "../macos/rust/ipc.rs"]
 mod ipc;
 #[cfg(target_os = "linux")]
@@ -408,7 +406,7 @@ pub use core::{
     ReadDirectoryResult, Result, SetMetadata, StatFs, now_ns,
 };
 #[cfg(target_os = "macos")]
-pub use ffi::{FskAttributes, FskDirEntry, FskSetAttributes, FskStatFs};
+pub use ipc::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
 #[cfg(target_os = "linux")]
 pub use linux::{MountOptions, MountSession};
 #[cfg(target_os = "macos")]
@@ -417,14 +415,11 @@ pub use macos_authorization::open_authorization_app;
 #[cfg(target_os = "macos")]
 pub use mount::{MountOptions, MountSession};
 pub use network::{
-    KernelCachePolicy, LocalFile, Mount, NetworkConfiguration, NetworkFile, NetworkFilesystem,
+    KernelCachePolicy, LocalFile, NetworkConfiguration, NetworkFile, NetworkFilesystem,
     local_file_directory,
 };
 #[cfg(target_os = "windows")]
 pub use windows::{EvictionHandle, EvictionOutcome, MountOptions, MountSession};
-
-/// Version of the C ABI implemented by this crate.
-pub const ABI_VERSION: u32 = 2;
 
 #[cfg(all(test, target_os = "macos"))]
 mod test_support {
@@ -509,115 +504,5 @@ mod test_support {
         fn read(&self, _inode: u64, _offset: u64, _output: &mut [u8]) -> Result<usize> {
             Ok(0)
         }
-    }
-}
-
-/// Exports a backend factory using the ABI expected by `FSKExtension`.
-///
-/// The factory is called once per mounted volume. Panics never cross the FFI boundary;
-/// they are converted to `EIO`.
-#[cfg(target_os = "macos")]
-#[macro_export]
-macro_rules! export_filesystem {
-    ($factory:path) => {
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn fsk_volume_create(
-            _resource: *const u8,
-            _resource_length: usize,
-            error_out: *mut i32,
-        ) -> *mut ::core::ffi::c_void {
-            unsafe { $crate::__private::create_volume_from_factory(error_out, $factory) }
-        }
-    };
-}
-
-/// Exports a network backend factory using the ABI expected by `FSKExtension`.
-///
-/// The factory receives the URL used to mount the volume and returns either a
-/// network filesystem or a positive Darwin errno.
-#[cfg(target_os = "macos")]
-#[macro_export]
-macro_rules! export_network_filesystem {
-    ($factory:path) => {
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn fsk_volume_create(
-            resource: *const u8,
-            resource_length: usize,
-            error_out: *mut i32,
-        ) -> *mut ::core::ffi::c_void {
-            unsafe {
-                $crate::__private::create_network_volume_from_raw(
-                    resource,
-                    resource_length,
-                    error_out,
-                    $factory,
-                )
-            }
-        }
-    };
-}
-
-#[cfg(target_os = "macos")]
-#[doc(hidden)]
-pub mod __private {
-    use crate::{Error, Filesystem};
-    use std::{
-        ffi::c_void,
-        panic::{AssertUnwindSafe, catch_unwind},
-        ptr,
-    };
-
-    pub use crate::ffi::{create_network_volume_from_raw, create_volume};
-
-    /// Runs a backend factory, converting a panic into `EIO` before it can
-    /// unwind through the exported C function.
-    ///
-    /// # Safety
-    ///
-    /// `error_out`, when non-null, must be writable for one `i32`.
-    pub unsafe fn create_volume_from_factory<T: Filesystem>(
-        error_out: *mut i32,
-        factory: impl FnOnce() -> T,
-    ) -> *mut c_void {
-        if let Ok(filesystem) = catch_unwind(AssertUnwindSafe(factory)) {
-            if !error_out.is_null() {
-                unsafe { ptr::write(error_out, 0) };
-            }
-            create_volume(filesystem)
-        } else {
-            if !error_out.is_null() {
-                unsafe { ptr::write(error_out, Error::IO.0) };
-            }
-            ptr::null_mut()
-        }
-    }
-}
-
-#[cfg(all(test, target_os = "macos"))]
-mod export_tests {
-    use crate::{__private::create_volume_from_factory, Error, test_support::TestFilesystem};
-
-    #[test]
-    fn a_panicking_factory_is_reported_as_io() {
-        let mut error = 0;
-        // SAFETY: `error` is a writable `i32` for the duration of the call.
-        let volume = unsafe {
-            create_volume_from_factory(&raw mut error, || -> TestFilesystem {
-                panic!("factory panic");
-            })
-        };
-        assert!(volume.is_null());
-        assert_eq!(error, Error::IO.0);
-    }
-
-    #[test]
-    fn a_successful_factory_clears_the_error() {
-        let mut error = i32::MIN;
-        // SAFETY: `error` is a writable `i32` for the duration of the call.
-        let volume = unsafe { create_volume_from_factory(&raw mut error, TestFilesystem::default) };
-        assert!(!volume.is_null());
-        assert_eq!(error, 0);
-        // SAFETY: `volume` came from `create_volume_from_factory`.
-        unsafe { crate::ffi::fsk_volume_destroy(volume) };
     }
 }

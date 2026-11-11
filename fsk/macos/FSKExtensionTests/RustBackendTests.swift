@@ -153,4 +153,21 @@ struct RustBackendTests {
             ) != nil
         )
     }
+
+    @Test("the extension declares the IPC protocol version it implements")
+    func protocolVersionMatchesInfoPlist() throws {
+        // The Rust side checks the same declaration text; keep both in sync so
+        // the app can never advertise a protocol its code does not speak.
+        let info = URL(filePath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appending(path: "FSKExtension/Info.plist")
+        guard FileManager.default.fileExists(atPath: info.path) else { return }
+
+        let data = try Data(contentsOf: info)
+        let object = try PropertyListSerialization.propertyList(from: data, format: nil)
+        let plist = try #require(object as? [String: Any])
+        #expect(plist["FSKProtocolMajor"] as? Int == Int(ipcProtocolMajor))
+        #expect(plist["FSKProtocolMinor"] as? Int == Int(ipcProtocolMinor))
+    }
 }

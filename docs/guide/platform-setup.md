@@ -89,15 +89,18 @@ is what `launch_app()` does. After that, the user enables it under **System Sett
 Login Items & Extensions → File System Extensions**. macOS exposes no API for the switch, so this
 is always a manual, per-user action.
 
-### Version matching
+### Protocol compatibility
 
-The installed app must match the crate version exactly. `authorization_status()` compares
-`CFBundleShortVersionString` with the crate version and the bundle identifier with
-`dev.specta.fsk`.
+The installed app does not need to share the crate's marketing version. `authorization_status()`
+reads `FSKProtocolMajor`/`FSKProtocolMinor` from the embedded extension's `Info.plist` and accepts
+any app with the same protocol major version and the bundle identifier `dev.specta.fsk`. Missing
+keys mean the app predates protocol metadata and speaks legacy protocol 1.0.
 
-Because the match is exact, installing an SDK built against an older release can downgrade an app
-installed by a newer one. A git build between releases reports the last released version and
-treats that release as current. Pin your dependency version if several tools share one machine.
+Because the check is protocol-based, an app whose protocol major matches is reused regardless of
+its marketing version, and a newer SDK reuses an older app with the same major; both sides use the
+lower of their advertised minor versions. When the major version differs, the app is reported as
+not installed and `install()` replaces it. A git build between releases still downloads the last
+released version, so pin your dependency version if several tools share one machine.
 
 ### Options and environment
 
@@ -118,9 +121,9 @@ Settings. If a future macOS refuses to register extensions outside Applications,
 serialised in-process and across processes, and an interrupted install is recovered from its
 backup before any download.
 
-Release assets are validated before use: version, bundle identifier, `codesign --verify --deep
---strict`, signing identity `dev.specta.fsk` with team `68994Z5PT3`, and `spctl --assess --type
-execute`.
+Release assets are validated before use: protocol major version, bundle identifier, `codesign
+--verify --deep --strict`, signing identity `dev.specta.fsk` with team `68994Z5PT3`, and `spctl
+--assess --type execute`.
 
 ## Windows
 

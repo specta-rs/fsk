@@ -149,9 +149,11 @@ error describes the FUSE requirement.
 macOS needs `FSK.app`, a small setup utility that hosts the FSKit extension.
 `fsk::install()` places it in a hidden per-user directory,
 `~/Library/Application Support/dev.specta.fsk/FSK.app`, so it never appears in
-Applications or Launchpad and needs no administrator permission. Installation
-requires an exact version match with the SDK, so a program built against an
-older SDK can downgrade an app installed by a newer one. `fsk::uninstall()`
+Applications or Launchpad and needs no administrator permission. Compatibility
+is decided by the Rust <-> Swift protocol version, not the product version, so
+an app that speaks the same protocol major version is reused. When the major
+version differs, `fsk::install()` replaces the installed app, even if that copy
+came from a newer SDK. `fsk::uninstall()`
 removes the current user's copy; on the default path, install and uninstall also
 remove a legacy machine-wide `/Applications/FSK.app`.
 
