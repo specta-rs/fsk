@@ -43,10 +43,15 @@ targets:
     platform: macOS
     sources:
       - FSKExtension
+      # System Settings shows the extension's own icon, not the host app's.
+      # Compile the same AppIcon used by FSK.app into the extension bundle.
+      - path: FSKApp/AppIcon.icon
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.specta.fsk.extension
         PRODUCT_NAME: FSKExtension
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         PROVISIONING_PROFILE_SPECIFIER: "$(FSK_EXTENSION_PROFILE)"
         ENABLE_HARDENED_RUNTIME: YES
         INFOPLIST_FILE: FSKExtension/Info.plist

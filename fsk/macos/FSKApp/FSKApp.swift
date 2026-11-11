@@ -80,20 +80,28 @@ private final class AuthorizationModel {
     }
 
     func retry() {
-        status = .checking
+        // Re-check in place. Going through `.checking` here swapped the whole
+        // card out and back, which read as a content flash when the result had
+        // not changed.
         Task { await refresh() }
     }
 
     func refresh() async {
+        let next: Status
         do {
             let modules = try await FSClient.shared.installedExtensions
-            guard let module = modules.first(where: { $0.bundleIdentifier == extensionIdentifier }) else {
-                status = .notInstalled
-                return
+            if let module = modules.first(where: { $0.bundleIdentifier == extensionIdentifier }) {
+                next = module.isEnabled ? .authorized : .needsApproval
+            } else {
+                next = .notInstalled
             }
-            status = module.isEnabled ? .authorized : .needsApproval
         } catch {
-            status = .failed(error.localizedDescription)
+            next = .failed(error.localizedDescription)
+        }
+        // The monitor polls every second; only publish a real change so an
+        // unchanged result cannot re-render or re-animate the card.
+        if next != status {
+            status = next
         }
     }
 

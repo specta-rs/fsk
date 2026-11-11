@@ -16,6 +16,7 @@
 		838EB499CA91357AA3851866 /* FSKExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93810A97BCBF93745B5A2FEB /* FSKExtension.swift */; };
 		89FB2A981ABE8C4EDE4A8050 /* FSKItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94E45A8E59B92828162DA336 /* FSKItem.swift */; };
 		937860346B47BE8AC665D547 /* FSKExtension.appex in Embed ExtensionKit Extensions */ = {isa = PBXBuildFile; fileRef = DF562CFB8FBB39C90D137E45 /* FSKExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		9EE5DD3BE438D79C76A9CBF8 /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = 2E9E8C9DBC1130F839480383 /* AppIcon.icon */; };
 		B665F1A36597E44D820961D9 /* FSKVolume.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8EB26A3B99E84188164CF57B /* FSKVolume.swift */; };
 		F6F87F3F09D3137F8282F156 /* RustBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1933626A4818DE15AE8E3838 /* RustBackend.swift */; };
 		F98E0616F8BBAF5EC5EE64DE /* FSKApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9301429F6F6C4797BA68B6D9 /* FSKApp.swift */; };
@@ -123,6 +124,7 @@
 			buildConfigurationList = 4EE74B35DE235D4B8A5DCC7C /* Build configuration list for PBXNativeTarget "FSKExtension" */;
 			buildPhases = (
 				2ED30D0C914F5032217AB416 /* Sources */,
+				C1A7FDBCEE8A6F42BB3AA620 /* Resources */,
 			);
 			buildRules = (
 			);
@@ -210,6 +212,14 @@
 			buildActionMask = 2147483647;
 			files = (
 				5EF21C1C18A7458B379DA545 /* AppIcon.icon in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C1A7FDBCEE8A6F42BB3AA620 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				9EE5DD3BE438D79C76A9CBF8 /* AppIcon.icon in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -359,6 +369,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				APPLICATION_EXTENSION_API_ONLY = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = FSKExtension/FSKExtension.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -443,6 +454,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				APPLICATION_EXTENSION_API_ONLY = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = FSKExtension/FSKExtension.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
