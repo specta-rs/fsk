@@ -5,7 +5,7 @@ each platform adapter works, how to develop the macOS FSKit extension, the
 toolchain you need, and the `FSK_APP_PATH` override.
 
 For the public API, see the crate-level documentation in `fsk/src/lib.rs`, the
-[user guide](README.md), and [`fsk/macos/README.md`](fsk/macos/README.md).
+[user guide](docs/README.md), and [`fsk/macos/README.md`](fsk/macos/README.md).
 
 ## Repository layout
 
