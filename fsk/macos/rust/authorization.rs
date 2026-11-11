@@ -309,6 +309,9 @@ fn extension_info_plist(app: &Path) -> Option<PathBuf> {
 /// Call this when [`authorization_status`](crate::authorization_status) reports
 /// [`AuthorizationStatus::NeedsApproval`], including right after a fresh
 /// installation: copying the app into place does not register its extension.
+/// The app at the destination must already match this SDK's bundle identifier
+/// and protocol major version, so a stale copy is never launched by mistake;
+/// call [`install`](crate::install) first when it does not.
 ///
 /// Set `FSK_APP_PATH` to override the normal
 /// `~/Library/Application Support/dev.specta.fsk/FSK.app` location. The value
@@ -316,14 +319,17 @@ fn extension_info_plist(app: &Path) -> Option<PathBuf> {
 ///
 /// # Errors
 ///
-/// Returns an error when the path is invalid, or when the app is missing or
-/// macOS cannot open it.
+/// Returns an error when the path is invalid, when the app is missing or does
+/// not match this SDK, or when macOS cannot open it.
 pub fn launch_app() -> io::Result<()> {
     let app = app_path()?;
-    if !app.exists() {
+    if !app_matches_sdk(&app) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("FSK.app was not found at {}", app.display()),
+            format!(
+                "FSK.app at {} is missing or does not match this SDK; call fsk::install() first",
+                app.display()
+            ),
         ));
     }
     let status = Command::new("/usr/bin/open")

@@ -347,16 +347,19 @@
 //!
 //! # Platform setup
 //!
-//! [`authorization_status`] reports whether the host is ready, and
-//! [`ensure_authorization`] performs the same check while opening any setup UI
-//! the platform provides.
+//! [`authorization_status`] reports whether the host is ready.
+//! [`ensure_authorization`] performs the same check, installs the matching
+//! companion on macOS when it is missing, and opens any setup UI the platform
+//! provides.
 //!
 //! - **macOS** uses an `FSKit` extension hosted by the companion `FSK.app`. The
 //!   app must be installed and its extension enabled in **System Settings →
-//!   General → Login Items & Extensions → File System Extensions**. The SDK
-//!   exposes `install`, `launch_app`, and `uninstall` to automate that setup.
-//!   The app is installed per-user under `~/Library/Application Support`;
-//!   `FSK_APP_PATH` overrides that location during development.
+//!   General → Login Items & Extensions → File System Extensions**.
+//!   `ensure_authorization` installs and launches the matching app;
+//!   `install`, `launch_app`, and `uninstall` remain available for callers that
+//!   want to control each step. The app is installed per-user under
+//!   `~/Library/Application Support`; `FSK_APP_PATH` overrides that location
+//!   during development.
 //! - **Linux** requires FUSE: `/dev/fuse` must exist and the mounting user must
 //!   be allowed to use it.
 //! - **Windows** requires the Projected File System optional component

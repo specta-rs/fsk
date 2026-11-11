@@ -19,10 +19,18 @@ treated as legacy protocol 1.0.
 Point `FSK_APP_PATH` at a development build, or run `fsk::install()` to replace an app whose
 protocol major does not match the SDK.
 
-### `ensure_authorization()` returns `NotFound`
+### `ensure_authorization()` fails to install `FSK.app`
 
-Expected. `ensure_authorization()` never installs anything. Call `fsk::install()` first, then
-`fsk::launch_app()`.
+It downloads the release matching the crate version, so a git build between releases still
+downloads the last released app. Check the network, `FSK_RELEASE_BASE_URL`, and any
+`GITHUB_TOKEN` or `GH_TOKEN` used for a private release. Running `fsk::install()` directly
+surfaces the same error.
+
+### `launch_app()` says the app does not match this SDK
+
+`launch_app()` refuses to open a missing or incompatible copy so a stale app is never launched.
+Call `fsk::install()` first, or use `fsk::ensure_authorization()`, which installs and launches in
+one step.
 
 ### Status stays at `NeedsApproval`
 

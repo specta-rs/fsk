@@ -145,8 +145,9 @@ Most failures happen before your backend is called.
 
 | Error                                                      | Cause                                                                    |
 | ---------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `NotFound`, "install FSK.app with `fsk::install()`"        | macOS has no matching app; `ensure_authorization` never installs         |
-| `PermissionDenied`, "enable FSK in the window that opened" | The extension is installed but not enabled                               |
+| `NotFound`, "FSK.app … does not match this SDK"            | `launch_app()` was called without installing a compatible app            |
+| `PermissionDenied`, "enable FSK in the window that opened" | A fresh install, or the extension is installed but not enabled           |
+| Download or verification error from `install()`            | `ensure_authorization()` could not fetch or validate the matching app    |
 | `FSKit mount failed: …`                                    | `mount(8)` rejected the mount; the message carries its stderr            |
 | "FUSE must be available"                                   | `/dev/fuse` is missing or is not a character device                      |
 | ProjFS initialization error                                | `Client-ProjFS` is missing, or the root is neither empty nor virtualized |

@@ -10,7 +10,7 @@ setup call; everything else is a per-platform prerequisite.
 
 | Platform | Requirement                                         | Setup                                                  |
 | -------- | --------------------------------------------------- | ------------------------------------------------------ |
-| macOS    | `FSK.app` installed and its extension enabled       | `fsk::install()`, then `fsk::launch_app()`             |
+| macOS    | `FSK.app` installed and its extension enabled       | `fsk::ensure_authorization()` installs and opens it    |
 | Windows  | Projected File System (`Client-ProjFS`) enabled     | Windows Features, or `ensure_authorization()` opens it |
 | Linux    | FUSE available and `/dev/fuse` usable by the caller | Install `fuse3` and fix device permissions             |
 
@@ -47,10 +47,11 @@ match fsk::authorization_status()? {
 | `NeedsApproval` | The component exists but a user action is needed | "enable FSK in System Settings …" / FUSE / ProjFS, depending on platform |
 | `Authorized`    | The host can mount                               | `None`                                                                   |
 
-`ensure_authorization()` never installs anything. `NotInstalled` returns
-`io::ErrorKind::NotFound`; `NeedsApproval` opens the platform UI and returns
-`io::ErrorKind::PermissionDenied`. That error is an instruction to run the command again after
-the user acts, not a failure of your code.
+`ensure_authorization()` installs the matching macOS app when it is missing, launches it, and
+opens the platform setup UI. It returns `io::ErrorKind::PermissionDenied` while setup is still
+required; that error is an instruction to run the command again after the user acts, not a
+failure of your code. Installation errors are propagated unchanged. Use `install()` and
+`launch_app()` directly only when you want to control each step.
 
 On other targets `authorization_status()` returns `io::ErrorKind::Unsupported`.
 
@@ -85,9 +86,14 @@ destination, both also remove a legacy machine-wide `/Applications/FSK.app`; wit
 `FSK_APP_PATH`, they leave it alone.
 
 Copying the bundle into place does not register the extension. It must be launched once, which
-is what `launch_app()` does. After that, the user enables it under **System Settings → General →
-Login Items & Extensions → File System Extensions**. macOS exposes no API for the switch, so this
-is always a manual, per-user action.
+is what `launch_app()` does. `ensure_authorization()` performs both steps: it installs the
+compatible release when the app is missing, then launches it. After that, the user enables it
+under **System Settings → General → Login Items & Extensions → File System Extensions**. macOS
+exposes no API for the switch, so this is always a manual, per-user action.
+
+`launch_app()` validates the app at the destination before opening it. If the copy is missing or
+speaks a different protocol major, it returns an error instead of launching a stale app; call
+`install()` first (or use `ensure_authorization()`).
 
 ### Protocol compatibility
 

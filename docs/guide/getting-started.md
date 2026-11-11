@@ -49,15 +49,18 @@ fn platform_is_ready() -> std::io::Result<bool> {
 }
 ```
 
-| Status          | Meaning                                      | What to do                                                       |
-| --------------- | -------------------------------------------- | ---------------------------------------------------------------- |
-| `Authorized`    | The platform can mount now                   | Nothing                                                          |
-| `NotInstalled`  | A matching `FSK.app` is missing (macOS only) | Call `fsk::install()`, then `fsk::launch_app()`                  |
-| `NeedsApproval` | The component exists but needs a user action | Call `fsk::ensure_authorization()` and retry after the user acts |
+| Status          | Meaning                                      | What to do                                                                    |
+| --------------- | -------------------------------------------- | ----------------------------------------------------------------------------- |
+| `Authorized`    | The platform can mount now                   | Nothing                                                                       |
+| `NotInstalled`  | A matching `FSK.app` is missing (macOS only) | Call `fsk::ensure_authorization()`; it installs and launches the app          |
+| `NeedsApproval` | The component exists but needs a user action | Call `fsk::ensure_authorization()` and retry after the user acts              |
 
-`ensure_authorization()` never installs anything. `NotInstalled` returns
-`io::ErrorKind::NotFound`; `NeedsApproval` opens the platform UI and returns
-`io::ErrorKind::PermissionDenied`. That error is the instruction to run again, not a bug.
+Most applications can replace the whole match with `fsk::ensure_authorization()`.
+On macOS it installs the release matching the crate when the app is missing,
+launches it, and asks the user to enable the extension. It returns
+`io::ErrorKind::PermissionDenied` while setup is still required; that error is
+the instruction to run again, not a bug. Use `fsk::install()` and
+`fsk::launch_app()` directly only when you want to control each step.
 
 On targets other than macOS, Linux and Windows, `authorization_status()` returns
 `io::ErrorKind::Unsupported`.

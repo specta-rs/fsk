@@ -139,10 +139,12 @@ match fsk::authorization_status()? {
 # Ok::<(), std::io::Error>(())
 ```
 
-`fsk::ensure_authorization()` performs the same check and opens the relevant
-setup UI: `FSK.app` on macOS and **Windows Features** on Windows. When setup is
-still required it returns an actionable error; Linux has no setup UI, so the
-error describes the FUSE requirement.
+`fsk::ensure_authorization()` performs the same check, installs the matching
+`FSK.app` release on macOS when it is missing, launches it, and opens the
+relevant setup UI. On Windows it opens **Windows Features**. When setup is still
+required it returns an actionable error; Linux has no setup UI, so the error
+describes the FUSE requirement. A git build between releases still downloads the
+last released app.
 
 ### macOS
 

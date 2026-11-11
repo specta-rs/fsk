@@ -17,8 +17,9 @@ use std::io;
 pub enum AuthorizationStatus {
     /// No companion app with a compatible protocol version is installed.
     ///
-    /// Only macOS returns this. Call `fsk::install()` to install a compatible
-    /// release, then launch the app to register its extension.
+    /// Only macOS returns this. [`ensure_authorization`] installs the release
+    /// matching this crate and launches it; [`install`] and [`launch_app`]
+    /// remain available when callers want to control each step.
     NotInstalled,
     /// The platform component or extension needs a user action.
     ///
@@ -50,7 +51,9 @@ impl AuthorizationStatus {
     pub const fn requirement(self) -> Option<&'static str> {
         match self {
             Self::Authorized => None,
-            Self::NotInstalled => Some("install the FSK companion app with fsk::install()"),
+            Self::NotInstalled => {
+                Some("install the FSK companion app with fsk::ensure_authorization()")
+            }
             Self::NeedsApproval => Some(APPROVAL_REQUIREMENT),
         }
     }
@@ -84,29 +87,41 @@ pub fn authorization_status() -> io::Result<AuthorizationStatus> {
     imp::authorization_status()
 }
 
-/// Checks the platform requirements and opens the relevant setup UI when a
-/// user action is needed.
+/// Checks the platform requirements, installs the companion app when it is
+/// missing, and opens the relevant setup UI when a user action is needed.
 ///
-/// On macOS this opens `FSK.app` when the extension needs approval. On Windows
-/// it opens the Windows Features dialog when `Client-ProjFS` is missing. Linux
-/// has no setup dialog, so the returned error describes the FUSE requirement.
+/// On macOS this installs the `FSK.app` release matching this crate, launches
+/// it so its extension registers, and returns an error asking the user to
+/// enable the extension. An installed app that already matches the SDK is
+/// launched without downloading anything. On Windows this opens the Windows
+/// Features dialog when `Client-ProjFS` is missing. Linux has no setup dialog,
+/// so the returned error describes the FUSE requirement.
+///
+/// Use [`install`] and [`launch_app`] directly only when the caller needs to
+/// control installation separately, such as installing ahead of time or
+/// selecting a development build with `FSK_APP_PATH`.
+///
+/// This blocks while downloading and verifying `FSK.app`, so run it on a
+/// background executor in an async application.
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::NotFound`] when the macOS companion is missing, or
-/// [`io::ErrorKind::PermissionDenied`] with an actionable message when the
-/// platform still needs to be configured. For example:
-///
-/// - macOS: install `FSK.app` with `fsk::install()` and enable the extension.
-/// - Linux: `FUSE must be available`.
-/// - Windows: `Enable the Projected File System optional component`.
+/// Returns [`io::ErrorKind::PermissionDenied`] with an actionable message when
+/// the platform still needs to be configured after the setup UI is opened.
+/// Propagates errors from installing `FSK.app`, such as network, verification,
+/// or filesystem failures.
 pub fn ensure_authorization() -> io::Result<()> {
     match authorization_status()? {
         AuthorizationStatus::Authorized => Ok(()),
-        AuthorizationStatus::NotInstalled => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "install FSK.app with fsk::install() before mounting",
-        )),
+        AuthorizationStatus::NotInstalled => {
+            #[cfg(target_os = "macos")]
+            imp::install_app()?;
+            imp::request_approval()?;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                APPROVAL_MESSAGE,
+            ))
+        }
         AuthorizationStatus::NeedsApproval => {
             imp::request_approval()?;
             Err(io::Error::new(
@@ -137,6 +152,10 @@ mod imp {
 
     pub(super) fn authorization_status() -> io::Result<AuthorizationStatus> {
         crate::macos_authorization::authorization_status()
+    }
+
+    pub(super) fn install_app() -> io::Result<()> {
+        crate::macos_authorization::install().map(|_| ())
     }
 
     pub(super) fn request_approval() -> io::Result<()> {

@@ -24,6 +24,11 @@ the user to enable it.
 4. The row updates as the user flips the FSK switch. When the extension is
    enabled, **Done** quits the app.
 
+`fsk::ensure_authorization()` performs steps 1 and 2 in one call: it installs
+the release matching the crate when no compatible app is present, then launches
+it. `fsk::launch_app()` refuses to open a copy that does not match the SDK's
+protocol major, so a stale app is never launched by mistake.
+
 macOS does not expose an API that enables an FSKit extension. The switch is a
 per-user action in System Settings; the app can only make that action obvious
 and verify the result.
