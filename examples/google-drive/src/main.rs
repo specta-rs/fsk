@@ -24,7 +24,7 @@ fn main() -> io::Result<()> {
         )
     })?;
     let token = access_token()?;
-    fsk::ensure_authorization()?;
+    authorize()?;
     let filesystem = drive::GoogleDrive::connect(token)?;
     let session = MountSession::mount_network(filesystem, &mount_path)?;
     println!(
@@ -40,6 +40,24 @@ fn main() -> io::Result<()> {
     }
     drop(session);
     Ok(())
+}
+
+/// Checks the platform requirement before mounting.
+///
+/// `FSKit` approval, FUSE, and the Projected File System optional component are
+/// host setup that Cargo cannot install. `requirement()` names the next step;
+/// `ensure_authorization()` opens the platform setup UI when one exists and
+/// returns the actionable error that `main` prints.
+fn authorize() -> io::Result<()> {
+    match fsk::authorization_status()? {
+        fsk::AuthorizationStatus::Authorized => Ok(()),
+        status => {
+            if let Some(requirement) = status.requirement() {
+                eprintln!("setup required: {requirement}");
+            }
+            fsk::ensure_authorization()
+        }
+    }
 }
 
 fn access_token() -> io::Result<String> {

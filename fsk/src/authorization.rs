@@ -61,8 +61,11 @@ const APPROVAL_REQUIREMENT: &str =
 #[cfg(target_os = "linux")]
 const APPROVAL_REQUIREMENT: &str = "FUSE must be available";
 #[cfg(target_os = "windows")]
-const APPROVAL_REQUIREMENT: &str =
-    "Enable the Projected File System optional component (Client-ProjFS)";
+const APPROVAL_REQUIREMENT: &str = concat!(
+    "enable the Projected File System optional component (Client-ProjFS) from an ",
+    "administrator PowerShell with: ",
+    "Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS",
+);
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 const APPROVAL_REQUIREMENT: &str = "this platform is not supported";
 
@@ -118,7 +121,11 @@ const APPROVAL_MESSAGE: &str = "enable FSK in the window that opened, then run t
 #[cfg(target_os = "linux")]
 const APPROVAL_MESSAGE: &str = "FUSE must be available; install fuse3 and make /dev/fuse accessible, then run this command again";
 #[cfg(target_os = "windows")]
-const APPROVAL_MESSAGE: &str = "Enable the Projected File System optional component in the window that opened, then run this command again";
+const APPROVAL_MESSAGE: &str = concat!(
+    "Enable the Projected File System optional component (Client-ProjFS) in the window that ",
+    "opened, then run this command again. From an administrator PowerShell:\n\n    ",
+    "Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS",
+);
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 const APPROVAL_MESSAGE: &str = "this platform is not supported";
 

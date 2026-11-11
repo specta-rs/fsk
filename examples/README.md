@@ -102,8 +102,9 @@ reject saves when another client changed the remote file after it was indexed.
 
 On macOS, install and authorize `FSK.app` before running a CLI. Linux
 requires FUSE, and Windows requires the Projected File System optional feature.
-The CLIs call `fsk::ensure_authorization()` to check these requirements and open
-the platform setup UI when possible.
+The CLIs call `authorization_status()` and print the platform requirement,
+including the exact `Enable-WindowsOptionalFeature` command on Windows, before
+`ensure_authorization()` opens the platform setup UI when possible.
 
 ## `github-filesystem`
 

@@ -34,7 +34,7 @@ fn run() -> io::Result<()> {
     // whether cleanup below owns the directory.
     let mount_directory = MountDirectory::create(&mount_path)?;
 
-    fsk::ensure_authorization()?;
+    authorize()?;
 
     let session = MountSession::mount(fs::filesystem(), &mount_path)?;
     println!(
@@ -55,6 +55,24 @@ fn run() -> io::Result<()> {
     drop(session);
     drop(mount_directory);
     Ok(())
+}
+
+/// Checks the platform requirement before mounting.
+///
+/// `FSKit` approval, FUSE, and the Projected File System optional component are
+/// host setup that Cargo cannot install. `requirement()` names the next step;
+/// `ensure_authorization()` opens the platform setup UI when one exists and
+/// returns the actionable error that `main` prints.
+fn authorize() -> io::Result<()> {
+    match fsk::authorization_status()? {
+        fsk::AuthorizationStatus::Authorized => Ok(()),
+        status => {
+            if let Some(requirement) = status.requirement() {
+                eprintln!("setup required: {requirement}");
+            }
+            fsk::ensure_authorization()
+        }
+    }
 }
 
 fn mount_path_from_args() -> io::Result<PathBuf> {

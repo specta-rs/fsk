@@ -29,7 +29,7 @@ fn main() -> io::Result<()> {
         |value| value.to_string_lossy().into_owned(),
     );
 
-    fsk::ensure_authorization()?;
+    authorize()?;
     let filesystem = fs::filesystem(resource.as_bytes())
         .map_err(|error| io::Error::from_raw_os_error(error.0))?;
     let session = MountSession::mount_network(filesystem, &mount_path)?;
@@ -48,4 +48,22 @@ fn main() -> io::Result<()> {
 
     drop(session);
     Ok(())
+}
+
+/// Checks the platform requirement before mounting.
+///
+/// `FSKit` approval, FUSE, and the Projected File System optional component are
+/// host setup that Cargo cannot install. `requirement()` names the next step;
+/// `ensure_authorization()` opens the platform setup UI when one exists and
+/// returns the actionable error that `main` prints.
+fn authorize() -> io::Result<()> {
+    match fsk::authorization_status()? {
+        fsk::AuthorizationStatus::Authorized => Ok(()),
+        status => {
+            if let Some(requirement) = status.requirement() {
+                eprintln!("setup required: {requirement}");
+            }
+            fsk::ensure_authorization()
+        }
+    }
 }
