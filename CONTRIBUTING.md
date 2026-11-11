@@ -27,7 +27,12 @@ fsk/                     the published crate
   macos/project.yml      XcodeGen source of truth for the Xcode project
   macos/include/fsk.h    C ABI definitions shared with the Swift bridge
 examples/                standalone backends (not part of the published crate)
+docs/                    the user guide, synced to the Specta website
 ```
+
+`docs/` is the source of truth for the user guide. It is published at
+<https://specta.dev/docs/fsk> through a submodule in `specta-rs/website`, so
+edit it here rather than in the website repository.
 
 `fsk/macos/FSK.xcodeproj` is generated and checked in. Edit `project.yml`, then
 regenerate the project rather than editing the project file by hand.

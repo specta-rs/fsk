@@ -334,6 +334,11 @@ connection per active CPU. Linux runs multiple FUSE event loops and uses
 `FUSE_DEV_IOC_CLONE` where available. Windows lets ProjFS select or configure
 native callback workers.
 
+## Documentation
+
+The user guide lives in [`docs/`](docs/README.md) and is published at
+[specta.dev/docs/fsk](https://specta.dev/docs/fsk).
+
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
