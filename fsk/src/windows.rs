@@ -7,13 +7,13 @@ use crate::{
         Caller, NativeRequest, Operation, Platform, RawBuffer, RawEvent, RawEventMask, RawOutcome,
     },
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::{
     collections::HashMap,
     ffi::c_void,
     fs, io,
     mem::size_of,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     ptr::{self, NonNull},
     sync::Arc,
 };
@@ -22,9 +22,11 @@ use windows_sys::{
     Win32::{
         Foundation::{
             ERROR_ACCESS_DENIED, ERROR_DIR_NOT_EMPTY, ERROR_DIRECTORY, ERROR_DISK_FULL,
-            ERROR_FILE_EXISTS, ERROR_FILE_INVALID, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF,
+            ERROR_FILE_EXISTS, ERROR_FILE_INVALID, ERROR_FILE_NOT_FOUND,
+            ERROR_FILE_SYSTEM_VIRTUALIZATION_INVALID_OPERATION, ERROR_HANDLE_EOF,
             ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
-            ERROR_IO_DEVICE, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_SUPPORTED, ERROR_WRITE_PROTECT,
+            ERROR_IO_DEVICE, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND,
+            ERROR_SHARING_VIOLATION, ERROR_WRITE_PROTECT,
         },
         Storage::ProjectedFileSystem::*,
         System::Com::CoCreateGuid,
@@ -62,14 +64,113 @@ impl Default for MountOptions {
     }
 }
 
+/// The result of an eviction request.
+///
+/// Eviction is best-effort: `ProjFS` only removes items that are still a clean
+/// cache of the backend. Items with local changes are retained so no user data
+/// is discarded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvictionOutcome {
+    /// The cached copy was removed, or the item was already virtual.
+    Evicted,
+    /// The item has local changes, is a tombstone, is open, or is a non-empty
+    /// directory, so it was left in place. An open item may instead fail the
+    /// call depending on how its handles were opened; treat either result as
+    /// retryable.
+    Retained,
+}
+
+/// A cloneable handle that evicts hydrated content from another thread.
+///
+/// [`MountSession`] is created after the backend is mounted, so a backend that
+/// needs to schedule eviction keeps a handle instead of a session:
+///
+/// ```ignore
+/// let eviction = Arc::new(Mutex::new(None));
+/// let backend = Backend::new(Arc::clone(&eviction));
+/// let session = MountSession::mount(backend, path)?;
+/// *eviction.lock().unwrap() = Some(session.eviction_handle());
+///
+/// // From a worker thread, once the file is idle:
+/// eviction.lock().unwrap().as_ref().unwrap().evict("dir/file.txt")?;
+/// ```
+///
+/// The handle does not keep the mount alive. Calls made after the session is
+/// dropped return [`io::ErrorKind::NotConnected`].
+#[derive(Clone)]
+pub struct EvictionHandle {
+    state: Arc<EvictionState>,
+}
+
+impl EvictionHandle {
+    /// Evicts a hydrated file from the `ProjFS` cache.
+    ///
+    /// `relative_path` is interpreted relative to the mount, must not contain a
+    /// root, prefix, or `..` component, and no component may end in `.` or a
+    /// space (Win32 strips those characters).
+    ///
+    /// See [`MountSession::evict`] for the behavior and errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::NotConnected`] after the mount stops, or another
+    /// error when the request fails for a reason unrelated to the item's state.
+    pub fn evict(&self, relative_path: impl AsRef<Path>) -> io::Result<EvictionOutcome> {
+        self.state.evict(relative_path.as_ref())
+    }
+}
+
+struct EvictionState {
+    context: RwLock<Option<VirtualizationContext>>,
+}
+
+impl EvictionState {
+    fn evict(&self, relative_path: &Path) -> io::Result<EvictionOutcome> {
+        let path = wide_relative_path(relative_path)?;
+        let context = self.context.read();
+        let Some(context) = context.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "the ProjFS mount is no longer active",
+            ));
+        };
+        let mut failure = PRJ_UPDATE_FAILURE_CAUSE_NONE;
+        // SAFETY: the read guard keeps `MountSession::drop` from taking the
+        // context until this call returns, and `path` is a valid
+        // null-terminated relative path.
+        let result = unsafe {
+            PrjDeleteFile(
+                context.0,
+                path.as_ptr(),
+                PRJ_UPDATE_NONE | PRJ_UPDATE_ALLOW_READ_ONLY,
+                &raw mut failure,
+            )
+        };
+        classify_eviction(result, failure)
+    }
+}
+
+struct VirtualizationContext(PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT);
+
+// SAFETY: ProjFS virtualization contexts are process-wide handles that may be
+// used from any thread. `EvictionState` synchronizes access, and the session
+// stops virtualization before the handle becomes invalid.
+unsafe impl Send for VirtualizationContext {}
+// SAFETY: the handle is immutable and shared access only reads the pointer.
+unsafe impl Sync for VirtualizationContext {}
+
 /// An active Windows `ProjFS` virtualization root.
 ///
 /// `ProjFS` is lazy by design: projected metadata and contents are materialized
 /// into the Windows cache on demand. Local edits remain in that cache and are
 /// reported through raw notification events.
+///
+/// `ProjFS` does not evict hydrated content automatically. Use
+/// [`eviction_handle`](Self::eviction_handle) or [`evict`](Self::evict) to
+/// return idle files to virtual placeholders.
 pub struct MountSession {
     mount_path: PathBuf,
-    context: PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+    eviction: Arc<EvictionState>,
     _state: Box<WindowsState>,
 }
 
@@ -129,6 +230,53 @@ impl MountSession {
     #[must_use]
     pub fn mount_path(&self) -> &Path {
         &self.mount_path
+    }
+
+    /// Returns a cloneable handle that can evict hydrated files from another
+    /// thread.
+    ///
+    /// The handle does not keep the mount alive. Calls made after the session is
+    /// dropped return [`io::ErrorKind::NotConnected`].
+    #[must_use]
+    pub fn eviction_handle(&self) -> EvictionHandle {
+        EvictionHandle {
+            state: Arc::clone(&self.eviction),
+        }
+    }
+
+    /// Evicts a hydrated file from the `ProjFS` cache.
+    ///
+    /// `relative_path` is interpreted relative to
+    /// [`mount_path`](Self::mount_path), must not contain a root, prefix, or
+    /// `..` component, and no component may end in `.` or a space (Win32 strips
+    /// those characters). On success the local copy is removed and the item
+    /// becomes virtual again; the next open recreates the placeholder and
+    /// hydrates it through the backend. A path that is not cached is treated as
+    /// already evicted.
+    ///
+    /// Eviction is best-effort. Items with local changes, tombstones, open
+    /// handles, and non-empty directories are left in place and reported as
+    /// [`EvictionOutcome::Retained`]; retry after handles close. This never
+    /// asks `ProjFS` to discard dirty metadata or dirty file data.
+    ///
+    /// A clean directory placeholder is also a valid target because this call
+    /// passes `PRJ_UPDATE_NONE`, which only permits items still in the
+    /// placeholder state. Removing an empty directory's local metadata is
+    /// recoverable when the backend lists the directory in its parent
+    /// enumeration; a proactively created placeholder that is not enumerated
+    /// must be re-created by the backend. A non-empty directory is retained.
+    ///
+    /// Call this outside a `Filesystem` callback. `ProjFS` may dispatch
+    /// callbacks while the eviction is processed, so the backend must not hold a
+    /// lock that those callbacks need.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `relative_path` is invalid, the mount has stopped,
+    /// or `ProjFS` rejects the request for a reason unrelated to the item's
+    /// state.
+    pub fn evict(&self, relative_path: impl AsRef<Path>) -> io::Result<EvictionOutcome> {
+        self.eviction.evict(relative_path.as_ref())
     }
 
     /// Stop the projection.
@@ -208,7 +356,9 @@ impl MountSession {
         })?;
         Ok(Self {
             mount_path: mount_path.to_owned(),
-            context,
+            eviction: Arc::new(EvictionState {
+                context: RwLock::new(Some(VirtualizationContext(context))),
+            }),
             _state: state,
         })
     }
@@ -216,10 +366,12 @@ impl MountSession {
 
 impl Drop for MountSession {
     fn drop(&mut self) {
-        if !self.context.is_null() {
-            // SAFETY: context was returned by PrjStartVirtualizing and is live.
-            unsafe { PrjStopVirtualizing(self.context) };
-            self.context = ptr::null_mut();
+        let context = self.eviction.context.write().take();
+        if let Some(context) = context {
+            // SAFETY: taking the context under the write lock prevents new
+            // eviction calls from using it, and existing calls hold the read
+            // lock until they finish.
+            unsafe { PrjStopVirtualizing(context.0) };
         }
     }
 }
@@ -689,6 +841,80 @@ fn wide_path(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
+/// Encodes a path relative to the virtualization root for a `ProjFS` API.
+fn wide_relative_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut wide = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => {
+                // Win32 strips trailing dots and spaces from each component, so
+                // a name ending in either would address a different entry.
+                if name.is_empty()
+                    || name
+                        .as_encoded_bytes()
+                        .last()
+                        .is_some_and(|byte| matches!(byte, b'.' | b' '))
+                {
+                    return Err(invalid_eviction_path(path));
+                }
+                if !wide.is_empty() {
+                    wide.push(u16::from(b'\\'));
+                }
+                for unit in name.encode_wide() {
+                    if unit == 0 {
+                        return Err(invalid_eviction_path(path));
+                    }
+                    wide.push(unit);
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(invalid_eviction_path(path));
+            }
+        }
+    }
+    if wide.is_empty() {
+        return Err(invalid_eviction_path(path));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+fn invalid_eviction_path(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "eviction path must be relative to the mount; components may not be a root, prefix, `..`, or end in `.` or a space: {}",
+            path.display()
+        ),
+    )
+}
+
+fn classify_eviction(
+    result: HRESULT,
+    failure: PRJ_UPDATE_FAILURE_CAUSES,
+) -> io::Result<EvictionOutcome> {
+    if result >= 0
+        || result == hresult(ERROR_FILE_NOT_FOUND)
+        || result == hresult(ERROR_PATH_NOT_FOUND)
+    {
+        return Ok(EvictionOutcome::Evicted);
+    }
+    if result == hresult(ERROR_FILE_SYSTEM_VIRTUALIZATION_INVALID_OPERATION) {
+        return Ok(EvictionOutcome::Retained);
+    }
+    if result == hresult(ERROR_SHARING_VIOLATION) || result == hresult(ERROR_DIR_NOT_EMPTY) {
+        return Ok(EvictionOutcome::Retained);
+    }
+    Err(io::Error::other(format!(
+        "ProjFS could not evict the item: HRESULT 0x{:08x} (failure 0x{:08x})",
+        u32::from_ne_bytes(result.to_ne_bytes()),
+        u32::from_ne_bytes(failure.to_ne_bytes()),
+    )))
+}
+
 unsafe fn wide_slice<'a>(pointer: PCWSTR) -> &'a [u16] {
     if pointer.is_null() {
         return &[];
@@ -823,6 +1049,96 @@ mod tests {
         assert_eq!(win32_code(error_hresult(Error(30))), ERROR_WRITE_PROTECT);
         // An unknown code must still be a failure rather than a success.
         assert!(error_hresult(Error(9999)) < 0);
+    }
+
+    #[test]
+    fn eviction_paths_stay_inside_the_mount() {
+        for path in [
+            "",
+            ".",
+            "..",
+            "../file",
+            "dir/..",
+            "dir/../../file",
+            "/file",
+            r"C:\file",
+            "C:file",
+            r"\\server\share\file",
+            ".. ",
+            "file.",
+        ] {
+            assert!(
+                wide_relative_path(Path::new(path)).is_err(),
+                "accepted {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn eviction_paths_are_normalized_utf16() {
+        let wide = wide_relative_path(Path::new("dir/./file.txt")).unwrap();
+        let expected: Vec<u16> = "dir\\file.txt".encode_utf16().chain(Some(0)).collect();
+        assert_eq!(wide, expected);
+    }
+
+    #[test]
+    fn eviction_reports_a_stopped_mount() {
+        let state = EvictionState {
+            context: RwLock::new(None),
+        };
+        let error = state.evict(Path::new("file.txt")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[test]
+    fn eviction_handle_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<EvictionHandle>();
+        assert_send_sync::<MountSession>();
+    }
+
+    #[test]
+    fn eviction_classifies_items_that_must_be_retained() {
+        let invalid = hresult(ERROR_FILE_SYSTEM_VIRTUALIZATION_INVALID_OPERATION);
+        assert_eq!(
+            classify_eviction(invalid, PRJ_UPDATE_FAILURE_CAUSE_DIRTY_DATA).unwrap(),
+            EvictionOutcome::Retained
+        );
+        assert_eq!(
+            classify_eviction(invalid, PRJ_UPDATE_FAILURE_CAUSE_NONE).unwrap(),
+            EvictionOutcome::Retained,
+            "an invalid-operation result means the item's state prevented eviction"
+        );
+        assert_eq!(
+            classify_eviction(hresult(ERROR_FILE_NOT_FOUND), PRJ_UPDATE_FAILURE_CAUSE_NONE)
+                .unwrap(),
+            EvictionOutcome::Evicted
+        );
+        assert_eq!(
+            classify_eviction(hresult(ERROR_PATH_NOT_FOUND), PRJ_UPDATE_FAILURE_CAUSE_NONE)
+                .unwrap(),
+            EvictionOutcome::Evicted
+        );
+        assert_eq!(
+            classify_eviction(
+                hresult(ERROR_SHARING_VIOLATION),
+                PRJ_UPDATE_FAILURE_CAUSE_NONE
+            )
+            .unwrap(),
+            EvictionOutcome::Retained
+        );
+        assert_eq!(
+            classify_eviction(hresult(ERROR_DIR_NOT_EMPTY), PRJ_UPDATE_FAILURE_CAUSE_NONE).unwrap(),
+            EvictionOutcome::Retained
+        );
+        assert_eq!(
+            classify_eviction(S_OK, PRJ_UPDATE_FAILURE_CAUSE_NONE).unwrap(),
+            EvictionOutcome::Evicted
+        );
+        assert!(
+            classify_eviction(hresult(ERROR_ACCESS_DENIED), PRJ_UPDATE_FAILURE_CAUSE_NONE).is_err(),
+            "an access denial is not a normal item-state outcome"
+        );
     }
 
     #[test]
