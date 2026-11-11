@@ -250,6 +250,9 @@ a backend-specific subdirectory beneath the returned directory.
 - macOS reads leased local files with `pread`, bypassing IPC.
 - Linux reads the local descriptor directly on its FUSE worker.
 - Windows ProjFS manages its virtualization root as the local hydration cache.
+  It never evicts hydrated files automatically; call `MountSession::evict` or
+  keep an `EvictionHandle` from `MountSession::eviction_handle` to return idle
+  files to virtual placeholders.
 
 ## Native events
 

@@ -125,6 +125,10 @@ Windows is a single-process ProjFS provider.
   notification events. This is intentionally different from owning all write
   semantics. A WinFsp adapter can be added later without changing the portable
   model.
+- ProjFS never evicts hydrated content on its own. `MountSession::evict` and
+  the handle returned by `MountSession::eviction_handle` call `PrjDeleteFile`
+  so a backend can return idle files to virtual placeholders; scheduling that
+  cleanup is left to the backend.
 - Raw events expose the borrowed `PRJ_CALLBACK_DATA`, namespace context,
   command id, callback flags, and the hydration buffer for reads.
 

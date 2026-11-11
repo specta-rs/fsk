@@ -231,6 +231,19 @@
 //! lease. Return [`NetworkFile::Remote`] for writes unless the backend can make
 //! them durable itself.
 //!
+//! # Evicting hydrated content
+//!
+//! `fsk` does not evict caches automatically. On macOS and Linux a network
+//! backend owns the files returned as [`NetworkFile::Local`] and should remove
+//! them from [`NetworkFilesystem::close_file`] or its own cleanup task.
+//!
+//! On Windows, `ProjFS` caches hydrated file data in the virtualization root
+//! and never evicts it. The platform `MountSession` exposes `eviction_handle`,
+//! and `EvictionHandle::evict` removes a file relative to the mount so the next
+//! open hydrates it again. Items with local changes, open handles, and non-empty
+//! directories are retained; an open handle may instead fail the call, and both
+//! outcomes are retryable. Deciding when to evict remains backend policy.
+//!
 //! # Accessing OS-native events
 //!
 //! Native events are opt-in. By default [`Filesystem::raw_event_mask`] returns
@@ -408,7 +421,7 @@ pub use network::{
     local_file_directory,
 };
 #[cfg(target_os = "windows")]
-pub use windows::{MountOptions, MountSession};
+pub use windows::{EvictionHandle, EvictionOutcome, MountOptions, MountSession};
 
 /// Version of the C ABI implemented by this crate.
 pub const ABI_VERSION: u32 = 2;
