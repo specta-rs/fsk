@@ -1,7 +1,7 @@
 #![deny(missing_docs)]
 #![doc(
-    html_logo_url = "https://github.com/specta-rs/fsk/raw/main/assets/app-icon-light.svg",
-    html_favicon_url = "https://github.com/specta-rs/fsk/raw/main/assets/app-icon-light.svg"
+    html_logo_url = "https://raw.githubusercontent.com/specta-rs/fsk/main/assets/app-icon-light.svg",
+    html_favicon_url = "https://raw.githubusercontent.com/specta-rs/fsk/main/assets/app-icon-light.svg"
 )]
 
 //! High-performance virtual and network filesystems for macOS, Linux, and Windows.
