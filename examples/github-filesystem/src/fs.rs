@@ -21,6 +21,7 @@ const EACCES: i32 = 13;
 const ENOENT: i32 = 2;
 const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
+const REPOSITORY_PAGE_SIZE: usize = 100;
 
 pub struct Options {
     pub api_url: String,
@@ -455,16 +456,40 @@ impl Api {
     }
 
     fn repositories(&self) -> Result<Vec<Repository>> {
+        // A user token lists repositories through `/user/repos`. The GitHub
+        // Actions installation token cannot call that endpoint, so fall back to
+        // the installation's repository list. Both expose the same shape after
+        // unwrapping the installation page.
+        match self.user_repositories() {
+            Ok(repositories) => Ok(repositories),
+            Err(Error(EACCES | ENOENT)) => self.installation_repositories(),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn user_repositories(&self) -> Result<Vec<Repository>> {
         let mut all = Vec::new();
         for page in 1.. {
             let mut url = self.endpoint(&["user", "repos"])?;
-            url.query_pairs_mut()
-                .append_pair("per_page", "100")
-                .append_pair("page", &page.to_string())
-                .append_pair("sort", "full_name");
+            add_repository_page(&mut url, page);
             let batch: Vec<Repository> = self.get(url)?.json().map_err(|_| Error::IO)?;
-            let done = batch.len() < 100;
+            let done = batch.len() < REPOSITORY_PAGE_SIZE;
             all.extend(batch);
+            if done {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    fn installation_repositories(&self) -> Result<Vec<Repository>> {
+        let mut all = Vec::new();
+        for page in 1.. {
+            let mut url = self.endpoint(&["installation", "repositories"])?;
+            add_repository_page(&mut url, page);
+            let batch: InstallationRepositories = self.get(url)?.json().map_err(|_| Error::IO)?;
+            let done = batch.repositories.len() < REPOSITORY_PAGE_SIZE;
+            all.extend(batch.repositories);
             if done {
                 break;
             }
@@ -498,11 +523,26 @@ impl Api {
         if response.status().as_u16() == 404 {
             return Err(Error(ENOENT));
         }
+        if matches!(response.status().as_u16(), 401 | 403) {
+            return Err(Error(EACCES));
+        }
         if !response.status().is_success() {
             return Err(Error::IO);
         }
         Ok(response)
     }
+}
+
+fn add_repository_page(url: &mut Url, page: u32) {
+    url.query_pairs_mut()
+        .append_pair("per_page", &REPOSITORY_PAGE_SIZE.to_string())
+        .append_pair("page", &page.to_string())
+        .append_pair("sort", "full_name");
+}
+
+#[derive(Deserialize)]
+struct InstallationRepositories {
+    repositories: Vec<Repository>,
 }
 
 #[derive(Deserialize)]

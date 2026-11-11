@@ -21,6 +21,13 @@ use parking_lot::Mutex;
 const APP_BUNDLE_IDENTIFIER: &str = "dev.specta.fsk";
 const APP_TEAM_IDENTIFIER: &str = "68994Z5PT3";
 const APP_EXECUTABLE: &str = "Contents/MacOS/FSK";
+const APP_NAME: &str = "FSK.app";
+/// The per-user directory that holds the installed app. `~/Library` is hidden
+/// in Finder, so the companion app never appears in Applications or Launchpad.
+const APP_SUPPORT_DIRECTORY: &str = "Library/Application Support/dev.specta.fsk";
+/// The machine-wide location used by SDK versions before the app became a
+/// hidden per-user install. It is migrated away by `install` and `uninstall`.
+const LEGACY_APP_PATH: &str = "/Applications/FSK.app";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASE_BASE_URL: &str = "https://github.com/specta-rs/fsk/releases/download";
 const RELEASE_API_URL: &str = "https://api.github.com/repos/specta-rs/fsk/releases/tags";
@@ -46,23 +53,32 @@ pub enum AppInstallOutcome {
 /// [`AuthorizationStatus::needs_install`] returns `true`). Installing does not
 /// authorize the extension; launch the app with [`launch_app`] afterwards.
 ///
-/// The app is installed machine-wide at `/Applications/FSK.app` and shared by
-/// every process on the machine. Installation requires an exact version match,
-/// so a program built against an older SDK can replace (downgrade) an app
-/// installed by a newer SDK.
+/// The app is installed per-user in a hidden directory:
+/// `~/Library/Application Support/dev.specta.fsk/FSK.app`. It is not shared
+/// between users, does not appear in Applications or Launchpad, and needs no
+/// administrator permission. Installation requires an exact version match, so a
+/// program built against an older SDK can replace (downgrade) an app installed
+/// by a newer SDK.
+///
+/// When the default destination is used, a legacy machine-wide
+/// `/Applications/FSK.app` from an older SDK is removed (best-effort) after the
+/// hidden copy is in place, so the visible app does not linger. Launch the app
+/// with [`launch_app`] afterwards; macOS registers the extension from wherever
+/// the launched bundle lives.
 ///
 /// This operation is synchronous and never launches the application or presents
 /// UI, so callers can run it on a background thread or executor of their choice.
-/// The release is downloaded from GitHub, checked by macOS, and installed at
-/// `/Applications/FSK.app`. An already installed, valid matching version is
+/// The release is downloaded from GitHub, checked by macOS, and installed in the
+/// hidden per-user directory. An already installed, valid matching version is
 /// left alone. An interrupted previous installation is recovered before any
 /// download begins.
 ///
 /// Set `FSK_APP_PATH` to the full path of an app bundle (for example
-/// `/Applications/FSK.app`) to choose a different destination during
-/// development. It must be an absolute path ending in `.app`; it is not a
-/// directory that contains the bundle. The value is normalized before use, and
-/// relative paths or paths containing `..` are rejected.
+/// `~/Library/Application Support/dev.specta.fsk/FSK.app`) to choose a different
+/// destination during development. It must be an absolute path ending in
+/// `.app`; it is not a directory that contains the bundle. The value is
+/// normalized before use, and relative paths or paths containing `..` are
+/// rejected. With an override, no legacy `/Applications` copy is touched.
 ///
 /// If `GITHUB_TOKEN` or `GH_TOKEN` is set, the release asset is resolved through
 /// the GitHub API so a private release can be downloaded. Set
@@ -90,7 +106,8 @@ pub enum AppInstallOutcome {
 /// contains `..`, or does not name a folder ending in `.app`.
 pub fn install() -> io::Result<AppInstallOutcome> {
     let _mutation = APP_MUTATION.lock();
-    let destination = app_path()?;
+    let configured = env::var_os("FSK_APP_PATH");
+    let destination = app_path_from(configured.clone(), env::var_os("HOME"))?;
     let parent = destination_parent(&destination)?;
     fs::create_dir_all(parent).map_err(|error| fs_error("create", parent, &error))?;
     // The lock is held on the directory itself, so no lock file is created and
@@ -98,39 +115,50 @@ pub fn install() -> io::Result<AppInstallOutcome> {
     let _lock = AppLock::acquire(parent)?;
     recover_interrupted_install(&destination)?;
     let was_installed = path_present(&destination)?;
-    if validate_app(&destination, APP_VERSION).is_ok() {
-        return Ok(AppInstallOutcome::AlreadyInstalled);
-    }
-    if was_installed && !is_fsk_app(&destination)? {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "refusing to replace {} because it is not an FSK.app bundle",
-                destination.display()
-            ),
-        ));
-    }
-
-    let temporary = temporary_directory()?;
-    let result = install_from_release(&temporary, &destination);
-    let _ = remove_path(&temporary);
-    result?;
-
-    Ok(if was_installed {
-        AppInstallOutcome::Updated
+    let outcome = if validate_app(&destination, APP_VERSION).is_ok() {
+        AppInstallOutcome::AlreadyInstalled
     } else {
-        AppInstallOutcome::Installed
-    })
+        if was_installed && !is_fsk_app(&destination)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to replace {} because it is not an FSK.app bundle",
+                    destination.display()
+                ),
+            ));
+        }
+
+        let temporary = temporary_directory()?;
+        let result = install_from_release(&temporary, &destination);
+        let _ = remove_path(&temporary);
+        result?;
+
+        if was_installed {
+            AppInstallOutcome::Updated
+        } else {
+            AppInstallOutcome::Installed
+        }
+    };
+    // A default install supersedes the machine-wide copy old SDK versions put
+    // in Applications. Remove it so it does not stay visible (and does not win
+    // PlugInKit election over the hidden copy that launch_app registers next).
+    if configured.is_none() {
+        let _ = remove_legacy_install();
+    }
+    Ok(outcome)
 }
 
 /// Remove the installed `FSK` companion app without presenting UI.
 ///
-/// The app is installed machine-wide and shared by every process on the
-/// machine, so this removes it for all consumers, not just the current process.
-/// Leftover staging entries from an interrupted installation that are older
-/// than 24 hours are removed best-effort. Every destination backup is removed
-/// so a later install cannot restore an app that was just uninstalled; a crash
-/// between removing the app and its backups can still leave one behind.
+/// The app is installed per-user in
+/// `~/Library/Application Support/dev.specta.fsk/FSK.app`, so this removes it
+/// for the current user. With the default destination, a legacy machine-wide
+/// `/Applications/FSK.app` from an older SDK is removed too (best-effort), so an
+/// uninstall does not leave the app visible in Applications. Leftover staging
+/// entries from an interrupted installation that are older than 24 hours are
+/// removed best-effort. Every destination backup is removed so a later install
+/// cannot restore an app that was just uninstalled; a crash between removing the
+/// app and its backups can still leave one behind.
 ///
 /// This operation is synchronous and is serialized with installation calls in
 /// the same process and, through an exclusive lock on the destination's parent
@@ -139,9 +167,10 @@ pub fn install() -> io::Result<AppInstallOutcome> {
 /// was installed.
 ///
 /// Set `FSK_APP_PATH` to the full path of an app bundle (for example
-/// `/Applications/FSK.app`) to choose a different destination during
-/// development. The value is normalized before use and must be a full bundle
-/// path, not a directory that contains the bundle.
+/// `~/Library/Application Support/dev.specta.fsk/FSK.app`) to choose a different
+/// destination during development. The value is normalized before use and must
+/// be a full bundle path, not a directory that contains the bundle. With an
+/// override, no legacy `/Applications` copy is touched.
 ///
 /// # Errors
 ///
@@ -151,21 +180,25 @@ pub fn install() -> io::Result<AppInstallOutcome> {
 /// it from the chosen destination may require permission.
 pub fn uninstall() -> io::Result<bool> {
     let _mutation = APP_MUTATION.lock();
-    let app = app_path()?;
+    let configured = env::var_os("FSK_APP_PATH");
+    let app = app_path_from(configured.clone(), env::var_os("HOME"))?;
     let parent = destination_parent(&app)?;
     let name = app_name(&app)?;
-    if !path_present(parent)? {
-        // Nothing could have been installed without a parent directory.
-        return Ok(false);
+    let mut removed = false;
+    if path_present(parent)? {
+        // Without a parent directory nothing could have been installed there.
+        let _lock = AppLock::acquire(parent)?;
+        removed = uninstall_app_at(&app)?;
+        let _ = cleanup_stale_entries(parent, name, "install");
+        // Remove every backup for this destination, not just stale ones. A
+        // recent backup would otherwise be restored by a later install, making
+        // the uninstall non-durable. The parent lock means no cooperating
+        // process can own one right now.
+        let _ = remove_matching_entries(parent, name, "backup");
     }
-    let _lock = AppLock::acquire(parent)?;
-    let removed = uninstall_app_at(&app)?;
-    let _ = cleanup_stale_entries(parent, name, "install");
-    // Remove every backup for this destination, not just stale ones. A recent
-    // backup would otherwise be restored by a later install, making the
-    // uninstall non-durable. The parent lock means no cooperating process can
-    // own one right now.
-    let _ = remove_matching_entries(parent, name, "backup");
+    if configured.is_none() {
+        removed |= remove_legacy_install();
+    }
     Ok(removed)
 }
 
@@ -180,10 +213,10 @@ pub fn uninstall() -> io::Result<bool> {
 /// called. When the app is not installed, this function does not run anything
 /// and returns immediately.
 ///
-/// Set `FSK_APP_PATH` to override the normal `/Applications/FSK.app`
-/// location, which is useful for development and app-local distributions. The
-/// value must be the full path of an `.app` bundle, not a directory that
-/// contains it.
+/// Set `FSK_APP_PATH` to override the normal
+/// `~/Library/Application Support/dev.specta.fsk/FSK.app` location, which is
+/// useful for development and app-local distributions. The value must be the
+/// full path of an `.app` bundle, not a directory that contains it.
 ///
 /// # Errors
 ///
@@ -235,9 +268,9 @@ fn app_matches_sdk(app: &Path) -> bool {
 /// [`AuthorizationStatus::NeedsApproval`], including right after a fresh
 /// installation: copying the app into place does not register its extension.
 ///
-/// Set `FSK_APP_PATH` to override the normal `/Applications/FSK.app`
-/// location. The value must be the full path of an `.app` bundle, not a
-/// directory that contains it.
+/// Set `FSK_APP_PATH` to override the normal
+/// `~/Library/Application Support/dev.specta.fsk/FSK.app` location. The value
+/// must be the full path of an `.app` bundle, not a directory that contains it.
 ///
 /// # Errors
 ///
@@ -930,6 +963,25 @@ fn uninstall_app_at(app: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Remove the machine-wide `/Applications/FSK.app` installed by older SDK
+/// versions.
+///
+/// This is best-effort: the per-user app is already installed (or being
+/// installed), and a legacy bundle that cannot be removed, or that is not an
+/// FSK app at all, must not fail the operation. Staging entries and backups for
+/// the legacy destination are cleaned up as well.
+fn remove_legacy_install() -> bool {
+    let app = Path::new(LEGACY_APP_PATH);
+    let removed = uninstall_app_at(app).unwrap_or(false);
+    if let (Some(parent), Some(name)) =
+        (app.parent(), app.file_name().and_then(|name| name.to_str()))
+    {
+        let _ = cleanup_stale_entries(parent, name, "install");
+        let _ = remove_matching_entries(parent, name, "backup");
+    }
+    removed
+}
+
 fn remove_path(path: &Path) -> io::Result<bool> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -1060,10 +1112,13 @@ fn fs_error(operation: &str, path: &Path, error: &io::Error) -> io::Error {
 }
 
 fn app_path() -> io::Result<PathBuf> {
-    app_path_from(env::var_os("FSK_APP_PATH"))
+    app_path_from(env::var_os("FSK_APP_PATH"), env::var_os("HOME"))
 }
 
-fn app_path_from(configured: Option<std::ffi::OsString>) -> io::Result<PathBuf> {
+fn app_path_from(
+    configured: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> io::Result<PathBuf> {
     let path = match configured {
         Some(value) if value.to_string_lossy().trim().is_empty() => {
             return Err(io::Error::new(
@@ -1072,9 +1127,30 @@ fn app_path_from(configured: Option<std::ffi::OsString>) -> io::Result<PathBuf> 
             ));
         }
         Some(value) => PathBuf::from(value),
-        None => Path::new("/Applications/FSK.app").to_owned(),
+        None => default_app_path(home)?,
     };
     normalize_app_path(&path)
+}
+
+/// The hidden per-user destination:
+/// `~/Library/Application Support/dev.specta.fsk/FSK.app`.
+fn default_app_path(home: Option<std::ffi::OsString>) -> io::Result<PathBuf> {
+    let home = home
+        .filter(|home| !home.to_string_lossy().trim().is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "HOME is not set, so FSK.app cannot be installed in the per-user Application Support directory; set FSK_APP_PATH",
+            )
+        })?;
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HOME must be an absolute path to locate FSK.app",
+        ));
+    }
+    normalize_app_path(&home.join(APP_SUPPORT_DIRECTORY).join(APP_NAME))
 }
 
 /// Normalize `FSK_APP_PATH` before any metadata, rename, or removal operation.
@@ -1192,12 +1268,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_app_is_not_installed() {
+    fn the_default_install_is_hidden_in_the_home_directory() {
         // The path resolver itself is deliberately deterministic; integration
         // tests exercise the installed app on signed release builds.
         assert_eq!(
-            Path::new("/Applications/FSK.app").join(APP_EXECUTABLE),
-            Path::new("/Applications/FSK.app/Contents/MacOS/FSK")
+            app_path_from(None, Some("/Users/example".into())).unwrap(),
+            Path::new("/Users/example/Library/Application Support/dev.specta.fsk/FSK.app")
+        );
+        assert_eq!(
+            Path::new("/Users/example/Library/Application Support/dev.specta.fsk/FSK.app")
+                .join(APP_EXECUTABLE),
+            Path::new(
+                "/Users/example/Library/Application Support/dev.specta.fsk/FSK.app/Contents/MacOS/FSK"
+            )
         );
     }
 
@@ -1816,13 +1899,13 @@ TeamIdentifier=68994Z5PT3
     }
 
     #[test]
-    fn empty_overrides_are_rejected() {
-        assert!(app_path_from(Some("".into())).is_err());
-        assert!(app_path_from(Some("   ".into())).is_err());
-        assert_eq!(
-            app_path_from(None).unwrap(),
-            Path::new("/Applications/FSK.app")
-        );
+    fn empty_overrides_and_missing_home_are_rejected() {
+        assert!(app_path_from(Some("".into()), None).is_err());
+        assert!(app_path_from(Some("   ".into()), None).is_err());
+        // A relative HOME cannot name a per-user Application Support directory.
+        assert!(app_path_from(None, Some("relative/home".into())).is_err());
+        assert!(app_path_from(None, Some("".into())).is_err());
+        assert!(app_path_from(None, None).is_err());
         assert!(release_base_from(Some("".into())).is_err());
         assert!(release_base_from(Some("   ".into())).is_err());
         assert_eq!(release_base_from(None).unwrap(), None);

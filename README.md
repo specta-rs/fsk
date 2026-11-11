@@ -7,44 +7,45 @@
 
 # FSK
 
-Build cross-platform virtual file systems with ease
+Build cross-platform virtual file systems with ease.
 
-- macOS: FSKit extension with an install-once Swift bridge.
-- Linux: multithreaded kernel FUSE adapter.
-- Windows: native ProjFS provider for lazy virtual and network trees.
-- Rust: `Filesystem` and `NetworkFilesystem: Filesystem` traits.
-- Native access: opt-in borrowed FSKit, FUSE, and Windows event contexts.
+- **macOS 26+** — FSKit extension behind an install-once Swift bridge.
+- **Linux** — multithreaded kernel FUSE adapter.
+- **Windows 10 1809+** — native ProjFS provider for lazy virtual and network
+  trees.
+- **Rust** — a small `Filesystem` trait, plus `NetworkFilesystem` for remote
+  trees.
+- **Native access** — opt-in borrowed FSKit, FUSE, and Windows event contexts.
 
-The common API stays deliberately small. Backends identify items with stable
-64-bit inode values, stream directory entries into a caller-owned sink, and
-read directly into caller-provided buffers. Names are arbitrary bytes on Unix
-and WTF-8 on Windows, preserving Windows UTF-16 names including unpaired
+The API stays deliberately small. Backends identify items with stable 64-bit
+inode values, stream directory entries into a caller-owned sink, and read
+directly into caller-provided buffers. Names are arbitrary bytes on Unix and
+WTF-8 on Windows, so UTF-16 names round-trip even when they contain unpaired
 surrogates.
 
-The published `fsk` crate deliberately implements neither `Filesystem` nor
-`NetworkFilesystem`. It does not choose an inode index, cache, locking model,
-transaction boundary, consistency policy, or storage engine for downstream
-users. The workspace's memory and network backends are examples only; copy
-their ideas or replace them entirely. The example catalog also includes a
-Google Drive backend that mounts `My Drive`, items `Shared with me`, and shared
-drives using an OAuth token while honoring each file's write capability.
+The published `fsk` crate implements neither trait for you. It chooses no inode
+index, cache, locking model, transaction boundary, consistency policy, or
+storage engine — those decisions belong to the backend. The workspace's memory
+and network backends are examples only; copy their ideas or replace them
+entirely. The catalog also includes a Google Drive backend that mounts
+`My Drive`, items shared with the user, and shared drives over OAuth while
+honoring each file's write capability.
 
 ## Platform support
 
-| Platform | Native layer | Model | Installation |
+| Platform | Native layer | Model | Requirement |
 |---|---|---|---|
 | macOS 26+ | FSKit | Full virtual filesystem; lazy network support | Install and authorize `FSK.app` once |
 | Linux | FUSE kernel protocol through `fuser` | Full virtual filesystem; lazy network support | FUSE must be available |
 | Windows 10 1809+ | ProjFS | Lazy projected tree with Windows-managed local cache | Enable the Projected File System optional component |
 
-ProjFS intentionally merges projected entries with local files. Writes and
-hydrated content live in its virtualization root, while providers receive
-native notifications through the raw hook. This is a particularly good fit for
-source-control, cloud, content-addressed, and other network-backed trees. A
-fully synthetic Windows filesystem with provider-owned write semantics would
-use WinFsp; FSK exposes the Windows-native callback context in a form that
-does not prevent a WinFsp adapter from being added without changing the common
-model.
+ProjFS merges projected entries with local files: writes and hydrated content
+live in its virtualization root, and providers observe changes through the raw
+hook. That makes it a good fit for source-control, cloud, content-addressed, and
+other network-backed trees. A fully synthetic Windows filesystem with
+provider-owned write semantics would use WinFsp; FSK exposes the Windows-native
+callback context in a form that leaves room for a WinFsp adapter without
+changing the common model.
 
 ## Implement a filesystem
 
@@ -95,11 +96,11 @@ let mount = MountSession::mount(MyCoolFilesystem, "/path/to/mount")?;
 # Ok::<(), std::io::Error>(())
 ```
 
-The required methods are sufficient for a read-only filesystem. Mutation
-methods default to `ENOTSUP`. Methods can run concurrently, so implementations
-must be `Send + Sync`.
+The required methods are enough for a read-only filesystem. Mutation methods
+default to `ENOTSUP`. Methods run concurrently, so implementations must be
+`Send + Sync`.
 
-The workspace's memory example is a complete CLI and a deliberately separate
+The workspace's memory backend is a complete CLI and a deliberately separate
 implementation:
 
 ```sh
@@ -107,9 +108,90 @@ cargo run -p fsk-memory-backend -- /path/to/mount
 ```
 
 Control-C performs an orderly unmount. The same executable builds against the
-native adapter selected by its target OS.
+native adapter selected by its target OS. See
+[`examples/README.md`](examples/README.md) for the full example catalog.
 
-See [`examples/README.md`](examples/README.md) for the complete example catalog.
+## Mount prerequisites
+
+Mounting needs a platform component in addition to the Rust crate.
+`fsk::authorization_status()` reports whether the host is ready:
+
+```rust
+match fsk::authorization_status()? {
+    fsk::AuthorizationStatus::Authorized => {}
+    fsk::AuthorizationStatus::NotInstalled => {
+        // macOS only: install the matching FSK.app release.
+        fsk::install()?;
+    }
+    fsk::AuthorizationStatus::NeedsApproval => {
+        // macOS: enable the FSK extension in System Settings.
+        // Windows: enable the Projected File System optional component.
+        // Linux: make FUSE available.
+    }
+}
+# Ok::<(), std::io::Error>(())
+```
+
+`fsk::ensure_authorization()` performs the same check and opens the relevant
+setup UI: `FSK.app` on macOS and **Windows Features** on Windows. When setup is
+still required it returns an actionable error; Linux has no setup UI, so the
+error describes the FUSE requirement.
+
+### macOS
+
+macOS needs `FSK.app`, a small setup utility that hosts the FSKit extension.
+`fsk::install()` places it in a hidden per-user directory,
+`~/Library/Application Support/dev.specta.fsk/FSK.app`, so it never appears in
+Applications or Launchpad and needs no administrator permission. Installation
+requires an exact version match with the SDK, so a program built against an
+older SDK can downgrade an app installed by a newer one. `fsk::uninstall()`
+removes the current user's copy; on the default path, install and uninstall also
+remove a legacy machine-wide `/Applications/FSK.app`.
+
+Copying the app into place does not register its extension: it must be launched
+once. After that, the user enables the extension under **System Settings →
+General → Login Items & Extensions → File System Extensions**. Enabling the
+switch is a per-user action, and macOS exposes no API for it:
+
+```rust
+let status = fsk::authorization_status()?;
+if status.needs_install() {
+    let outcome = fsk::install()?;
+    println!("FSK app installation: {outcome:?}");
+}
+if status != fsk::AuthorizationStatus::Authorized {
+    fsk::launch_app()?;
+}
+# Ok::<(), std::io::Error>(())
+```
+
+Run the blocking installation call on your background executor. Downloads come
+from this repository's public GitHub release; set `GITHUB_TOKEN` or `GH_TOKEN`
+for a private release, or set `FSK_RELEASE_BASE_URL` to a mirror that serves
+`{base}/v{version}/FSK-v{version}.zip`.
+
+Set `FSK_APP_PATH` to the full path of an `.app` bundle, such as
+`/Applications/FSK.app`, to test a build outside the default location. It must
+name the bundle itself, not the directory that contains it; with an override, no
+legacy `/Applications` copy is touched. See
+[`fsk/macos/README.md`](fsk/macos/README.md) for the setup flow, or
+[CONTRIBUTING.md](CONTRIBUTING.md) for the full helper and environment-variable
+reference.
+
+### Windows
+
+Enable **Projected File System** under **Turn Windows features on or off**, or
+from an administrator shell:
+
+```powershell
+Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
+```
+
+ProjFS requires an empty or previously initialized virtualization root.
+
+### Linux
+
+Linux needs a working FUSE installation and access to `/dev/fuse`.
 
 ## Network filesystems and downloaded files
 
@@ -162,7 +244,7 @@ a backend-specific subdirectory beneath the returned directory.
 - Linux reads the local descriptor directly on its FUSE worker.
 - Windows ProjFS manages its virtualization root as the local hydration cache.
 
-## Native requests without default overhead
+## Platform-native requests
 
 Implementers can inspect platform-specific events without forcing every
 filesystem through an allocation-heavy universal request object:
@@ -217,7 +299,7 @@ predictable bit test and do not construct an event or call the hook. Buffers
 are borrowed in place:
 
 - Linux exposes the live `fuser::Request` and read/write buffer.
-- Windows exposes `PRJ_CALLBACK_DATA`, namespace context, command ID, and
+- Windows exposes `PRJ_CALLBACK_DATA`, namespace context, command ID, and the
   ProjFS-aligned hydration buffer.
 - macOS exposes exact bridge payloads, request/item identifiers, and flags.
   FSKit Objective-C pointers cannot be validly exposed to a separate Rust
@@ -236,210 +318,14 @@ flowchart LR
     M --> S["Install-once Swift extension"]
 ```
 
-macOS mounts use a mode-0600 Unix socket in the FSK App Group container and
-a random per-mount capability. The extension pools up to one persistent
-connection per active CPU. Linux uses multiple FUSE event loops and
-`FUSE_DEV_IOC_CLONE` where available. Windows lets ProjFS select or configure
-native callback workers.
-
-## Performance
-
-The hot paths avoid serialization frameworks and per-item calls:
-
-- caller-owned read buffers and borrowed write buffers;
-- packed directory batches on macOS;
-- reusable thread-local FUSE read buffers on Linux;
-- ProjFS-aligned buffers written directly with `PrjWriteFileData` on Windows;
-- fixed little-endian IPC frames rather than JSON or Codable;
-- `writev` for macOS response headers and payloads;
-- stable directory cookies and mutation verifiers;
-- no raw-event allocation or virtual call unless its operation is enabled.
-
-These figures use a benchmark-only immutable `Filesystem` with no inode index,
-cache, locking, consistency policy, or storage engine. They measure trait
-dispatch, caller-owned buffers, directory sinks, and raw-hook plumbing rather
-than either example implementation. Benchmarks were run on an Apple M1 Pro
-using release builds:
-
-| Benchmark | Observed result |
-|---|---:|
-| Trait-object lookup | 435 million operations/s median |
-| 128 KiB caller-buffer reads | 54.8 GiB/s median |
-| 10,001-entry directory sink | 466 million entries/s median |
-| Raw hooks disabled | Within run-to-run noise of direct dispatch |
-| Authenticated macOS IPC lookup | 188 thousand round trips/s median |
-
-Changing macOS response writes from two syscalls to vectored I/O improved the
-authenticated lookup result from a 162–169k baseline to 182–196k round trips/s
-(roughly 12–15% by median, depending on the run). A round trip is about
-5.1–5.5 µs on this machine.
-
-Run the same benchmarks locally:
-
-```sh
-cargo bench -p fsk --bench throughput
-cargo bench -p fsk --bench raw_overhead
-cargo test --release -p fsk \
-  ipc::tests::benchmark_authenticated_ipc_lookup_roundtrip \
-  -- --ignored --nocapture
-```
-
-These isolate backend and dispatch costs. Mounted performance also includes the
-host kernel, FUSE/FSKit/ProjFS, cache state, and the downstream backend; use
-`fio`, Instruments, `fs_usage`, or platform equivalents for deployment-specific
-measurements.
-
-## Building and testing
-
-Rust requires version 1.85 or later.
-
-```sh
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
-
-cargo check --workspace --all-targets \
-  --target x86_64-unknown-linux-gnu
-cargo check --workspace --all-targets \
-  --target x86_64-pc-windows-msvc
-```
-
-The CI matrix runs native Rust tests on macOS, Ubuntu, and Windows. The macOS
-job also generates the Xcode project and runs the Swift bridge tests.
-
-### macOS bridge
-
-macOS additionally requires Xcode 26, XcodeGen, and an Apple team capable of
-signing `com.apple.developer.fskit.fsmodule`.
-
-```sh
-(cd fsk/macos && xcodegen generate)
-./fsk/macos/check.sh
-```
-
-The Rust SDK can download and install the matching `FSK.app` release without
-opening it. Run the blocking installation call on your background executor,
-then launch the app separately when the user is ready to authorize it under
-**System Settings → General → Login Items & Extensions → File System Extensions**.
-`authorization_status()` reports `NotInstalled` when the matching app is missing,
-and `NeedsApproval` when the app is present but its extension is not registered
-or enabled. Copying the app into place does not register its extension, so a
-fresh installation reports `NeedsApproval` until the app has been launched once:
-
-```rust
-let status = fsk::authorization_status()?;
-if status.needs_install() {
-    let outcome = fsk::install()?;
-    println!("FSK app installation: {outcome:?}");
-}
-if status != fsk::AuthorizationStatus::Authorized {
-    fsk::launch_app()?;
-}
-# Ok::<(), std::io::Error>(())
-```
-
-Later, when your application no longer needs the extension:
-
-```rust
-let removed = fsk::uninstall()?;
-println!("FSK app removed: {removed}");
-# Ok::<(), std::io::Error>(())
-```
-
-The default download uses the public GitHub release for this repository. If the
-release is private, set `GITHUB_TOKEN` or `GH_TOKEN` and the SDK resolves the
-asset through the GitHub API, or set `FSK_RELEASE_BASE_URL` to a mirror that
-serves `{base}/v0.0.9/FSK-v0.0.9.zip`.
-
-The app is installed machine-wide at `/Applications/FSK.app` and shared by every
-process and SDK consumer on the machine. Installation requires an exact version
-match, so a program built against an older SDK can replace (downgrade) an app
-installed by a newer SDK. `uninstall()` likewise removes the app for all
-consumers, not just the current program. Both operations are serialized across
-cooperating processes with an advisory lock on the destination's parent
-directory; no lock file is created.
-
-Set `FSK_APP_PATH` to the full path of an `.app` bundle (for example
-`/Applications/FSK.app`) while testing an app outside `/Applications`. All four
-helpers — install, authorization status, launch, and uninstall — require a full
-bundle path; it is not a directory that contains the app. Uninstall removes
-directory bundles only when their `CFBundleIdentifier` is `dev.specta.fsk`
-(symlinks at the destination are removed without following them, and any other
-file or directory is refused), and it always refuses to delete a mount point.
-
-### Windows
-
-Enable **Projected File System** in “Turn Windows features on or off”, or with
-an administrator shell:
-
-```powershell
-Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS
-```
-
-ProjFS requires an empty or previously initialized virtualization root.
-
-### Platform authorization
-
-`fsk::authorization_status()` reports whether the host can mount:
-
-```rust
-match fsk::authorization_status()? {
-    fsk::AuthorizationStatus::Authorized => {}
-    fsk::AuthorizationStatus::NotInstalled => {
-        // macOS only: install the matching FSK.app release.
-        fsk::install()?;
-    }
-    fsk::AuthorizationStatus::NeedsApproval => {
-        // macOS: enable the FSK extension in System Settings.
-        // Windows: enable the Projected File System optional component.
-        // Linux: make FUSE available.
-    }
-}
-# Ok::<(), std::io::Error>(())
-```
-
-`fsk::ensure_authorization()` performs the same check and opens the relevant
-setup UI: `FSK.app` on macOS and **Windows Features** on Windows. It returns an
-actionable error when setup is still required. Linux has no setup UI, so the
-error describes the FUSE requirement.
-
-Linux additionally needs a working FUSE installation and access to
-`/dev/fuse`.
+macOS mounts use a mode-0600 Unix socket in the FSK App Group container and a
+random per-mount capability. The extension pools up to one persistent
+connection per active CPU. Linux runs multiple FUSE event loops and uses
+`FUSE_DEV_IOC_CLONE` where available. Windows lets ProjFS select or configure native callback
+workers.
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the platform architecture, how to
 develop and test the FSKit extension, the required Rust and Swift toolchains,
 and the `FSK_APP_PATH` development override.
-
-## Releases
-
-Tags matching `v*` build, sign, notarize, staple, and upload `FSK.app`, then
-publish the matching `fsk` crate through crates.io Trusted Publishing.
-
-Configure a crates.io trusted publisher for:
-
-- GitHub owner: `specta-rs`
-- repository: `fsk`
-- workflow: `release.yml`
-- environment: none
-
-The workflow uses GitHub OIDC and does not require a crates.io API-token
-secret. The tag must exactly match the crate version, such as `v0.0.1`.
-
-For macOS signing, configure:
-
-- `BUILD_CERTIFICATE_BASE64`
-- `P12_PASSWORD`
-- `KEYCHAIN_PASSWORD`
-- `APP_PROVISIONING_PROFILE_BASE64`
-- `EXTENSION_PROVISIONING_PROFILE_BASE64`
-- `APPLE_TEAM_ID`
-- `APPLE_ID`
-- `APPLE_APP_SPECIFIC_PASSWORD`
-
-Both App IDs and profiles must include the
-`group.dev.specta.fsk` App Group.
-
-FSKit still requires its `.appex` inside a signed `.app`; a CLI cannot contain
-the extension as a raw executable. The companion app is installed once and can
-serve any number of independent Rust mount processes.

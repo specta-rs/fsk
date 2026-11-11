@@ -50,3 +50,20 @@ cargo test -p fsk-github-filesystem
 The end-to-end test starts a local fake GitHub REST server and exercises discovery,
 directory traversal, an API read, a cached local reopen, read-only behavior, and
 age-based eviction without external credentials.
+
+### Live mount test
+
+`live_mount_reads_repository` mounts the real repository through FUSE on Linux
+and reads it through the mounted path. It is ignored by default because it needs
+network access and a working FUSE installation:
+
+```sh
+GITHUB_TOKEN=... GITHUB_REPOSITORY=specta-rs/fsk \
+  cargo test -p fsk-github-filesystem -- --ignored live_mount
+```
+
+Any user token with repository read access works. CI uses the workflow's
+built-in installation token: the API client falls back to
+`/installation/repositories` when `/user/repos` is unavailable. The
+`.github/workflows/live-mounts.yml` workflow runs this test on every change and
+weekly.

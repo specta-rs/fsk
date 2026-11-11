@@ -908,3 +908,61 @@ fn stale_remote_versions_are_rejected_and_drive_quota_stays_authoritative() {
     assert_eq!(stats.free_bytes, 1_000);
     assert_eq!(stats.available_bytes, 1_000);
 }
+
+/// Mount a real Drive account through FUSE and read the CI fixture.
+///
+/// Ignored by default because it needs network access, Google credentials, and
+/// a working FUSE installation. CI runs it with:
+///
+/// ```sh
+/// cargo test -p fsk-google-drive -- --ignored live_mount
+/// ```
+///
+/// Set `FSK_DRIVE_TEST_PATH` to override the fixture path under `My Drive`
+/// (default: `fsk-ci/hello.txt`). Its contents must be `hello from fsk ci\n`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires network access, Google credentials, and FUSE"]
+fn live_mount_reads_drive_fixture() {
+    let filesystem = GoogleDrive::connect(live_access_token()).expect("connect to Google Drive");
+    let mount = tempfile::tempdir().expect("mount directory");
+    let session =
+        fsk::MountSession::mount_network(filesystem, mount.path()).expect("mount Google Drive");
+
+    let fixture =
+        std::env::var("FSK_DRIVE_TEST_PATH").unwrap_or_else(|_| "fsk-ci/hello.txt".to_owned());
+    let mut path = mount.path().join("My Drive");
+    for segment in fixture.split('/').filter(|segment| !segment.is_empty()) {
+        path.push(segment);
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    assert_eq!(content, "hello from fsk ci\n", "unexpected fixture content");
+
+    let metadata = std::fs::metadata(&path).expect("fixture metadata");
+    assert_eq!(metadata.len(), content.len() as u64);
+
+    let missing = std::fs::read(mount.path().join("My Drive").join("fsk-ci-missing-file"));
+    assert_eq!(
+        missing.expect_err("missing files must fail").kind(),
+        std::io::ErrorKind::NotFound
+    );
+
+    drop(session);
+}
+
+#[cfg(target_os = "linux")]
+fn live_access_token() -> String {
+    if let Ok(token) = std::env::var("GOOGLE_DRIVE_ACCESS_TOKEN") {
+        return token;
+    }
+    let client_id = std::env::var("GOOGLE_CLIENT_ID")
+        .expect("GOOGLE_CLIENT_ID must be set (or GOOGLE_DRIVE_ACCESS_TOKEN)");
+    let client_secret = std::env::var("GOOGLE_CLIENT_SECRET")
+        .expect("GOOGLE_CLIENT_SECRET must be set (or GOOGLE_DRIVE_ACCESS_TOKEN)");
+    let refresh_token = std::env::var("GOOGLE_DRIVE_REFRESH_TOKEN")
+        .expect("GOOGLE_DRIVE_REFRESH_TOKEN must be set (or GOOGLE_DRIVE_ACCESS_TOKEN)");
+    refresh_access_token(&client_id, &client_secret, &refresh_token)
+        .expect("exchange Google Drive refresh token")
+}

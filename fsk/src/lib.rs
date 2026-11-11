@@ -337,7 +337,8 @@
 //!   app must be installed and its extension enabled in **System Settings →
 //!   General → Login Items & Extensions → File System Extensions**. The SDK
 //!   exposes `install`, `launch_app`, and `uninstall` to automate that setup.
-//!   `FSK_APP_PATH` overrides the app location during development.
+//!   The app is installed per-user under `~/Library/Application Support`;
+//!   `FSK_APP_PATH` overrides that location during development.
 //! - **Linux** requires FUSE: `/dev/fuse` must exist and the mounting user must
 //!   be allowed to use it.
 //! - **Windows** requires the Projected File System optional component

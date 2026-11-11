@@ -3,14 +3,15 @@
 `FSK.app` is the install-once companion application that hosts the FSKit
 extension. It is a setup utility, not a background service: it opens the File
 System Extensions pane, reports whether the extension is enabled, and waits for
-the user to choose **Done** or **Quit**.
+the user to enable it.
 
 ## Setup flow
 
-1. An embedding application installs `FSK.app` (or the user moves it to
-   `/Applications`). `fsk::authorization_status()` reports `NotInstalled` when
-   the matching app is missing, so
-   `fsk::install()` should run first.
+1. An embedding application installs `FSK.app` with `fsk::install()`.
+   `fsk::authorization_status()` reports `NotInstalled` when the matching app
+   is missing, so `install()` should run first. The app goes into a hidden
+   per-user directory, `~/Library/Application Support/dev.specta.fsk/FSK.app`,
+   and a legacy `/Applications/FSK.app` from an older SDK is removed.
 2. The embedding application calls `fsk::launch_app()` when
    `fsk::authorization_status()` reports `NeedsApproval`. A freshly installed
    app is not registered with `FSKit` until it has been launched once.
@@ -26,17 +27,23 @@ macOS does not expose an API that enables an FSKit extension. The switch is a
 per-user action in System Settings; the app can only make that action obvious
 and verify the result.
 
-## Why `/Applications`?
+## Why a hidden directory?
 
-FSKit discovers modules through LaunchServices and PlugInKit. `/Applications`
-is the reliable, supported location. Apps elsewhere (including
-`~/Applications`) can work after they have been launched once, but discovery is
-less predictable and System Settings may not list the extension until then.
+FSKit discovers modules through LaunchServices and PlugInKit when the host app
+is launched, not because of where the bundle lives. Xcode runs and tests FSKit
+extensions from DerivedData, so the install location does not affect discovery
+as long as the app is launched at least once. `launch_app()` does that as part
+of the setup flow.
 
-`FSK.app` sets `LSUIElement`, so it does not appear in the Dock or App Switcher.
-It is still a normal application bundle in `/Applications`; it only shows its
-setup window when launched. Set `FSK_APP_PATH` while testing an app outside
-`/Applications`.
+The default destination is
+`~/Library/Application Support/dev.specta.fsk/FSK.app`. `~/Library` is hidden in
+Finder, so the app never appears in Applications, Launchpad, or Spotlight, and
+each user gets their own copy without needing administrator permission.
+`FSK.app` also sets `LSUIElement`, so it does not appear in the Dock or App
+Switcher; it only shows its setup window when launched.
+
+If a future macOS refuses to register an extension outside Applications, set
+`FSK_APP_PATH=/Applications/FSK.app` before calling the lifecycle helpers.
 
 ## Build and test
 

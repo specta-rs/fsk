@@ -1,0 +1,113 @@
+name: Live mounts
+
+# These jobs exercise the example network filesystems against the real GitHub
+# and Google Drive APIs and mount them through the Linux FUSE adapter. They are
+# deliberately separate from `ci.yml` so offline unit tests stay fast and do not
+# depend on credentials.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/live-mounts.yml
+      - Cargo.toml
+      - Cargo.lock
+      - fsk/**
+      - examples/github-filesystem/**
+      - examples/google-drive/**
+  pull_request:
+    paths:
+      - .github/workflows/live-mounts.yml
+      - Cargo.toml
+      - Cargo.lock
+      - fsk/**
+      - examples/github-filesystem/**
+      - examples/google-drive/**
+  schedule:
+    # Catch API or credential drift even when nothing changed.
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: live-mounts-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  github:
+    name: GitHub mount (FUSE)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+          sudo modprobe fuse || true
+          test -c /dev/fuse
+
+      # The workflow token is an installation token, so the example discovers
+      # repositories through `/installation/repositories`. This also lets the
+      # job run for pull requests from forks, which cannot read repo secrets.
+      - name: Mount and read a GitHub repository
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: cargo test -p fsk-github-filesystem -- --ignored live_mount
+
+  google-drive:
+    name: Google Drive mount (FUSE)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Check credentials
+        id: credentials
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_DRIVE_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_REFRESH_TOKEN }}
+        run: |
+          if [[ -n "$GOOGLE_CLIENT_ID" && -n "$GOOGLE_CLIENT_SECRET" && -n "$GOOGLE_DRIVE_REFRESH_TOKEN" ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require credentials
+        if: steps.credentials.outputs.present != 'true'
+        env:
+          FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          if [[ "$FORK_PR" == "true" ]]; then
+            echo "Skipping: forked pull requests cannot read repository secrets."
+            exit 0
+          fi
+          echo "::error::Google Drive mount tests need GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_DRIVE_REFRESH_TOKEN repository secrets."
+          exit 1
+
+      - name: Install FUSE
+        if: steps.credentials.outputs.present == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+          sudo modprobe fuse || true
+          test -c /dev/fuse
+
+      - name: Mount and read the Drive fixture
+        if: steps.credentials.outputs.present == 'true'
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_DRIVE_REFRESH_TOKEN: ${{ secrets.GOOGLE_DRIVE_REFRESH_TOKEN }}
+          FSK_DRIVE_TEST_PATH: ${{ vars.FSK_DRIVE_TEST_PATH || 'fsk-ci/hello.txt' }}
+        run: cargo test -p fsk-google-drive -- --ignored live_mount

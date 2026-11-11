@@ -13,6 +13,7 @@ use std::{
 use unicode_normalization::UnicodeNormalization;
 
 const API: &str = "https://www.googleapis.com/drive/v3";
+const OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const FOLDER: &str = "application/vnd.google-apps.folder";
 const SHORTCUT: &str = "application/vnd.google-apps.shortcut";
 const MAX_BUFFERED_FILE_SIZE: u64 = 256 * 1024 * 1024;
@@ -142,6 +143,45 @@ struct RootFile {
 #[derive(Deserialize)]
 struct FileVersion {
     version: String,
+}
+
+#[derive(Deserialize)]
+struct AccessToken {
+    access_token: String,
+}
+
+/// Exchange an OAuth refresh token for an hour-long access token.
+///
+/// Interactive mounts can use `GOOGLE_DRIVE_ACCESS_TOKEN` directly, but CI
+/// cannot keep an expiring token in a secret. Storing the refresh token and the
+/// OAuth client credentials lets each run mint a fresh access token instead.
+pub fn refresh_access_token(
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> io::Result<String> {
+    let response = Client::builder()
+        .user_agent("fsk-google-drive-example")
+        .build()
+        .map_err(io::Error::other)?
+        .post(OAUTH_TOKEN_URL)
+        .form(&[
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("refresh_token", refresh_token),
+            ("grant_type", "refresh_token"),
+        ])
+        .send()
+        .map_err(io::Error::other)?;
+    let status = response.status();
+    let body = response.text().map_err(io::Error::other)?;
+    if !status.is_success() {
+        return Err(io::Error::other(format!(
+            "OAuth token exchange failed with {status}: {body}"
+        )));
+    }
+    let token: AccessToken = serde_json::from_str(&body).map_err(io::Error::other)?;
+    Ok(token.access_token)
 }
 
 #[derive(Deserialize)]

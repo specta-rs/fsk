@@ -72,6 +72,30 @@ Application-default tokens from `gcloud` only work when the associated OAuth
 grant includes that scope; a token from any other OAuth flow works too.
 Access tokens are short-lived; restart the example with a refreshed token when
 the current token expires.
+
+For unattended use, set the OAuth client credentials and a refresh token
+instead. The example exchanges them for an access token at startup:
+
+```sh
+GOOGLE_CLIENT_ID=... \
+GOOGLE_CLIENT_SECRET=... \
+GOOGLE_DRIVE_REFRESH_TOKEN=... \
+cargo run -p fsk-google-drive -- /path/to/mount
+```
+
+`GOOGLE_DRIVE_ACCESS_TOKEN` takes precedence when both forms are set. CI uses
+the refresh-token form so no expiring token has to be stored. The live mount
+test expects a `fsk-ci/hello.txt` fixture (override with `FSK_DRIVE_TEST_PATH`)
+containing `hello from fsk ci\n`, and runs as:
+
+```sh
+cargo test -p fsk-google-drive -- --ignored live_mount
+```
+
+`GOOGLE_DRIVE_ACCESS_TOKEN` can be used instead of the three refresh variables.
+The test requires FUSE on Linux and is run by
+`.github/workflows/live-mounts.yml`.
+
 For simplicity, this example stages ordinary file contents in memory and limits
 individual buffered files to 256 MiB. Uploads use Drive revisions and ETags to
 reject saves when another client changed the remote file after it was indexed.

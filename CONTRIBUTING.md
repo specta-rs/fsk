@@ -78,8 +78,9 @@ The extension is sandboxed and uses the `group.dev.specta.fsk` app group to
 reach the socket; it also carries `com.apple.developer.fskit.fsmodule`.
 
 `FSK.app` is not a daemon: it is an `LSUIElement` setup utility that reports
-authorization state and opens the File System Extensions pane. It is normally
-installed at `/Applications/FSK.app`; the extension lives at
+authorization state and opens the File System Extensions pane. It is installed
+per-user in the hidden directory
+`~/Library/Application Support/dev.specta.fsk/FSK.app`; the extension lives at
 `FSK.app/Contents/Extensions/FSKExtension.appex`.
 
 Because the extension is out of process, Objective-C and FSKit pointers cannot
@@ -164,10 +165,10 @@ along with the YAML change.
 
 Open `fsk/macos/FSK.xcodeproj`, choose the `FSKApp` scheme, set your team under
 Signing & Capabilities, and run. Xcode launches the build product from its
-DerivedData directory; to test the normal discovery path, copy the built
-`FSK.app` to `/Applications/FSK.app`. If you build to another location, see
-[FSK_APP_PATH](#fsk_app_path) for the lifecycle helpers and remember that FSKit
-discovers extensions most reliably from `/Applications`.
+DerivedData directory; launching it once is enough for FSKit to register the
+embedded extension. To exercise the normal lifecycle path, copy the built
+`FSK.app` to `~/Library/Application Support/dev.specta.fsk/FSK.app`, or set
+[FSK_APP_PATH](#fsk_app_path) to any other location for the lifecycle helpers.
 
 Launch `FSK.app` once, then enable the extension under **System Settings →
 General → Login Items & Extensions → File System Extensions**. Enabling the
@@ -228,8 +229,8 @@ Useful iteration tips:
 ## `FSK_APP_PATH`
 
 `FSK_APP_PATH` overrides the companion app location used by the macOS
-lifecycle helpers. It is mainly for development builds that are not installed
-in `/Applications`.
+lifecycle helpers. It is mainly for development builds that should not replace
+the normal per-user installation.
 
 ```sh
 export FSK_APP_PATH="/abs/path/to/FSK.app"
@@ -243,7 +244,8 @@ Rules:
 - `..` components are rejected. Trailing separators and `.` components are
   normalized.
 - An empty value is an error.
-- When unset, the default is `/Applications/FSK.app`.
+- When unset, the default is
+  `~/Library/Application Support/dev.specta.fsk/FSK.app`.
 
 It affects:
 
@@ -252,10 +254,11 @@ It affects:
 - `fsk::launch_app()` — opens the app at that path.
 - `fsk::uninstall()` — removes the app at that path.
 
-It does **not** change which extension FSKit has registered. Mounting still
-resolves the extension through LaunchServices/PlugInKit, so for reliable
-discovery keep the app in `/Applications` (or launch it once from the override
-location) and enable it in System Settings.
+It does **not** change which extension FSKit has registered. Mounting resolves
+the extension through LaunchServices/PlugInKit, so launch the app once from
+whichever location you use and enable it in System Settings. On the default
+path, `install()` and `uninstall()` also remove a legacy machine-wide
+`/Applications/FSK.app`; with an override, that copy is left alone.
 
 `install` still validates the downloaded bundle's version, bundle identifier,
 code signature, team, and Gatekeeper assessment; the override only changes the
@@ -326,6 +329,37 @@ The crate enforces `#![deny(missing_docs)]`; document every new public item and
 keep intra-doc links working on Linux, macOS, and Windows builds. The CI
 `rust-platforms` job also runs tests and Clippy on Linux and Windows, so keep
 platform modules compiling even when you only work on one OS.
+
+## Live mount tests
+
+`.github/workflows/live-mounts.yml` exercises the examples against the real
+GitHub and Google Drive APIs, mounting each through the Linux FUSE adapter. It
+runs on changes to `fsk/` or either example, on pushes to `main`, and weekly so
+credential and upstream API drift is caught even without commits.
+
+- **GitHub** uses the workflow's built-in `GITHUB_TOKEN`, so it needs no secret
+  and still runs for pull requests from forks. The API client discovers
+  repositories through `/installation/repositories` when the token is an
+  installation token.
+- **Google Drive** needs the `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and
+  `GOOGLE_DRIVE_REFRESH_TOKEN` repository secrets. The refresh token must grant
+  the `https://www.googleapis.com/auth/drive` scope. The account needs a
+  `fsk-ci` folder in `My Drive` containing `hello.txt` with the contents
+  `hello from fsk ci\n`; set the `FSK_DRIVE_TEST_PATH` repository variable to
+  override that path. Fork pull requests skip the job because they cannot read
+  secrets.
+
+Run the same tests locally on Linux:
+
+```sh
+GITHUB_TOKEN=... GITHUB_REPOSITORY=specta-rs/fsk \
+  cargo test -p fsk-github-filesystem -- --ignored live_mount
+GOOGLE_DRIVE_ACCESS_TOKEN=... \
+  cargo test -p fsk-google-drive -- --ignored live_mount
+```
+
+Both require a working FUSE installation, and the tests are `#[ignore]`d so
+normal `cargo test` runs never touch the network.
 
 ## Releases
 
