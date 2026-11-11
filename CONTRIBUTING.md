@@ -401,12 +401,18 @@ credential and upstream API drift is caught even without commits.
   repositories through `/installation/repositories` when the token is an
   installation token.
 - **Google Drive** needs the `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and
-  `GOOGLE_DRIVE_REFRESH_TOKEN` repository secrets. The refresh token must grant
-  the `https://www.googleapis.com/auth/drive` scope. The account needs a
-  `fsk-ci` folder in `My Drive` containing `hello.txt` with the contents
+  `GOOGLE_DRIVE_REFRESH_TOKEN` repository secrets. The refresh token only needs
+  `https://www.googleapis.com/auth/drive.readonly` for the read-only mount test.
+  Create a **Web application** OAuth client with
+  `https://developers.google.com/oauthplayground` as an authorised redirect URI
+  (the Playground cannot use a Desktop client), publish the app to production so
+  the refresh token does not expire after seven days, and generate the token in
+  the Playground with **Access type: Offline**. The account needs a `fsk-ci`
+  folder in `My Drive` containing `hello.txt` with the contents
   `hello from fsk ci\n`; set the `FSK_DRIVE_TEST_PATH` repository variable to
-  override that path. The job is skipped when these secrets are absent, which
-  includes fork pull requests because they cannot read secrets.
+  override that path. The job skips with a notice when the secrets are absent
+  (including fork pull requests, which cannot read them); otherwise it runs and
+  fails if the credentials are invalid.
 
 Run the same tests locally on Linux:
 

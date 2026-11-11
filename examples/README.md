@@ -84,9 +84,14 @@ cargo run -p fsk-google-drive -- /path/to/mount
 ```
 
 `GOOGLE_DRIVE_ACCESS_TOKEN` takes precedence when both forms are set. CI uses
-the refresh-token form so no expiring token has to be stored. The live mount
-test expects a `fsk-ci/hello.txt` fixture (override with `FSK_DRIVE_TEST_PATH`)
-containing `hello from fsk ci\n`, and runs as:
+the refresh-token form so no expiring token has to be stored. To mint a refresh
+token, create a **Web application** OAuth client with
+`https://developers.google.com/oauthplayground` as an authorised redirect URI,
+publish the app to production, then authorise with **Access type: Offline** in
+the OAuth Playground. A read-only mount only needs
+`https://www.googleapis.com/auth/drive.readonly`. The live mount test expects a
+`fsk-ci/hello.txt` fixture (override with `FSK_DRIVE_TEST_PATH`) containing
+`hello from fsk ci\n`, and runs as:
 
 ```sh
 cargo test -p fsk-google-drive -- --ignored live_mount
