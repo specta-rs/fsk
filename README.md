@@ -1,35 +1,37 @@
-<p align="center">
+<div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <img src="assets/logo-light.svg" alt="FSK logo" width="132">
+    <img src="assets/logo-light.svg" alt="FSK logo" width="150">
   </picture>
-</p>
 
-# FSK
+  <h1>FSK</h1>
 
-Build cross-platform virtual file systems with ease.
+  <p><strong>Build cross-platform virtual file systems with ease.</strong></p>
 
-- **macOS 26+** — FSKit extension behind an install-once Swift bridge.
-- **Linux** — multithreaded kernel FUSE adapter.
-- **Windows 10 1809+** — native ProjFS provider for lazy virtual and network
-  trees.
-- **Rust** — a small `Filesystem` trait, plus `NetworkFilesystem` for remote
-  trees.
-- **Native access** — opt-in borrowed FSKit, FUSE, and Windows event contexts.
+  <p>
+    <a href="https://github.com/specta-rs/fsk/actions/workflows/ci.yml"><img src="https://github.com/specta-rs/fsk/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+    <a href="https://crates.io/crates/fsk"><img src="https://img.shields.io/crates/v/fsk?style=flat-square" alt="crates.io"></a>
+    <a href="https://docs.rs/fsk"><img src="https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square" alt="docs.rs"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/crates/l/fsk?style=flat-square" alt="MIT license"></a>
+    <img src="https://img.shields.io/badge/MSRV-1.85-blue?style=flat-square" alt="MSRV 1.85">
+  </p>
+</div>
 
-The API stays deliberately small. Backends identify items with stable 64-bit
-inode values, stream directory entries into a caller-owned sink, and read
-directly into caller-provided buffers. Names are arbitrary bytes on Unix and
-WTF-8 on Windows, so UTF-16 names round-trip even when they contain unpaired
-surrogates.
+<br>
 
-The published `fsk` crate implements neither trait for you. It chooses no inode
-index, cache, locking model, transaction boundary, consistency policy, or
-storage engine — those decisions belong to the backend. The workspace's memory
-and network backends are examples only; copy their ideas or replace them
-entirely. The catalog also includes a Google Drive backend that mounts
-`My Drive`, items shared with the user, and shared drives over OAuth while
-honoring each file's write capability.
+FSK is a Rust toolkit for building real filesystems. Implement one trait, then
+mount it as a native volume: FSKit on macOS, FUSE on Linux, or ProjFS on
+Windows. FSK owns the platform plumbing — mounting, IPC, authorization,
+directory encoding, and lifecycle — while your backend owns the data.
+
+- **One model, three backends.** `Filesystem` covers full virtual filesystems;
+  `NetworkFilesystem` adds lazy remote trees and downloaded-file leases.
+- **Your storage, your rules.** No inode index, cache, locking model,
+  transaction boundary, or consistency policy is imposed.
+- **Lifecycle included.** `MountSession` mounts, serves, and unmounts on drop,
+  and platform setup and authorization helpers ship with the crate.
+- **Native escape hatches.** Opt into borrowed FSKit, FUSE, and ProjFS events
+  only when you need them.
 
 ## Platform support
 
@@ -47,7 +49,17 @@ provider-owned write semantics would use WinFsp; FSK exposes the Windows-native
 callback context in a form that leaves room for a WinFsp adapter without
 changing the common model.
 
-## Implement a filesystem
+## Quick start
+
+Add the crate:
+
+```sh
+cargo add fsk
+```
+
+Rust 1.85 or later is required.
+
+### Implement a filesystem
 
 ```rust
 use fsk::{Filesystem, MountSession};
@@ -100,16 +112,10 @@ The required methods are enough for a read-only filesystem. Mutation methods
 default to `ENOTSUP`. Methods run concurrently, so implementations must be
 `Send + Sync`.
 
-The workspace's memory backend is a complete CLI and a deliberately separate
-implementation:
-
-```sh
-cargo run -p fsk-memory-backend -- /path/to/mount
-```
-
-Control-C performs an orderly unmount. The same executable builds against the
-native adapter selected by its target OS. See
-[`examples/README.md`](examples/README.md) for the full example catalog.
+FSK deliberately implements neither trait for you. It chooses no inode index,
+cache, locking model, transaction boundary, consistency policy, or storage
+engine — those decisions belong to the backend. The workspace's backends are
+examples only; copy their ideas or replace them entirely.
 
 ## Mount prerequisites
 
@@ -244,7 +250,7 @@ a backend-specific subdirectory beneath the returned directory.
 - Linux reads the local descriptor directly on its FUSE worker.
 - Windows ProjFS manages its virtualization root as the local hydration cache.
 
-## Platform-native requests
+## Native events
 
 Implementers can inspect platform-specific events without forcing every
 filesystem through an allocation-heavy universal request object:
@@ -307,6 +313,26 @@ are borrowed in place:
 
 Raw pointers and buffers are valid only for the synchronous hook call.
 
+## Examples
+
+The workspace includes four standalone backends. They are not part of the
+published crate and make different storage and consistency choices on purpose.
+
+| Example | Package | What it shows |
+|---|---|---|
+| [`memory-backend`](examples/memory-backend) | `fsk-memory-backend` | A complete writable filesystem: sharded inode lookup, per-node locking, atomic renames, sparse files, and clean unmount on Ctrl-C. |
+| [`network-backend`](examples/network-backend) | `fsk-network-backend` | Lazy remote reads, downloaded-file leases, and the App Group file directory required by the macOS extension. |
+| [`google-drive`](examples/google-drive) | `fsk-google-drive` | A Drive mount spanning `My Drive`, shared items, and shared drives, with OAuth and per-file write capability checks. |
+| [`github-filesystem`](examples/github-filesystem) | `fsk-github-filesystem` | A read-only GitHub tree with lazy API-backed directories, atomic downloads, and LRU cache cleanup. |
+
+```sh
+cargo run -p fsk-memory-backend -- /path/to/mount
+```
+
+Control-C performs an orderly unmount, and the same executable builds against
+the native adapter selected by its target OS. See
+[`examples/README.md`](examples/README.md) for credentials and options.
+
 ## Architecture
 
 ```mermaid
@@ -321,11 +347,15 @@ flowchart LR
 macOS mounts use a mode-0600 Unix socket in the FSK App Group container and a
 random per-mount capability. The extension pools up to one persistent
 connection per active CPU. Linux runs multiple FUSE event loops and uses
-`FUSE_DEV_IOC_CLONE` where available. Windows lets ProjFS select or configure native callback
-workers.
+`FUSE_DEV_IOC_CLONE` where available. Windows lets ProjFS select or configure
+native callback workers.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the platform architecture, how to
-develop and test the FSKit extension, the required Rust and Swift toolchains,
-and the `FSK_APP_PATH` development override.
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+platform architecture, how to develop and test the FSKit extension, the
+required Rust and Swift toolchains, and the `FSK_APP_PATH` development override.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
