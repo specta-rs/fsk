@@ -346,8 +346,8 @@ credential and upstream API drift is caught even without commits.
   the `https://www.googleapis.com/auth/drive` scope. The account needs a
   `fsk-ci` folder in `My Drive` containing `hello.txt` with the contents
   `hello from fsk ci\n`; set the `FSK_DRIVE_TEST_PATH` repository variable to
-  override that path. Fork pull requests skip the job because they cannot read
-  secrets.
+  override that path. The job is skipped when these secrets are absent, which
+  includes fork pull requests because they cannot read secrets.
 
 Run the same tests locally on Linux:
 

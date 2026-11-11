@@ -70,6 +70,8 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      # Fork pull requests and repositories without the secrets configured skip
+      # the mount instead of failing. The GitHub job runs unconditionally.
       - name: Check credentials
         id: credentials
         env:
@@ -81,19 +83,8 @@ jobs:
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping Google Drive mount tests: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_DRIVE_REFRESH_TOKEN are not configured."
           fi
-
-      - name: Require credentials
-        if: steps.credentials.outputs.present != 'true'
-        env:
-          FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-        run: |
-          if [[ "$FORK_PR" == "true" ]]; then
-            echo "Skipping: forked pull requests cannot read repository secrets."
-            exit 0
-          fi
-          echo "::error::Google Drive mount tests need GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_DRIVE_REFRESH_TOKEN repository secrets."
-          exit 1
 
       - name: Install FUSE
         if: steps.credentials.outputs.present == 'true'

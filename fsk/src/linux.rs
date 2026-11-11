@@ -823,8 +823,9 @@ fn next_handle(counter: &AtomicU64) -> FileHandle {
 fn rename_constraint(flags: RenameFlags, destination_exists: bool) -> Option<Errno> {
     // Only NOREPLACE maps onto the portable rename contract. Exchange, whiteout,
     // and future flags cannot be honoured safely, so reject them instead of
-    // silently degrading to a plain rename.
-    if !(flags & !RenameFlags::RENAME_NOREPLACE).is_empty() {
+    // silently degrading to a plain rename. Compare raw bits: bitflags' `!`
+    // keeps only known flags, which would drop unknown future bits.
+    if flags.bits() & !RenameFlags::RENAME_NOREPLACE.bits() != 0 {
         return Some(Errno::EINVAL);
     }
     if flags.contains(RenameFlags::RENAME_NOREPLACE) && destination_exists {
