@@ -246,4 +246,17 @@ mod tests {
         assert!(!AuthorizationStatus::NeedsApproval.needs_install());
         assert!(AuthorizationStatus::NeedsApproval.requirement().is_some());
     }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_requirement_includes_the_enable_command() {
+        let requirement = AuthorizationStatus::NeedsApproval
+            .requirement()
+            .expect("needs approval has a requirement");
+        assert!(requirement.contains("Client-ProjFS"));
+        assert!(
+            requirement
+                .contains("Enable-WindowsOptionalFeature -Online -FeatureName Client-ProjFS")
+        );
+    }
 }
