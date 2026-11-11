@@ -1,3 +1,8 @@
+#![doc(
+    html_logo_url = "https://github.com/specta-rs/fsk/raw/main/assets/app-icon-light.svg",
+    html_favicon_url = "https://github.com/specta-rs/fsk/raw/main/assets/app-icon-light.svg"
+)]
+
 mod fs;
 
 use fsk::MountSession;
