@@ -103,10 +103,18 @@ impl Filesystem for MyCoolFilesystem {
     }
 }
 
+// Install and enable the platform component if needed, then continue once
+// the user has granted access.
+fsk::wait_for_authorization(std::time::Duration::from_secs(600))?;
+
 let mount = MountSession::mount(MyCoolFilesystem, "/path/to/mount")?;
 // Keep `mount` alive. Dropping it unregisters/unmounts the filesystem.
 # Ok::<(), std::io::Error>(())
 ```
+
+Pick a mount directory outside Desktop, Documents and Downloads on macOS; privacy
+protection refuses FSKit mounts inside them, and the crate adds a hint to the
+mount error.
 
 The required methods are enough for a read-only filesystem. Mutation methods
 default to `ENOTSUP`. Methods run concurrently, so implementations must be
@@ -138,6 +146,9 @@ match fsk::authorization_status()? {
 }
 # Ok::<(), std::io::Error>(())
 ```
+
+`fsk::wait_for_authorization(timeout)` runs that flow and blocks until the
+switch is on, which is usually what an application or example wants.
 
 `fsk::ensure_authorization()` performs the same check, installs the matching
 `FSK.app` release on macOS when it is missing, launches it, and opens the
@@ -179,7 +190,12 @@ if status != fsk::AuthorizationStatus::Authorized {
 Run the blocking installation call on your background executor. Downloads come
 from this repository's public GitHub release; set `GITHUB_TOKEN` or `GH_TOKEN`
 for a private release, or set `FSK_RELEASE_BASE_URL` to a mirror that serves
-`{base}/v{version}/FSK-v{version}.zip`.
+`{base}/v{version}/FSK-v{version}.zip`. `fsk::install_with_progress` reports the
+download, verification and installation phases so a CLI does not look hung.
+
+Replacing the legacy machine-wide `/Applications/FSK.app` also asks a running
+copy to quit and always needs a new approval in System Settings, because macOS
+authorises the extension per installed location.
 
 Set `FSK_APP_PATH` to the full path of an `.app` bundle, such as
 `/Applications/FSK.app`, to test a build outside the default location. It must

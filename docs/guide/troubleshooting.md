@@ -37,7 +37,28 @@ one step.
 The app is installed but the extension is not enabled. `launch_app()` opens the setup window;
 the user must flip the switch in **System Settings → General → Login Items & Extensions → File
 System Extensions**. macOS exposes no API for it, so retrying before the user acts changes
-nothing.
+nothing. `fsk::wait_for_authorization(Duration::from_secs(600))` retries safely once the switch
+is on.
+
+`pluginkit` is not that switch. `pluginkit -m -p com.apple.fskit.fsmodule` printing `+` only
+shows that the extension is registered, and `pluginkit -e use -i dev.specta.fsk.extension`
+exits successfully without changing FSKit's enabled state. Do not use either to check or change
+authorization.
+
+### Approval was lost after upgrading
+
+Approval belongs to the installed bundle, not the bundle identifier. Replacing a machine-wide
+`/Applications/FSK.app` with the per-user copy in `~/Library/Application Support/dev.specta.fsk/`
+needs the switch in System Settings to be enabled again, even when the protocol major version is
+unchanged. `install()` quits a running legacy copy before removing it.
+
+### `FSKit mount failed: … Operation not permitted`
+
+`mount(8)` could not attach the volume. On current macOS the usual cause is the mount directory:
+FSKit refuses mounts inside **Desktop**, **Documents** and **Downloads** because they are
+privacy-protected. Mount under your home directory or in `/tmp` instead. The crate appends this
+hint to the error; other EPERM causes are a disabled extension or a path the extension cannot
+reach (see the next entry).
 
 ### `FSKit mount failed: …`
 

@@ -29,6 +29,16 @@ the release matching the crate when no compatible app is present, then launches
 it. `fsk::launch_app()` refuses to open a copy that does not match the SDK's
 protocol major, so a stale app is never launched by mistake.
 
+`fsk::wait_for_authorization(timeout)` performs steps 1 and 2 and then polls the
+status until the switch is on, so an application can mount straight after the
+call returns. `fsk::install_with_progress(callback)` reports the download,
+verification and installation phases for callers that show progress.
+
+Approval belongs to the installed bundle. Moving from the legacy
+`/Applications/FSK.app` to the per-user copy therefore needs the switch again
+even when both apps speak the same protocol major version; `install()` quits a
+running legacy copy before removing its bundle.
+
 macOS does not expose an API that enables an FSKit extension. The switch is a
 per-user action in System Settings; the app can only make that action obvious
 and verify the result.
