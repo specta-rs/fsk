@@ -213,11 +213,32 @@ jobs:
           # `grep -q` failing the pipeline under `pipefail`.
           unzip -Z1 "$asset" > "$RUNNER_TEMP/asset-listing.txt"
           grep -qx 'FSK.app/' "$RUNNER_TEMP/asset-listing.txt"
-          gh release create "$GITHUB_REF_NAME" \
-            "$asset" \
-            --title "FSK $GITHUB_REF_NAME" \
-            --generate-notes \
-            --verify-tag
+
+          # Prefer the curated CHANGELOG section: --generate-notes only lists
+          # merged pull requests, so a release made of direct commits to main
+          # would get an empty body.
+          version="${GITHUB_REF_NAME#v}"
+          version_pattern="$(printf '%s' "$version" | sed 's/\./\\./g')"
+          notes="$RUNNER_TEMP/release-notes.md"
+          awk -v heading="^## ${version_pattern}( |\$)" '
+            $0 ~ heading { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > "$notes"
+
+          if grep -q '[^[:space:]]' "$notes"; then
+            gh release create "$GITHUB_REF_NAME" \
+              "$asset" \
+              --title "FSK $GITHUB_REF_NAME" \
+              --notes-file "$notes" \
+              --verify-tag
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "$asset" \
+              --title "FSK $GITHUB_REF_NAME" \
+              --generate-notes \
+              --verify-tag
+          fi
 
   publish-crate:
     name: Publish fsk to crates.io
@@ -242,6 +263,10 @@ jobs:
           crate_version=$(cargo metadata --no-deps --format-version 1 |
             jq -r '.packages[] | select(.name == "fsk") | .version')
           test "$GITHUB_REF_NAME" = "v$crate_version"
+          # The release body comes from this section, so a missing heading would
+          # silently produce empty notes.
+          version_pattern="$(printf '%s' "$crate_version" | sed 's/\./\\./g')"
+          grep -Eq "^## ${version_pattern}( |\$)" CHANGELOG.md
 
       - name: Authenticate with crates.io
         id: crates_io_auth

@@ -25,7 +25,9 @@ against the published crate, including the first-run macOS permission flow.
 - Named `Error` constants for `ENOENT`, `EEXIST`, `ENOTDIR`, `EISDIR`, `EFBIG`,
   `ENOSPC` and `ERANGE`, so backends no longer spell out bare integers.
 - `CHANGELOG.md`, because the generated GitHub notes only list merged pull
-  requests.
+  requests. The release workflow now publishes the changelog section for the tag
+  as the release body, falls back to generated notes when there is none, and
+  fails early when the tag has no section.
 
 ### Changed
 
