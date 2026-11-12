@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## Unreleased
 
+## 0.2.0 - 2026-11-12
+
+Everything here came out of building three filesystems outside the repository
+against the published crate, including the first-run macOS permission flow.
+
 ### Added
 
 - `fsk::wait_for_authorization(timeout)`: installs and launches the platform
@@ -18,7 +23,9 @@ All notable changes to this project are documented here. The format follows
 - `Metadata::file(..)`, `Metadata::directory(..)` and `Metadata::owned_by(..)`
   constructors, plus `StatFs::with_capacity(..)` and `StatFs::default()`.
 - Named `Error` constants for `ENOENT`, `EEXIST`, `ENOTDIR`, `EISDIR`, `EFBIG`,
-  `ENOSPC` and `ERANGE`.
+  `ENOSPC` and `ERANGE`, so backends no longer spell out bare integers.
+- `CHANGELOG.md`, because the generated GitHub notes only list merged pull
+  requests.
 
 ### Changed
 
@@ -28,18 +35,24 @@ All notable changes to this project are documented here. The format follows
 - The macOS mount error explains that FSKit cannot mount inside Desktop,
   Documents or Downloads, instead of leaving a bare `Operation not permitted`.
 - Migrating a legacy `/Applications/FSK.app` now quits the running legacy app
-  before removing its bundle, and the docs state that the new location needs
-  approval again.
+  before removing its bundle, and the docs state that the approval is tied to the
+  installed location.
 
 ### Documentation
 
 - Getting started uses the new metadata constructors and owner helpers, waits
   for authorization before mounting, links the testing guide, and warns about
   privacy-protected mount directories.
-- Troubleshooting explains that `pluginkit` cannot enable the extension and
-  documents the EPERM mount failure.
+- Troubleshooting explains that `pluginkit` cannot enable the extension, that
+  moving the app needs a fresh approval, and what an EPERM mount failure means.
+- `concepts.md` explains that generated or remote content must move
+  `modified_ns`, because FSKit otherwise serves cached pages.
 - `examples/memory-backend` and `examples/google-drive` use the shared owner
   helpers instead of declaring their own libc bindings or errno constants.
+
+The companion app's IPC protocol is unchanged, so an installed `FSK.app` from
+0.1.0 is reused without a new System Settings approval.
+
 
 ## 0.1.0 - 2026-11-12
 

@@ -1,6 +1,6 @@
 [package]
 name = "fsk"
-version = "0.1.0"
+version = "0.2.0"
 description = "Build cross-platform virtual file systems with ease"
 authors = ["Oscar Beaumont <oscar@otbeaumont.me>"]
 edition.workspace = true
