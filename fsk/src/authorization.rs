@@ -18,7 +18,7 @@ pub enum AuthorizationStatus {
     /// No companion app with a compatible protocol version is installed.
     ///
     /// Only macOS returns this. [`ensure_authorization`] installs the release
-    /// matching this crate and launches it; [`install`] and [`launch_app`]
+    /// matching this crate and launches it; `install` and `launch_app`
     /// remain available when callers want to control each step.
     NotInstalled,
     /// The platform component or extension needs a user action.
@@ -97,7 +97,7 @@ pub fn authorization_status() -> io::Result<AuthorizationStatus> {
 /// Features dialog when `Client-ProjFS` is missing. Linux has no setup dialog,
 /// so the returned error describes the FUSE requirement.
 ///
-/// Use [`install`] and [`launch_app`] directly only when the caller needs to
+/// Use `install` and `launch_app` directly only when the caller needs to
 /// control installation separately, such as installing ahead of time or
 /// selecting a development build with `FSK_APP_PATH`.
 ///
@@ -133,7 +133,10 @@ pub fn ensure_authorization() -> io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-const APPROVAL_MESSAGE: &str = "enable FSK in the window that opened, then run this command again";
+const APPROVAL_MESSAGE: &str = concat!(
+    "enable FSK in System Settings → General → Login Items & Extensions → ",
+    "File System Extensions, then run this command again"
+);
 #[cfg(target_os = "linux")]
 const APPROVAL_MESSAGE: &str = "FUSE must be available; install fuse3 and make /dev/fuse accessible, then run this command again";
 #[cfg(target_os = "windows")]
@@ -144,6 +147,94 @@ const APPROVAL_MESSAGE: &str = concat!(
 );
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 const APPROVAL_MESSAGE: &str = "this platform is not supported";
+
+/// How often [`wait_for_authorization`] rechecks while the user is in System
+/// Settings.
+///
+/// A macOS check runs the installed companion app's status command, so this is
+/// deliberately slower than a filesystem stat.
+const AUTHORIZATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Runs the setup flow once, then blocks until the platform is ready to mount.
+///
+/// This is the "wait for the user" counterpart to [`ensure_authorization`]:
+///
+/// 1. When the host is already ready, it returns immediately.
+/// 2. Otherwise it calls [`ensure_authorization`] once, which installs the
+///    matching macOS app when needed and opens the setup UI. A
+///    [`PermissionDenied`](io::ErrorKind::PermissionDenied) result is expected
+///    here and starts the wait; any other error is returned.
+/// 3. It then polls [`authorization_status`] until the user finishes setup, or
+///    until `timeout` elapses.
+///
+/// A reload of System Settings, a restart of the terminal, or a fresh build are
+/// not needed: the first poll after the switch flips succeeds and the caller can
+/// mount immediately.
+///
+/// The call blocks the current thread for as long as the user takes, so run it
+/// on a background executor in an async application. `timeout` bounds the wait
+/// for CLIs and CI; a value like `Duration::from_secs(600)` is generous enough
+/// for a person and short enough not to hang a script. Use `Duration::ZERO` to
+/// check once without waiting.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::TimedOut`] when the deadline passes while setup is
+/// still required; the message names the outstanding requirement. Propagates
+/// installation and status-check errors unchanged.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::{io, time::Duration};
+///
+/// fn main() -> io::Result<()> {
+///     // Installs FSK.app on macOS if needed, asks the user to enable the
+///     // extension, and returns once the platform can mount.
+///     fsk::wait_for_authorization(Duration::from_secs(600))?;
+///     Ok(())
+/// }
+/// ```
+pub fn wait_for_authorization(timeout: std::time::Duration) -> io::Result<()> {
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "authorization timeout is too large",
+            )
+        })?;
+
+    match authorization_status()? {
+        AuthorizationStatus::Authorized => return Ok(()),
+        _ => match ensure_authorization() {
+            // Install and open the setup UI. The PermissionDenied result is the
+            // instruction to wait, not a failure.
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(error) => return Err(error),
+        },
+    }
+
+    loop {
+        match authorization_status()? {
+            AuthorizationStatus::Authorized => return Ok(()),
+            status => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        status.requirement().map_or_else(
+                            || "timed out waiting for FSK setup".to_owned(),
+                            |requirement| format!("timed out waiting for FSK setup: {requirement}"),
+                        ),
+                    ));
+                }
+                std::thread::sleep(remaining.min(AUTHORIZATION_POLL_INTERVAL));
+            }
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 mod imp {

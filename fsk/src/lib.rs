@@ -37,44 +37,29 @@
 //! impl Filesystem for HelloFilesystem {
 //!     fn statfs(&self) -> Result<StatFs> {
 //!         Ok(StatFs {
-//!             block_size: 4096,
-//!             io_size: 4096,
-//!             total_bytes: 4096,
-//!             free_bytes: 0,
-//!             available_bytes: 0,
 //!             files: 2,
-//!             free_files: 0,
+//!             ..StatFs::with_capacity(4096, 0)
 //!         })
 //!     }
 //!
 //!     fn metadata(&self, inode: u64) -> Result<Metadata> {
-//!         let (kind, size) = match inode {
-//!             ROOT_INODE => (FileType::Directory, 0),
-//!             HELLO_INODE => (FileType::File, HELLO.len() as u64),
-//!             _ => return Err(Error(2)), // ENOENT
-//!         };
-//!         Ok(Metadata {
-//!             inode,
-//!             parent: ROOT_INODE,
-//!             size,
-//!             allocated_size: size,
-//!             generation: 1,
-//!             created_ns: 0,
-//!             modified_ns: 0,
-//!             accessed_ns: 0,
-//!             mode: if kind == FileType::Directory { 0o755 } else { 0o644 },
-//!             uid: 0,
-//!             gid: 0,
-//!             link_count: 1,
-//!             kind,
-//!         })
+//!         match inode {
+//!             ROOT_INODE => Ok(Metadata::directory(ROOT_INODE, ROOT_INODE, 0o755)),
+//!             HELLO_INODE => Ok(Metadata::file(
+//!                 HELLO_INODE,
+//!                 ROOT_INODE,
+//!                 HELLO.len() as u64,
+//!                 0o644,
+//!             )),
+//!             _ => Err(Error::NOT_FOUND),
+//!         }
 //!     }
 //!
 //!     fn lookup(&self, parent: u64, name: &[u8]) -> Result<(u64, FileType)> {
 //!         if parent == ROOT_INODE && name == b"hello.txt" {
 //!             Ok((HELLO_INODE, FileType::File))
 //!         } else {
-//!             Err(Error(2)) // ENOENT
+//!             Err(Error::NOT_FOUND)
 //!         }
 //!     }
 //!
@@ -86,7 +71,7 @@
 //!         sink: &mut dyn DirectorySink,
 //!     ) -> Result<ReadDirectoryResult> {
 //!         if inode != ROOT_INODE {
-//!             return Err(Error(2)); // ENOENT
+//!             return Err(Error::NOT_FOUND);
 //!         }
 //!         if verifier != 0 && verifier != 1 {
 //!             return Err(Error::STALE);
@@ -114,7 +99,7 @@
 //!
 //!     fn read(&self, inode: u64, offset: u64, output: &mut [u8]) -> Result<usize> {
 //!         if inode != HELLO_INODE {
-//!             return Err(Error(2)); // ENOENT
+//!             return Err(Error::NOT_FOUND);
 //!         }
 //!         let start = usize::try_from(offset).unwrap_or(usize::MAX).min(HELLO.len());
 //!         let count = output.len().min(HELLO.len() - start);
@@ -124,6 +109,10 @@
 //! }
 //!
 //! # fn main() -> std::io::Result<()> {
+//! // Install and enable FSK.app if needed, then wait for the user to finish
+//! // setup. Returns immediately when the platform is already authorized.
+//! fsk::wait_for_authorization(std::time::Duration::from_secs(600))?;
+//!
 //! let session = fsk::MountSession::mount(HelloFilesystem, "/tmp/fsk-hello")?;
 //! println!("mounted at {}", session.mount_path().display());
 //! # Ok(())
@@ -400,13 +389,17 @@ pub mod raw;
 #[cfg(target_os = "windows")]
 mod windows;
 
-pub use authorization::{AuthorizationStatus, authorization_status, ensure_authorization};
+pub use authorization::{
+    AuthorizationStatus, authorization_status, ensure_authorization, wait_for_authorization,
+};
 #[cfg(target_os = "macos")]
-pub use macos_authorization::{AppInstallOutcome, install, launch_app, uninstall};
+pub use macos_authorization::{
+    AppInstallOutcome, InstallPhase, install, install_with_progress, launch_app, uninstall,
+};
 // Re-exporting the deprecated alias would otherwise trip `-D warnings` here.
 pub use core::{
     DirectoryEntry, DirectorySink, Error, FileType, Filesystem, Metadata, ROOT_INODE,
-    ReadDirectoryResult, Result, SetMetadata, StatFs, now_ns,
+    ReadDirectoryResult, Result, SetMetadata, StatFs, current_gid, current_uid, now_ns,
 };
 #[cfg(target_os = "macos")]
 pub use ipc::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
@@ -459,7 +452,7 @@ mod test_support {
             let kind = match inode {
                 ROOT_INODE => FileType::Directory,
                 2 if self.entry => FileType::File,
-                _ => return Err(Error(2)),
+                _ => return Err(Error::NOT_FOUND),
             };
             Ok(Metadata {
                 inode,
@@ -486,7 +479,7 @@ mod test_support {
             if self.entry && parent == ROOT_INODE && name == b"entry" {
                 Ok((2, FileType::File))
             } else {
-                Err(Error(2))
+                Err(Error::NOT_FOUND)
             }
         }
 

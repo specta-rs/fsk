@@ -1,7 +1,7 @@
 use fsk::{
     DirectoryEntry, DirectorySink, Error, FileType, Filesystem, KernelCachePolicy, Metadata,
     NetworkConfiguration, NetworkFile, NetworkFilesystem, ROOT_INODE, ReadDirectoryResult, Result,
-    SetMetadata, StatFs,
+    SetMetadata, StatFs, current_gid, current_uid,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Deserializer, de::Error as _};
@@ -40,34 +40,6 @@ where
 
 fn inode_index(inode: u64) -> Option<usize> {
     usize::try_from(inode).ok()?.checked_sub(1)
-}
-
-#[cfg(unix)]
-unsafe extern "C" {
-    #[link_name = "getuid"]
-    fn c_getuid() -> u32;
-    #[link_name = "getgid"]
-    fn c_getgid() -> u32;
-}
-
-#[cfg(unix)]
-fn current_uid() -> u32 {
-    unsafe { c_getuid() }
-}
-
-#[cfg(unix)]
-fn current_gid() -> u32 {
-    unsafe { c_getgid() }
-}
-
-#[cfg(windows)]
-const fn current_uid() -> u32 {
-    0
-}
-
-#[cfg(windows)]
-const fn current_gid() -> u32 {
-    0
 }
 
 #[derive(Clone, Deserialize)]

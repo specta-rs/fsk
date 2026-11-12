@@ -186,9 +186,10 @@ impl MountSession {
         };
         if !output.status.success() {
             stop_accepting(&stop, &socket_path, accept_thread);
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             return Err(io::Error::other(format!(
-                "FSKit mount failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                "FSKit mount failed: {message}{}",
+                mount_failure_hint(&message)
             )));
         }
         socket_cleanup.armed = false;
@@ -263,6 +264,20 @@ fn retryable_accept_error(error: &io::Error) -> bool {
         error.kind(),
         io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
     )
+}
+
+/// Adds the likely cause to the bare `EPERM` macOS reports for some mounts.
+///
+/// `mount(8)` only forwards `Operation not permitted`, which gives no hint that
+/// the mount directory itself is the problem.
+fn mount_failure_hint(stderr: &str) -> &'static str {
+    if stderr.contains("Operation not permitted") {
+        "\n\nhint: macOS blocks FSKit mounts inside privacy-protected folders such as \
+         Desktop, Documents and Downloads. Choose a mount directory outside those folders, \
+         for example under your home directory or in /tmp."
+    } else {
+        ""
+    }
 }
 
 fn prepare_mount_path(path: &Path) -> io::Result<PathBuf> {
@@ -344,6 +359,14 @@ mod tests {
         ] {
             assert!(!retryable_accept_error(&io::Error::from(kind)));
         }
+    }
+
+    #[test]
+    fn permission_failures_explain_the_privacy_restriction() {
+        let stderr = "mount: Final mount step ended with error: The operation couldn’t be \
+                      completed. Operation not permitted";
+        assert!(mount_failure_hint(stderr).contains("privacy-protected"));
+        assert_eq!(mount_failure_hint("no such file or directory"), "");
     }
 
     #[test]

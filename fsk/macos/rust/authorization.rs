@@ -53,6 +53,21 @@ pub enum AppInstallOutcome {
     Updated,
 }
 
+/// One stage of [`install_with_progress`].
+///
+/// The stages are coarse on purpose: they describe work a UI can show without
+/// exposing the download or signature-plumbing details.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallPhase {
+    /// Locating the release asset and downloading it.
+    Downloading,
+    /// Checking the bundle's identifier, protocol, code signature and
+    /// Gatekeeper assessment.
+    Verifying,
+    /// Copying the verified bundle into its destination.
+    Installing,
+}
+
 /// Download and install the `FSK` companion app for this SDK.
 ///
 /// Call this when [`authorization_status`](crate::authorization_status) reports
@@ -70,9 +85,15 @@ pub enum AppInstallOutcome {
 ///
 /// When the default destination is used, a legacy machine-wide
 /// `/Applications/FSK.app` from an older SDK is removed (best-effort) after the
-/// hidden copy is in place, so the visible app does not linger. Launch the app
-/// with [`launch_app`] afterwards; macOS registers the extension from wherever
-/// the launched bundle lives.
+/// hidden copy is in place, so the visible app does not linger. A running copy
+/// of that legacy app is asked to quit first, so it cannot survive the upgrade
+/// as an orphaned process. Launch the app with [`launch_app`] afterwards; macOS
+/// registers the extension from wherever the launched bundle lives.
+///
+/// Approval is per installed location: replacing the legacy bundle with the
+/// per-user copy requires the user to enable the extension again in
+/// **System Settings → General → Login Items & Extensions → File System
+/// Extensions**, even when both apps speak the same protocol major version.
 ///
 /// This operation is synchronous and never launches the application or presents
 /// UI, so callers can run it on a background thread or executor of their choice.
@@ -113,6 +134,40 @@ pub enum AppInstallOutcome {
 /// Returns [`io::ErrorKind::InvalidInput`] if `FSK_APP_PATH` is relative,
 /// contains `..`, or does not name a folder ending in `.app`.
 pub fn install() -> io::Result<AppInstallOutcome> {
+    install_inner(&mut |_| {})
+}
+
+/// Installs `FSK.app` like [`install`], reporting each phase to `progress`.
+///
+/// A CLI can print "downloading FSK.app…" instead of appearing to hang during
+/// the network round-trip and code-signature checks. The callback runs on the
+/// calling thread; keep it cheap and do not block.
+///
+/// ```
+/// # #[cfg(target_os = "macos")]
+/// # fn main() -> std::io::Result<()> {
+/// let outcome = fsk::install_with_progress(|phase| match phase {
+///     fsk::InstallPhase::Downloading => eprintln!("downloading FSK.app"),
+///     fsk::InstallPhase::Verifying => eprintln!("verifying FSK.app"),
+///     fsk::InstallPhase::Installing => eprintln!("installing FSK.app"),
+/// })?;
+/// println!("{outcome:?}");
+/// # Ok(())
+/// # }
+/// # #[cfg(not(target_os = "macos"))]
+/// # fn main() {}
+/// ```
+///
+/// # Errors
+///
+/// Returns the same errors as [`install`].
+pub fn install_with_progress<F: FnMut(InstallPhase)>(
+    mut progress: F,
+) -> io::Result<AppInstallOutcome> {
+    install_inner(&mut progress)
+}
+
+fn install_inner(progress: &mut dyn FnMut(InstallPhase)) -> io::Result<AppInstallOutcome> {
     let _mutation = APP_MUTATION.lock();
     let configured = env::var_os("FSK_APP_PATH");
     let destination = app_path_from(configured.clone(), env::var_os("HOME"))?;
@@ -137,7 +192,7 @@ pub fn install() -> io::Result<AppInstallOutcome> {
         }
 
         let temporary = temporary_directory()?;
-        let result = install_from_release(&temporary, &destination);
+        let result = install_from_release(&temporary, &destination, progress);
         let _ = remove_path(&temporary);
         result?;
 
@@ -357,7 +412,11 @@ pub fn open_authorization_app() -> io::Result<()> {
     launch_app()
 }
 
-fn install_from_release(temporary: &Path, destination: &Path) -> io::Result<()> {
+fn install_from_release(
+    temporary: &Path,
+    destination: &Path,
+    progress: &mut dyn FnMut(InstallPhase),
+) -> io::Result<()> {
     let archive = temporary.join("FSK.zip");
     let extracted = temporary.join("extracted");
     fs::DirBuilder::new()
@@ -365,6 +424,7 @@ fn install_from_release(temporary: &Path, destination: &Path) -> io::Result<()> 
         .create(&extracted)
         .map_err(|error| fs_error("create", &extracted, &error))?;
     let tag = format!("v{APP_VERSION}");
+    progress(InstallPhase::Downloading);
     download_release(temporary, &archive, &tag)?;
     run(
         Command::new("/usr/bin/ditto")
@@ -376,6 +436,7 @@ fn install_from_release(temporary: &Path, destination: &Path) -> io::Result<()> 
 
     let source = extracted.join("FSK.app");
     require_real_directory(&source)?;
+    progress(InstallPhase::Verifying);
     validate_app(&source)?;
 
     // The destination was validated in `install`, so it has a
@@ -384,6 +445,7 @@ fn install_from_release(temporary: &Path, destination: &Path) -> io::Result<()> 
     fs::create_dir_all(parent).map_err(|error| fs_error("create", parent, &error))?;
     let name = app_name(destination)?;
     let staging = new_entry_path(parent, name, "install");
+    progress(InstallPhase::Installing);
     create_staging_directory(&staging)?;
     let staged_app = staging.join(name);
     let stage_result = run(
@@ -1030,6 +1092,7 @@ fn uninstall_app_at(app: &Path) -> io::Result<bool> {
 /// the legacy destination are cleaned up as well.
 fn remove_legacy_install() -> bool {
     let app = Path::new(LEGACY_APP_PATH);
+    terminate_legacy_app();
     let removed = uninstall_app_at(app).unwrap_or(false);
     if let (Some(parent), Some(name)) =
         (app.parent(), app.file_name().and_then(|name| name.to_str()))
@@ -1038,6 +1101,20 @@ fn remove_legacy_install() -> bool {
         let _ = remove_matching_entries(parent, name, "backup");
     }
     removed
+}
+
+/// Stops a running legacy app before its bundle is removed.
+///
+/// macOS keeps an unlinked executable running, so a stale `/Applications` copy
+/// would otherwise survive the upgrade as a second menu bar item that can never
+/// be launched again. The pattern is anchored to the legacy bundle path so the
+/// per-user copy that is being installed is never matched.
+fn terminate_legacy_app() {
+    // `/Applications/FSK\.app/` is a regular expression: the dot is escaped.
+    let _ = Command::new("/usr/bin/pkill")
+        .arg("-f")
+        .arg(r"^/Applications/FSK\.app/")
+        .status();
 }
 
 fn remove_path(path: &Path) -> io::Result<bool> {

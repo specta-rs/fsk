@@ -25,10 +25,24 @@ pub const ROOT_INODE: u64 = 1;
 pub struct Error(pub i32);
 
 impl Error {
+    /// The name does not exist in the parent directory (`ENOENT`).
+    pub const NOT_FOUND: Self = Self(2);
     /// Generic I/O failure (`EIO`).
     pub const IO: Self = Self(5);
+    /// The name already exists in the parent directory (`EEXIST`).
+    pub const EXISTS: Self = Self(17);
+    /// A component of the path is not a directory (`ENOTDIR`).
+    pub const NOT_A_DIRECTORY: Self = Self(20);
+    /// The operation expected a file but the inode is a directory (`EISDIR`).
+    pub const IS_A_DIRECTORY: Self = Self(21);
     /// Invalid argument (`EINVAL`).
     pub const INVALID: Self = Self(22);
+    /// The write would exceed the backend's size limit (`EFBIG`).
+    pub const FILE_TOO_LARGE: Self = Self(27);
+    /// No space is left for the write (`ENOSPC`).
+    pub const NO_SPACE: Self = Self(28);
+    /// The supplied output buffer is too small (`ERANGE`).
+    pub const RANGE: Self = Self(34);
     /// Operation is not supported by this backend (`ENOTSUP`).
     pub const NOT_SUPPORTED: Self = Self(45);
     /// Directory is not empty (`ENOTEMPTY`).
@@ -122,6 +136,111 @@ pub struct SetMetadata {
     pub accessed_ns: Option<u64>,
     /// New modification time in nanoseconds since the Unix epoch.
     pub modified_ns: Option<u64>,
+}
+
+impl Metadata {
+    /// Attributes for a regular file owned by the current user.
+    ///
+    /// The timestamps are set to now, `generation` and `link_count` start at
+    /// `1`, and `allocated_size` matches `size`.
+    #[must_use]
+    pub fn file(inode: u64, parent: u64, size: u64, mode: u32) -> Self {
+        let now = now_ns();
+        Self {
+            inode,
+            parent,
+            size,
+            allocated_size: size,
+            generation: 1,
+            created_ns: now,
+            modified_ns: now,
+            accessed_ns: now,
+            mode,
+            uid: current_uid(),
+            gid: current_gid(),
+            link_count: 1,
+            kind: FileType::File,
+        }
+    }
+
+    /// Attributes for a directory owned by the current user.
+    ///
+    /// Directories report a zero size. The timestamps are set to now,
+    /// `generation` and `link_count` start at `1`.
+    #[must_use]
+    pub fn directory(inode: u64, parent: u64, mode: u32) -> Self {
+        let now = now_ns();
+        Self {
+            inode,
+            parent,
+            size: 0,
+            allocated_size: 0,
+            generation: 1,
+            created_ns: now,
+            modified_ns: now,
+            accessed_ns: now,
+            mode,
+            uid: current_uid(),
+            gid: current_gid(),
+            link_count: 1,
+            kind: FileType::Directory,
+        }
+    }
+
+    /// Replaces the owner with explicit ids.
+    ///
+    /// Useful when the volume should report a different owner than the process,
+    /// or on Windows where [`current_uid`] returns `0`.
+    #[must_use]
+    pub const fn owned_by(mut self, uid: u32, gid: u32) -> Self {
+        self.uid = uid;
+        self.gid = gid;
+        self
+    }
+}
+
+/// Returns the numeric user ID of the current process.
+///
+/// Use it when building [`Metadata`]; `FSKit` and FUSE report the value to the
+/// mounted volume, so `0` makes every file look root-owned. Windows has no
+/// numeric POSIX owner and returns `0`.
+#[must_use]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn current_uid() -> u32 {
+    // SAFETY: `getuid` has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+/// Returns the numeric user ID of the current process.
+///
+/// Use it when building [`Metadata`]; `FSKit` and FUSE report the value to the
+/// mounted volume, so `0` makes every file look root-owned. Windows has no
+/// numeric POSIX owner and returns `0`.
+#[must_use]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub const fn current_uid() -> u32 {
+    0
+}
+
+/// Returns the numeric group ID of the current process.
+///
+/// Use it when building [`Metadata`]; Windows has no numeric POSIX group and
+/// returns `0`.
+#[must_use]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn current_gid() -> u32 {
+    // SAFETY: `getgid` has no preconditions and cannot fail.
+    unsafe { libc::getgid() }
+}
+
+/// Returns the numeric group ID of the current process.
+///
+/// Use it when building [`Metadata`]; Windows has no numeric POSIX group and
+/// returns `0`.
+#[must_use]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub const fn current_gid() -> u32 {
+    0
 }
 
 /// One entry produced while enumerating a directory.
@@ -374,6 +493,43 @@ pub struct StatFs {
     pub free_files: u64,
 }
 
+impl StatFs {
+    /// Statistics for a volume with a known capacity.
+    ///
+    /// `available_bytes` mirrors `free_bytes`, and the 4 KiB block sizes come
+    /// from [`StatFs::default`]. Override the inode counts with struct update
+    /// syntax when the backend tracks them.
+    ///
+    /// ```
+    /// let stats = fsk::StatFs::with_capacity(16 * 1024 * 1024, 8 * 1024 * 1024);
+    /// assert_eq!(stats.total_bytes, 16 * 1024 * 1024);
+    /// assert_eq!(stats.available_bytes, 8 * 1024 * 1024);
+    /// ```
+    #[must_use]
+    pub fn with_capacity(total_bytes: u64, free_bytes: u64) -> Self {
+        Self {
+            total_bytes,
+            free_bytes,
+            available_bytes: free_bytes,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for StatFs {
+    fn default() -> Self {
+        Self {
+            block_size: 4096,
+            io_size: 4096,
+            total_bytes: 0,
+            free_bytes: 0,
+            available_bytes: 0,
+            files: 0,
+            free_files: 0,
+        }
+    }
+}
+
 /// Returns the current time as nanoseconds since the Unix epoch.
 ///
 /// Use this for [`Metadata`] timestamps. The value is clamped to `u64`, so it
@@ -403,5 +559,43 @@ mod tests {
     fn rejects_io_counts_beyond_the_supplied_buffer() {
         assert_eq!(checked_io_count(4, 4), Ok(4));
         assert_eq!(checked_io_count(5, 4), Err(Error::INVALID));
+    }
+
+    #[test]
+    fn named_errors_use_the_portable_values() {
+        assert_eq!(Error::NOT_FOUND, Error(2));
+        assert_eq!(Error::EXISTS, Error(17));
+        assert_eq!(Error::NOT_A_DIRECTORY, Error(20));
+        assert_eq!(Error::IS_A_DIRECTORY, Error(21));
+        assert_eq!(Error::FILE_TOO_LARGE, Error(27));
+        assert_eq!(Error::NO_SPACE, Error(28));
+        assert_eq!(Error::RANGE, Error(34));
+    }
+
+    #[test]
+    fn file_and_directory_metadata_are_consistent() {
+        let file = Metadata::file(2, ROOT_INODE, 11, 0o644);
+        assert_eq!(file.kind, FileType::File);
+        assert_eq!(file.size, 11);
+        assert_eq!(file.allocated_size, 11);
+        assert_eq!(file.generation, 1);
+        assert_eq!(file.link_count, 1);
+        assert!(file.created_ns > 0);
+
+        let directory = Metadata::directory(3, ROOT_INODE, 0o755);
+        assert_eq!(directory.kind, FileType::Directory);
+        assert_eq!(directory.size, 0);
+        assert_eq!(directory.allocated_size, 0);
+
+        let owned = file.owned_by(501, 20);
+        assert_eq!((owned.uid, owned.gid), (501, 20));
+    }
+
+    #[test]
+    fn statfs_defaults_to_a_usable_block_size() {
+        let stats = StatFs::with_capacity(4096, 1024);
+        assert_eq!(stats.block_size, 4096);
+        assert_eq!(stats.available_bytes, 1024);
+        assert_eq!(StatFs::default().block_size, 4096);
     }
 }

@@ -96,7 +96,7 @@ fn mutation_invalidates_an_active_directory_enumeration() {
     let error = filesystem
         .read_directory(ROOT_INODE, result.next_cookie, result.verifier, &mut sink)
         .unwrap_err();
-    assert_eq!(error, Error(errno::ESTALE));
+    assert_eq!(error, Error::STALE);
 }
 
 #[test]
@@ -121,7 +121,7 @@ fn cross_directory_rename_updates_parent_and_lookup_indexes() {
     );
     assert_eq!(
         filesystem.lookup(source, b"old").unwrap_err(),
-        Error(errno::ENOENT)
+        Error::NOT_FOUND
     );
     assert_eq!(filesystem.metadata(file).unwrap().parent, destination);
 }
@@ -139,7 +139,7 @@ fn nonempty_directory_cannot_be_removed() {
         filesystem
             .remove(ROOT_INODE, b"directory", directory)
             .unwrap_err(),
-        Error(errno::ENOTEMPTY)
+        Error::DIRECTORY_NOT_EMPTY
     );
 }
 
@@ -156,7 +156,7 @@ fn directory_cannot_be_moved_inside_itself() {
         filesystem
             .rename(ROOT_INODE, b"parent", child, b"cycle", None)
             .unwrap_err(),
-        Error(errno::EINVAL)
+        Error::INVALID
     );
 }
 
@@ -182,7 +182,7 @@ fn rename_cannot_replace_a_nonempty_directory() {
                 Some(destination),
             )
             .unwrap_err(),
-        Error(errno::ENOTEMPTY)
+        Error::DIRECTORY_NOT_EMPTY
     );
     assert_eq!(filesystem.lookup(ROOT_INODE, b"source").unwrap().0, source);
 }
@@ -219,7 +219,7 @@ fn capacity_is_enforced_across_files_and_failed_growth_is_atomic() {
 
     assert_eq!(
         filesystem.write(first, BLOCK_SIZE, b"x").unwrap_err(),
-        Error(errno::ENOSPC)
+        Error::NO_SPACE
     );
     assert_eq!(filesystem.metadata(first).unwrap().size, 1);
     assert_eq!(filesystem.statfs().unwrap().free_bytes, 0);
@@ -268,7 +268,7 @@ fn concurrent_growth_cannot_overcommit_capacity() {
     assert_eq!(
         results
             .iter()
-            .filter(|result| **result == Err(Error(errno::ENOSPC)))
+            .filter(|result| **result == Err(Error::NO_SPACE))
             .count(),
         1
     );

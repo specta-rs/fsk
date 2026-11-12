@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use fsk::{
     DirectoryEntry, DirectorySink, Error, FileType, Filesystem, Metadata, ROOT_INODE,
-    ReadDirectoryResult, Result, SetMetadata, StatFs, now_ns,
+    ReadDirectoryResult, Result, SetMetadata, StatFs, current_gid, current_uid, now_ns,
 };
 use parking_lot::{Mutex, RwLock};
 use std::{
@@ -131,7 +131,7 @@ impl MemoryFileSystem {
         self.nodes
             .get(&inode)
             .map(|entry| Arc::clone(entry.value()))
-            .ok_or(Error(errno::ENOENT))
+            .ok_or(Error::NOT_FOUND)
     }
 
     /// Resolve an inode to a readable path for the change log.
@@ -195,7 +195,7 @@ impl MemoryFileSystem {
             || name.contains(&0)
             || name.contains(&b'/')
         {
-            return Err(Error(errno::EINVAL));
+            return Err(Error::INVALID);
         }
         Ok(())
     }
@@ -252,13 +252,13 @@ impl MemoryFileSystem {
         let parent_node = self.node(parent)?;
         let mut parent_state = parent_node.state.write();
         let NodeData::Directory(directory) = &mut parent_state.data else {
-            return Err(Error(errno::ENOTDIR));
+            return Err(Error::NOT_A_DIRECTORY);
         };
         if directory.by_name.contains_key(name) {
-            return Err(Error(errno::EEXIST));
+            return Err(Error::EXISTS);
         }
 
-        let size = u64::try_from(bytes.len()).map_err(|_| Error(errno::EFBIG))?;
+        let size = u64::try_from(bytes.len()).map_err(|_| Error::FILE_TOO_LARGE)?;
         self.reserve_growth(0, allocated_size(size))?;
         let node = self.allocate_node(parent, kind, mode, bytes);
         let inode = node.state.read().metadata.inode;
@@ -297,7 +297,7 @@ impl MemoryFileSystem {
             let next = current
                 .checked_add(additional)
                 .filter(|total| *total <= self.capacity)
-                .ok_or(Error(errno::ENOSPC))?;
+                .ok_or(Error::NO_SPACE)?;
             match self.used_bytes.compare_exchange_weak(
                 current,
                 next,
@@ -345,13 +345,13 @@ impl Filesystem for MemoryFileSystem {
         let mut state = node.state.write();
         if let Some(size) = update.size {
             if size > self.capacity {
-                return Err(Error(errno::ENOSPC));
+                return Err(Error::NO_SPACE);
             }
             let old_allocated = state.metadata.allocated_size;
             let NodeData::File(data) = &mut state.data else {
-                return Err(Error(errno::EISDIR));
+                return Err(Error::IS_A_DIRECTORY);
             };
-            let new_len = usize::try_from(size).map_err(|_| Error(errno::EFBIG))?;
+            let new_len = usize::try_from(size).map_err(|_| Error::FILE_TOO_LARGE)?;
             let new_allocated = allocated_size(size);
             self.update_usage(old_allocated, new_allocated)?;
             data.resize(new_len, 0);
@@ -397,10 +397,10 @@ impl Filesystem for MemoryFileSystem {
         let node = self.node(parent)?;
         let state = node.state.read();
         let NodeData::Directory(directory) = &state.data else {
-            return Err(Error(errno::ENOTDIR));
+            return Err(Error::NOT_A_DIRECTORY);
         };
-        let slot = *directory.by_name.get(name).ok_or(Error(errno::ENOENT))?;
-        let entry = directory.slots[slot].as_ref().ok_or(Error(errno::ENOENT))?;
+        let slot = *directory.by_name.get(name).ok_or(Error::NOT_FOUND)?;
+        let entry = directory.slots[slot].as_ref().ok_or(Error::NOT_FOUND)?;
         Ok((entry.inode, entry.kind))
     }
 
@@ -414,14 +414,14 @@ impl Filesystem for MemoryFileSystem {
         let node = self.node(inode)?;
         let state = node.state.read();
         let NodeData::Directory(directory) = &state.data else {
-            return Err(Error(errno::ENOTDIR));
+            return Err(Error::NOT_A_DIRECTORY);
         };
         if verifier != 0 && verifier != directory.version {
-            return Err(Error(errno::ESTALE));
+            return Err(Error::STALE);
         }
-        let start = usize::try_from(cookie).map_err(|_| Error(errno::EINVAL))?;
+        let start = usize::try_from(cookie).map_err(|_| Error::INVALID)?;
         if start > directory.slots.len() {
-            return Err(Error(errno::EINVAL));
+            return Err(Error::INVALID);
         }
         let mut next_cookie = cookie;
         for (index, entry) in directory.slots.iter().enumerate().skip(start) {
@@ -452,7 +452,7 @@ impl Filesystem for MemoryFileSystem {
         let node = self.node(inode)?;
         let state = node.state.read();
         let NodeData::File(data) = &state.data else {
-            return Err(Error(errno::EISDIR));
+            return Err(Error::IS_A_DIRECTORY);
         };
         let start = usize::try_from(offset)
             .unwrap_or(usize::MAX)
@@ -468,12 +468,14 @@ impl Filesystem for MemoryFileSystem {
         let mut state = node.state.write();
         let old_allocated = state.metadata.allocated_size;
         let NodeData::File(data) = &mut state.data else {
-            return Err(Error(errno::EISDIR));
+            return Err(Error::IS_A_DIRECTORY);
         };
-        let start = usize::try_from(offset).map_err(|_| Error(errno::EFBIG))?;
-        let end = start.checked_add(input.len()).ok_or(Error(errno::EFBIG))?;
+        let start = usize::try_from(offset).map_err(|_| Error::FILE_TOO_LARGE)?;
+        let end = start
+            .checked_add(input.len())
+            .ok_or(Error::FILE_TOO_LARGE)?;
         if u64::try_from(end).unwrap_or(u64::MAX) > self.capacity {
-            return Err(Error(errno::ENOSPC));
+            return Err(Error::NO_SPACE);
         }
         if end > data.len() {
             self.update_usage(old_allocated, allocated_size(end as u64))?;
@@ -495,7 +497,7 @@ impl Filesystem for MemoryFileSystem {
 
     fn create(&self, parent: u64, name: &[u8], kind: FileType, mode: u32) -> Result<u64> {
         if kind == FileType::Symlink {
-            return Err(Error(errno::EINVAL));
+            return Err(Error::INVALID);
         }
         self.create_with_bytes(parent, name, kind, mode, Vec::new())
     }
@@ -508,10 +510,10 @@ impl Filesystem for MemoryFileSystem {
         let node = self.node(inode)?;
         let state = node.state.read();
         let NodeData::Symlink(target) = &state.data else {
-            return Err(Error(errno::EINVAL));
+            return Err(Error::INVALID);
         };
         if output.len() < target.len() {
-            return Err(Error(errno::ERANGE));
+            return Err(Error::RANGE);
         }
         output[..target.len()].copy_from_slice(target);
         Ok(target.len())
@@ -525,21 +527,21 @@ impl Filesystem for MemoryFileSystem {
         if let NodeData::Directory(child_directory) = &child_node.state.read().data
             && !child_directory.by_name.is_empty()
         {
-            return Err(Error(errno::ENOTEMPTY));
+            return Err(Error::DIRECTORY_NOT_EMPTY);
         }
         let mut parent_state = parent_node.state.write();
         let NodeData::Directory(directory) = &mut parent_state.data else {
-            return Err(Error(errno::ENOTDIR));
+            return Err(Error::NOT_A_DIRECTORY);
         };
-        let slot = *directory.by_name.get(name).ok_or(Error(errno::ENOENT))?;
+        let slot = *directory.by_name.get(name).ok_or(Error::NOT_FOUND)?;
         if directory.slots[slot].as_ref().map(|entry| entry.inode) != Some(inode) {
-            return Err(Error(errno::ENOENT));
+            return Err(Error::NOT_FOUND);
         }
         directory.by_name.remove(name);
         directory.slots[slot] = None;
         directory.version = directory.version.wrapping_add(1).max(1);
         parent_state.metadata.modified_ns = now_ns();
-        let removed = self.nodes.remove(&inode).ok_or(Error(errno::ENOENT))?.1;
+        let removed = self.nodes.remove(&inode).ok_or(Error::NOT_FOUND)?.1;
         let (removed_kind, removed_size) = {
             let state = removed.state.read();
             (state.metadata.kind, state.metadata.allocated_size)
@@ -569,15 +571,15 @@ impl Filesystem for MemoryFileSystem {
         let source_entry = {
             let source_state = source_node.state.read();
             let NodeData::Directory(source_directory) = &source_state.data else {
-                return Err(Error(errno::ENOTDIR));
+                return Err(Error::NOT_A_DIRECTORY);
             };
             let source_slot = *source_directory
                 .by_name
                 .get(source_name)
-                .ok_or(Error(errno::ENOENT))?;
+                .ok_or(Error::NOT_FOUND)?;
             source_directory.slots[source_slot]
                 .clone()
-                .ok_or(Error(errno::ENOENT))?
+                .ok_or(Error::NOT_FOUND)?
         };
         if source_parent == destination_parent && source_name == destination_name {
             return Ok(());
@@ -585,14 +587,14 @@ impl Filesystem for MemoryFileSystem {
         if source_entry.kind == FileType::Directory
             && self.is_descendant_of(destination_parent, source_entry.inode)?
         {
-            return Err(Error(errno::EINVAL));
+            return Err(Error::INVALID);
         }
         self.validate_replacement(source_entry.kind, replaced_inode)?;
 
         if source_parent == destination_parent {
             let mut state = source_node.state.write();
             let NodeData::Directory(directory) = &mut state.data else {
-                return Err(Error(errno::ENOTDIR));
+                return Err(Error::NOT_A_DIRECTORY);
             };
             rename_in_same_directory(directory, source_name, destination_name, replaced_inode)?;
             directory.version = directory.version.wrapping_add(1).max(1);
@@ -611,18 +613,18 @@ impl Filesystem for MemoryFileSystem {
                 (&mut second_state, &mut first_state)
             };
             let NodeData::Directory(source_directory) = &mut source_state.data else {
-                return Err(Error(errno::ENOTDIR));
+                return Err(Error::NOT_A_DIRECTORY);
             };
             let NodeData::Directory(destination_directory) = &mut destination_state.data else {
-                return Err(Error(errno::ENOTDIR));
+                return Err(Error::NOT_A_DIRECTORY);
             };
             let source_slot = *source_directory
                 .by_name
                 .get(source_name)
-                .ok_or(Error(errno::ENOENT))?;
+                .ok_or(Error::NOT_FOUND)?;
             let mut entry = source_directory.slots[source_slot]
                 .take()
-                .ok_or(Error(errno::ENOENT))?;
+                .ok_or(Error::NOT_FOUND)?;
             source_directory.by_name.remove(source_name);
             remove_destination(destination_directory, destination_name, replaced_inode)?;
             entry.name = destination_name.to_vec();
@@ -667,17 +669,17 @@ impl MemoryFileSystem {
         if source_kind == FileType::Directory
             && replacement_state.metadata.kind != FileType::Directory
         {
-            return Err(Error(errno::ENOTDIR));
+            return Err(Error::NOT_A_DIRECTORY);
         }
         if source_kind != FileType::Directory
             && replacement_state.metadata.kind == FileType::Directory
         {
-            return Err(Error(errno::EISDIR));
+            return Err(Error::IS_A_DIRECTORY);
         }
         if let NodeData::Directory(directory) = &replacement_state.data
             && !directory.by_name.is_empty()
         {
-            return Err(Error(errno::ENOTEMPTY));
+            return Err(Error::DIRECTORY_NOT_EMPTY);
         }
         Ok(())
     }
@@ -706,7 +708,7 @@ impl MemoryFileSystem {
             }
             candidate = self.node(candidate)?.state.read().metadata.parent;
         }
-        Err(Error(errno::EINVAL))
+        Err(Error::INVALID)
     }
 }
 
@@ -716,17 +718,14 @@ fn rename_in_same_directory(
     destination_name: &[u8],
     replaced_inode: Option<u64>,
 ) -> Result<()> {
-    let source_slot = *directory
-        .by_name
-        .get(source_name)
-        .ok_or(Error(errno::ENOENT))?;
+    let source_slot = *directory.by_name.get(source_name).ok_or(Error::NOT_FOUND)?;
     if source_name == destination_name {
         return Ok(());
     }
     remove_destination(directory, destination_name, replaced_inode)?;
     let entry = directory.slots[source_slot]
         .as_mut()
-        .ok_or(Error(errno::ENOENT))?;
+        .ok_or(Error::NOT_FOUND)?;
     directory.by_name.remove(source_name);
     entry.name = destination_name.to_vec();
     directory
@@ -749,7 +748,7 @@ fn remove_destination(
             directory.slots[slot] = None;
             Ok(())
         }
-        (None | Some(_), Some(_)) | (Some(_), None) => Err(Error(errno::EEXIST)),
+        (None | Some(_), Some(_)) | (Some(_), None) => Err(Error::EXISTS),
     }
 }
 
@@ -764,49 +763,6 @@ fn join_path(parent: &str, name: &[u8]) -> String {
 
 const fn allocated_size(size: u64) -> u64 {
     size.div_ceil(BLOCK_SIZE).saturating_mul(BLOCK_SIZE)
-}
-
-#[cfg(unix)]
-unsafe extern "C" {
-    #[link_name = "getuid"]
-    fn c_getuid() -> u32;
-    #[link_name = "getgid"]
-    fn c_getgid() -> u32;
-}
-
-#[cfg(unix)]
-fn current_uid() -> u32 {
-    unsafe { c_getuid() }
-}
-
-#[cfg(unix)]
-fn current_gid() -> u32 {
-    unsafe { c_getgid() }
-}
-
-// Windows has no numeric POSIX UID/GID. Zero is the neutral value consumed by
-// the portable model; ProjFS applies Windows ACLs to the virtualization root.
-#[cfg(windows)]
-const fn current_uid() -> u32 {
-    0
-}
-
-#[cfg(windows)]
-const fn current_gid() -> u32 {
-    0
-}
-
-mod errno {
-    pub const ENOENT: i32 = 2;
-    pub const EEXIST: i32 = 17;
-    pub const ENOTDIR: i32 = 20;
-    pub const EISDIR: i32 = 21;
-    pub const EINVAL: i32 = 22;
-    pub const EFBIG: i32 = 27;
-    pub const ENOSPC: i32 = 28;
-    pub const ERANGE: i32 = 34;
-    pub const ENOTEMPTY: i32 = 66;
-    pub const ESTALE: i32 = 70;
 }
 
 // Tests live under `tests/` to keep the example source focused.
