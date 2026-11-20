@@ -454,6 +454,31 @@ impl WindowsState {
 struct Enumeration {
     entries: Vec<WindowsEntry>,
     index: usize,
+    // None before the first page; an empty vector means no filter was supplied.
+    search_expression: Option<Vec<u16>>,
+}
+
+impl Enumeration {
+    /// `search_expression` must be null or a valid, terminated UTF-16 string.
+    unsafe fn begin_page(&mut self, restart: bool, search_expression: PCWSTR) -> Option<&[u16]> {
+        if restart || self.search_expression.is_none() {
+            self.index = 0;
+            // ProjFS supplies a callback-scoped expression. Capture it only on
+            // the first page or on restart, and retain it for continuation pages.
+            let expression = if search_expression.is_null() {
+                Vec::new()
+            } else {
+                // SAFETY: the callback guarantees a valid terminated string.
+                let mut expression = unsafe { wide_slice(search_expression) }.to_vec();
+                expression.push(0);
+                expression
+            };
+            self.search_expression = Some(expression);
+        }
+        self.search_expression
+            .as_deref()
+            .filter(|expression| !expression.is_empty())
+    }
 }
 
 struct WindowsEntry {
@@ -541,7 +566,7 @@ unsafe extern "system" fn start_directory(
         key,
         Arc::new(Mutex::new(Enumeration {
             entries: sink.entries,
-            index: 0,
+            ..Enumeration::default()
         })),
     );
     S_OK
@@ -574,14 +599,16 @@ unsafe extern "system" fn get_directory(
     };
     let mut session = session.lock();
     // SAFETY: callback references initialized callback data.
-    if unsafe { (*callback).Flags } & PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN != 0 {
-        session.index = 0;
-    }
+    let restart = unsafe { (*callback).Flags } & PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN != 0;
+    // SAFETY: ProjFS supplies null or a callback-scoped terminated string.
+    let search_expression =
+        unsafe { session.begin_page(restart, search_expression) }.map(<[u16]>::as_ptr);
     let mut added = false;
     while let Some(entry) = session.entries.get(session.index) {
-        if !search_expression.is_null()
-            // SAFETY: both are null-terminated UTF-16 strings.
-            && !unsafe { PrjFileNameMatch(entry.name.as_ptr(), search_expression) }
+        if let Some(expression) = search_expression
+            // SAFETY: both strings are terminated and the captured expression
+            // stays alive in `session` throughout this loop.
+            && !unsafe { PrjFileNameMatch(entry.name.as_ptr(), expression) }
         {
             session.index += 1;
             continue;
@@ -1017,6 +1044,52 @@ mod tests {
 
     fn win32_code(value: HRESULT) -> u32 {
         u32::from_ne_bytes(value.to_ne_bytes()) & 0xffff
+    }
+
+    #[test]
+    fn directory_search_expression_persists_across_pages() {
+        use windows_sys::w;
+
+        let mut session = Enumeration::default();
+        let mut initial: Vec<u16> = "*.txt\0".encode_utf16().collect();
+        // SAFETY: all strings passed to these functions are terminated or null.
+        unsafe {
+            assert!(session.begin_page(false, initial.as_ptr()).is_some());
+            initial.fill(0);
+            session.index = 2;
+
+            for input in [ptr::null(), w!("*.bin")] {
+                let expression = session.begin_page(false, input).unwrap();
+                assert!(PrjFileNameMatch(w!("next.txt"), expression.as_ptr()));
+                assert!(!PrjFileNameMatch(w!("next.bin"), expression.as_ptr()));
+                assert_eq!(session.index, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn directory_search_expression_is_recaptured_on_restart() {
+        use windows_sys::w;
+
+        let mut session = Enumeration::default();
+        // SAFETY: all strings passed to these functions are terminated or null.
+        unsafe {
+            assert!(session.begin_page(false, ptr::null()).is_none());
+            session.index = 2;
+            assert!(session.begin_page(false, w!("*.txt")).is_none());
+            assert_eq!(session.index, 2);
+
+            assert!(session.begin_page(true, w!("*.txt")).is_some());
+            session.index = 1;
+            let expression = session.begin_page(true, w!("*.bin")).unwrap();
+            assert!(PrjFileNameMatch(w!("next.bin"), expression.as_ptr()));
+            assert!(!PrjFileNameMatch(w!("next.txt"), expression.as_ptr()));
+            assert_eq!(session.index, 0);
+
+            session.index = 1;
+            assert!(session.begin_page(true, ptr::null()).is_none());
+            assert_eq!(session.index, 0);
+        }
     }
 
     #[test]
