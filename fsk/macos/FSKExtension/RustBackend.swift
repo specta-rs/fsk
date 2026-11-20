@@ -55,11 +55,6 @@ enum RustBackendError: Error, Equatable, CustomStringConvertible {
         }
     }
 
-    /// Whether the peer is healthy but negotiated an older protocol revision.
-    var isProtocolTooOld: Bool {
-        if case .protocolTooOld = self { true } else { false }
-    }
-
     var description: String {
         switch self {
         case let .posix(code):
@@ -420,19 +415,13 @@ private final class IPCConnectionPool: @unchecked Sendable {
         minimumMinor: UInt16 = 0
     ) throws -> Data {
         let connection = try checkout()
-        var reusable = true
+        var reusable = false
         defer { checkin(connection, reusable: reusable) }
-        do {
-            return try connection.request(operation, body, minimumMinor: minimumMinor)
-        } catch let error as RustBackendError {
-            // A minor-version refusal happens before anything is written, so
-            // the connection is still healthy.
-            reusable = !error.isProtocolTooOld
-            throw error
-        } catch {
-            reusable = false
-            throw error
-        }
+        // A thrown exchange failure may leave the stream out of sync. Drop
+        // the socket without replaying the request: the server may have run it.
+        let result = try connection.request(operation, body, minimumMinor: minimumMinor)
+        reusable = true
+        return try result.get()
     }
 
     private func checkout() throws -> IPCConnection {
@@ -483,6 +472,7 @@ private final class IPCConnection {
         do {
             try connect(path: socketPath)
             let hello = try requestRaw(.hello, token, requestID: 1)
+            _ = try hello.result.get()
             negotiatedMinor = hello.minor
         } catch {
             Darwin.close(descriptor)
@@ -497,35 +487,30 @@ private final class IPCConnection {
         }
     }
 
+    /// Returns errors from a complete reply or local validation as a result;
+    /// throws only when the stream can no longer be reused.
     func request(
         _ operation: IPCOperation,
         _ body: Data = Data(),
         minimumMinor: UInt16 = 0
-    ) throws -> Data {
+    ) throws -> Result<Data, RustBackendError> {
         guard negotiatedMinor >= minimumMinor else {
-            throw RustBackendError.protocolTooOld(
+            return .failure(.protocolTooOld(
                 required: minimumMinor,
                 negotiated: negotiatedMinor
-            )
+            ))
         }
-        return try requestRaw(operation, body).body
-    }
-
-    private func requestRaw(
-        _ operation: IPCOperation,
-        _ body: Data
-    ) throws -> (body: Data, minor: UInt16) {
+        guard body.count <= ipcMaximumFrame else { return .failure(.posix(E2BIG)) }
         let requestID = nextRequestID
         nextRequestID &+= 1
-        return try requestRaw(operation, body, requestID: requestID)
+        return try requestRaw(operation, body, requestID: requestID).result
     }
 
     private func requestRaw(
         _ operation: IPCOperation,
         _ body: Data,
         requestID: UInt64
-    ) throws -> (body: Data, minor: UInt16) {
-        guard body.count <= ipcMaximumFrame else { throw RustBackendError.posix(E2BIG) }
+    ) throws -> (result: Result<Data, RustBackendError>, minor: UInt16) {
         var header = IPCEncoder(capacity: ipcHeaderLength)
         header.append(ipcMagic)
         header.append(ipcProtocolMajor)
@@ -556,10 +541,7 @@ private final class IPCConnection {
         let length = Int(try decoder.uint32())
         guard length <= ipcMaximumFrame else { throw RustBackendError.invalidProtocol }
         let response = try readExactly(length)
-        if status != 0 {
-            throw RustBackendError.posix(status)
-        }
-        return (response, serverMinor)
+        return (status == 0 ? .success(response) : .failure(.posix(status)), serverMinor)
     }
 
     private func connect(path: String) throws {
