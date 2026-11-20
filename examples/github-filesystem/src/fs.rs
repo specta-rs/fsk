@@ -76,7 +76,6 @@ struct FileNode {
     path: String,
     sha: String,
     size: u64,
-    download_url: Option<String>,
     inline: Option<Vec<u8>>,
 }
 
@@ -221,7 +220,6 @@ impl GitHubFilesystem {
                     path,
                     sha: content.sha,
                     size: content.size,
-                    download_url: content.download_url,
                     inline,
                 };
                 files.push(file.clone());
@@ -275,8 +273,7 @@ impl GitHubFilesystem {
             if let Some(bytes) = &file.inline {
                 return Ok(bytes.clone());
             }
-            let url = file.download_url.as_deref().ok_or(Error::IO)?;
-            self.api.download(url)
+            self.api.blob(&file.owner, &file.repo, &file.sha)
         })
     }
 }
@@ -504,20 +501,24 @@ impl Api {
         response.json().map_err(|_| Error::IO)
     }
 
-    fn download(&self, url: &str) -> Result<Vec<u8>> {
-        let url = Url::parse(url).map_err(|_| Error::IO)?;
-        self.get(url)?
+    fn blob(&self, owner: &str, repo: &str, sha: &str) -> Result<Vec<u8>> {
+        let url = self.endpoint(&["repos", owner, repo, "git", "blobs", sha])?;
+        self.get_with_accept(url, "application/vnd.github.raw+json")?
             .bytes()
             .map(|bytes| bytes.to_vec())
             .map_err(|_| Error::IO)
     }
 
     fn get(&self, url: Url) -> Result<reqwest::blocking::Response> {
+        self.get_with_accept(url, "application/vnd.github+json")
+    }
+
+    fn get_with_accept(&self, url: Url, accept: &str) -> Result<reqwest::blocking::Response> {
         let response = self
             .client
             .get(url)
             .bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json")
+            .header("Accept", accept)
             .send()
             .map_err(|_| Error::IO)?;
         if response.status().as_u16() == 404 {
@@ -562,7 +563,6 @@ struct Content {
     size: u64,
     #[serde(rename = "type")]
     kind: String,
-    download_url: Option<String>,
     #[serde(rename = "content")]
     payload: Option<String>,
 }
@@ -601,8 +601,10 @@ impl Cache {
     }
 
     fn path(&self, file: &FileNode) -> PathBuf {
+        // Entries created from branch-relative download URLs may contain
+        // bytes from a newer revision than the SHA in their cache key.
         let digest = Sha256::digest(format!(
-            "{}/{}/{}:{}",
+            "blob-by-sha:{}/{}/{}:{}",
             file.owner, file.repo, file.path, file.sha
         ));
         self.root.join(format!("{digest:x}.blob"))
