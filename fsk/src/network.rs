@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 ///
 /// # Errors
 ///
-/// Returns an error if the directory can't be created or the home directory
-/// can't be located.
+/// Returns an error if the directory can't be created or, on macOS, if
+/// `HOME` does not identify an absolute home directory.
 pub fn local_file_directory() -> std::io::Result<PathBuf> {
     imp::local_file_directory()
 }
@@ -29,15 +29,40 @@ mod imp {
     use std::path::PathBuf;
 
     pub(super) fn local_file_directory() -> std::io::Result<PathBuf> {
-        let home = std::env::var_os("HOME").ok_or_else(|| {
+        directory_in_home(std::env::var_os("HOME").map(PathBuf::from))
+    }
+
+    fn directory_in_home(home: Option<PathBuf>) -> std::io::Result<PathBuf> {
+        let home = home.ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "could not locate the user home directory",
             )
         })?;
-        let path = PathBuf::from(home).join("Library/Group Containers/group.dev.specta.fsk/Caches");
+        if !home.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "HOME must be an absolute path",
+            ));
+        }
+        let path = home.join("Library/Group Containers/group.dev.specta.fsk/Caches");
         std::fs::create_dir_all(&path)?;
         Ok(path)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn rejects_relative_home_for_local_files() {
+            for home in [PathBuf::new(), PathBuf::from("relative-home")] {
+                assert_eq!(
+                    directory_in_home(Some(home)).unwrap_err().kind(),
+                    std::io::ErrorKind::InvalidInput
+                );
+            }
+        }
     }
 }
 
