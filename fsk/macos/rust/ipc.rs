@@ -188,6 +188,13 @@ impl Service {
                 buffer: None,
             };
             if let RawOutcome::Reject(error) = fs.raw_event(event) {
+                // The extension has already released its open state. Close
+                // the lease even though the reply will report the rejection.
+                if raw_operation == Operation::Close
+                    && let Ok(lease) = Decoder::new(payload).u64()
+                {
+                    let _ = self.close(lease);
+                }
                 return Err(error);
             }
         }
@@ -682,6 +689,87 @@ mod tests {
         os::{fd::AsRawFd, unix::net::UnixStream},
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn rejected_close_still_releases_the_network_lease_once() {
+        struct RejectClose {
+            close_calls: Arc<AtomicU64>,
+        }
+
+        impl Filesystem for RejectClose {
+            fn statfs(&self) -> crate::Result<crate::StatFs> {
+                unreachable!()
+            }
+
+            fn metadata(&self, _: u64) -> crate::Result<crate::Metadata> {
+                unreachable!()
+            }
+
+            fn lookup(&self, _: u64, _: &[u8]) -> crate::Result<(u64, FileType)> {
+                unreachable!()
+            }
+
+            fn read_directory(
+                &self,
+                _: u64,
+                _: u64,
+                _: u64,
+                _: &mut dyn DirectorySink,
+            ) -> crate::Result<ReadDirectoryResult> {
+                unreachable!()
+            }
+
+            fn read(&self, _: u64, _: u64, _: &mut [u8]) -> crate::Result<usize> {
+                unreachable!()
+            }
+
+            fn raw_event_mask(&self) -> RawEventMask {
+                RawEventMask::operation(Operation::Close)
+            }
+
+            fn raw_event(&self, event: RawEvent<'_>) -> RawOutcome {
+                assert_eq!(event.operation, Operation::Close);
+                RawOutcome::Reject(Error::NOT_SUPPORTED)
+            }
+        }
+
+        impl NetworkFilesystem for RejectClose {
+            fn close_file(&self, inode: u64, file: NetworkFile) -> crate::Result<()> {
+                assert_eq!(inode, 2);
+                assert_eq!(file, NetworkFile::Remote);
+                self.close_calls.fetch_add(1, Ordering::Relaxed);
+                Err(Error::IO)
+            }
+        }
+
+        let close_calls = Arc::new(AtomicU64::new(0));
+        let service = Service::network(
+            RejectClose {
+                close_calls: Arc::clone(&close_calls),
+            },
+            [7; 32],
+        );
+        let mut open = Encoder::with_capacity(9);
+        open.u64(2);
+        open.u8(0);
+        let opened = service.dispatch(1, opcode::OPEN, &open.finish()).unwrap();
+        let lease = Decoder::new(&opened).u64().unwrap();
+        assert_ne!(lease, 0);
+
+        assert_eq!(
+            service.dispatch(2, opcode::CLOSE, &lease.to_le_bytes()),
+            Err(Error::NOT_SUPPORTED)
+        );
+        assert_eq!(close_calls.load(Ordering::Relaxed), 1);
+        assert!(!service.leases.lock().contains_key(&lease));
+
+        assert_eq!(
+            service.dispatch(3, opcode::CLOSE, &lease.to_le_bytes()),
+            Err(Error::NOT_SUPPORTED)
+        );
+        drop(service);
+        assert_eq!(close_calls.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn authenticated_connection_serves_metadata() {

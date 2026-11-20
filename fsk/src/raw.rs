@@ -107,6 +107,9 @@ pub enum RawOutcome {
     /// Let the adapter dispatch the portable operation normally.
     Continue,
     /// Skip the portable operation and fail the request with this error.
+    ///
+    /// For [`Operation::Close`], the adapter still releases any associated
+    /// handle or lease, even if the request is rejected.
     Reject(Error),
 }
 

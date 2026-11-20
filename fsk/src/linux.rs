@@ -617,20 +617,17 @@ impl fuser::Filesystem for FuseAdapter {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        if let Err(error) = self.before(req, Operation::Close, fh.0, raw_flags(flags)) {
-            reply.error(errno(error));
-            return;
-        }
-        let Some(open) = self.open_files.lock().remove(&fh.0) else {
-            reply.ok();
-            return;
-        };
-        match self
-            .backend
-            .network()
-            .expect("network handle without network backend")
-            .close_file(open.inode, open.network_file)
-        {
+        let outcome = self.before(req, Operation::Close, fh.0, raw_flags(flags));
+        let open = self.open_files.lock().remove(&fh.0);
+        // The kernel won't repeat release after an error, so close the lease
+        // even if the hook rejected the request.
+        let closed = open.map_or(Ok(()), |open| {
+            self.backend
+                .network()
+                .expect("network handle without network backend")
+                .close_file(open.inode, open.network_file)
+        });
+        match outcome.and(closed) {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(errno(error)),
         }
