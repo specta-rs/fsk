@@ -127,6 +127,75 @@ fn cross_directory_rename_updates_parent_and_lookup_indexes() {
 }
 
 #[test]
+fn cross_directory_rename_to_occupied_destination_preserves_source() {
+    assert_failed_cross_directory_rename_preserves_entries(false);
+}
+
+#[test]
+fn cross_directory_rename_with_stale_replacement_preserves_source() {
+    assert_failed_cross_directory_rename_preserves_entries(true);
+}
+
+fn assert_failed_cross_directory_rename_preserves_entries(stale_replacement: bool) {
+    let filesystem = MemoryFileSystem::new();
+    let source = filesystem
+        .create(ROOT_INODE, b"source", FileType::Directory, 0o755)
+        .unwrap();
+    let destination = filesystem
+        .create(ROOT_INODE, b"destination", FileType::Directory, 0o755)
+        .unwrap();
+    let file = filesystem
+        .create(source, b"old", FileType::File, 0o644)
+        .unwrap();
+    let occupied = filesystem
+        .create(destination, b"new", FileType::File, 0o644)
+        .unwrap();
+    let replacement = stale_replacement.then(|| {
+        filesystem
+            .create(destination, b"other", FileType::File, 0o644)
+            .unwrap()
+    });
+    filesystem.write(file, 0, b"source").unwrap();
+    filesystem.write(occupied, 0, b"target").unwrap();
+    let free_bytes = filesystem.statfs().unwrap().free_bytes;
+    let mut before = VecSink {
+        capacity: 1,
+        ..VecSink::default()
+    };
+    let listing = filesystem
+        .read_directory(source, 0, 0, &mut before)
+        .unwrap();
+
+    assert_eq!(
+        filesystem.rename(source, b"old", destination, b"new", replacement),
+        Err(Error::EXISTS)
+    );
+    assert_eq!(
+        filesystem.lookup(source, b"old"),
+        Ok((file, FileType::File))
+    );
+    assert_eq!(
+        filesystem.lookup(destination, b"new"),
+        Ok((occupied, FileType::File))
+    );
+    let mut after = VecSink {
+        capacity: 1,
+        ..VecSink::default()
+    };
+    assert_eq!(
+        filesystem.read_directory(source, 0, listing.verifier, &mut after),
+        Ok(listing)
+    );
+    assert_eq!(before.entries, after.entries);
+    for (inode, expected) in [(file, b"source"), (occupied, b"target")] {
+        let mut output = [0; 6];
+        assert_eq!(filesystem.read(inode, 0, &mut output), Ok(expected.len()));
+        assert_eq!(&output, expected);
+    }
+    assert_eq!(filesystem.statfs().unwrap().free_bytes, free_bytes);
+}
+
+#[test]
 fn nonempty_directory_cannot_be_removed() {
     let filesystem = MemoryFileSystem::new();
     let directory = filesystem
