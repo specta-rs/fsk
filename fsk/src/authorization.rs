@@ -111,25 +111,31 @@ pub fn authorization_status() -> io::Result<AuthorizationStatus> {
 /// Propagates errors from installing `FSK.app`, such as network, verification,
 /// or filesystem failures.
 pub fn ensure_authorization() -> io::Result<()> {
+    match run_setup()? {
+        SetupOutcome::Authorized => Ok(()),
+        SetupOutcome::NeedsApproval => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            APPROVAL_MESSAGE,
+        )),
+    }
+}
+
+enum SetupOutcome {
+    Authorized,
+    NeedsApproval,
+}
+
+fn run_setup() -> io::Result<SetupOutcome> {
     match authorization_status()? {
-        AuthorizationStatus::Authorized => Ok(()),
+        AuthorizationStatus::Authorized => return Ok(SetupOutcome::Authorized),
         AuthorizationStatus::NotInstalled => {
             #[cfg(target_os = "macos")]
             imp::install_app()?;
-            imp::request_approval()?;
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                APPROVAL_MESSAGE,
-            ))
         }
-        AuthorizationStatus::NeedsApproval => {
-            imp::request_approval()?;
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                APPROVAL_MESSAGE,
-            ))
-        }
+        AuthorizationStatus::NeedsApproval => {}
     }
+    imp::request_approval()?;
+    Ok(SetupOutcome::NeedsApproval)
 }
 
 #[cfg(target_os = "macos")]
@@ -160,10 +166,9 @@ const AUTHORIZATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// This is the "wait for the user" counterpart to [`ensure_authorization`]:
 ///
 /// 1. When the host is already ready, it returns immediately.
-/// 2. Otherwise it calls [`ensure_authorization`] once, which installs the
-///    matching macOS app when needed and opens the setup UI. A
-///    [`PermissionDenied`](io::ErrorKind::PermissionDenied) result is expected
-///    here and starts the wait; any other error is returned.
+/// 2. Otherwise it runs the same setup as [`ensure_authorization`] once:
+///    install the matching macOS app when needed and open the setup UI.
+///    Setup failures are returned immediately.
 /// 3. It then polls [`authorization_status`] until the user finishes setup, or
 ///    until `timeout` elapses.
 ///
@@ -181,7 +186,7 @@ const AUTHORIZATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::fr
 ///
 /// Returns [`io::ErrorKind::TimedOut`] when the deadline passes while setup is
 /// still required; the message names the outstanding requirement. Propagates
-/// installation and status-check errors unchanged.
+/// installation, setup UI, and status-check errors unchanged.
 ///
 /// # Example
 ///
@@ -196,6 +201,14 @@ const AUTHORIZATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// }
 /// ```
 pub fn wait_for_authorization(timeout: std::time::Duration) -> io::Result<()> {
+    wait_for_authorization_with(timeout, run_setup, authorization_status)
+}
+
+fn wait_for_authorization_with(
+    timeout: std::time::Duration,
+    setup: impl FnOnce() -> io::Result<SetupOutcome>,
+    mut check_status: impl FnMut() -> io::Result<AuthorizationStatus>,
+) -> io::Result<()> {
     let deadline = std::time::Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| {
@@ -205,19 +218,12 @@ pub fn wait_for_authorization(timeout: std::time::Duration) -> io::Result<()> {
             )
         })?;
 
-    match authorization_status()? {
-        AuthorizationStatus::Authorized => return Ok(()),
-        _ => match ensure_authorization() {
-            // Install and open the setup UI. The PermissionDenied result is the
-            // instruction to wait, not a failure.
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
-            Err(error) => return Err(error),
-        },
+    if let SetupOutcome::Authorized = setup()? {
+        return Ok(());
     }
 
     loop {
-        match authorization_status()? {
+        match check_status()? {
             AuthorizationStatus::Authorized => return Ok(()),
             status => {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -345,6 +351,37 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_propagates_setup_permission_denied() {
+        let error = wait_for_authorization_with(
+            std::time::Duration::ZERO,
+            || {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cannot create the companion app directory",
+                ))
+            },
+            || Ok(AuthorizationStatus::NotInstalled),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "cannot create the companion app directory"
+        );
+    }
+
+    #[test]
+    fn wait_polls_when_setup_needs_approval() {
+        wait_for_authorization_with(
+            std::time::Duration::ZERO,
+            || Ok(SetupOutcome::NeedsApproval),
+            || Ok(AuthorizationStatus::Authorized),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn status_reports_the_next_setup_action() {

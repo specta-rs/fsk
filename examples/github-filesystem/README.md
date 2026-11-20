@@ -37,8 +37,9 @@ startup and after local-file leases close. Files currently open are never
 removed. Offline reads continue to work for already materialized files; uncached
 namespace and file requests return an I/O error.
 
-The cache key includes repository, path, and blob SHA. A changed default-branch
-blob therefore never aliases stale bytes. Downloads use a temporary file plus an
+The cache key includes repository, path, and blob SHA. Downloads request that
+exact blob, so a branch update between listing and reading a file cannot change
+the bytes stored under its cache key. Downloads use a temporary file plus an
 atomic rename so interrupted requests cannot expose partial contents.
 
 ## Tests

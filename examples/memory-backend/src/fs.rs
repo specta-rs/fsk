@@ -622,22 +622,22 @@ impl Filesystem for MemoryFileSystem {
                 .by_name
                 .get(source_name)
                 .ok_or(Error::NOT_FOUND)?;
-            let mut entry = source_directory.slots[source_slot]
-                .take()
-                .ok_or(Error::NOT_FOUND)?;
-            source_directory.by_name.remove(source_name);
+            let moved_node = self.node(source_entry.inode)?;
             remove_destination(destination_directory, destination_name, replaced_inode)?;
+            source_directory.by_name.remove(source_name);
+            source_directory.slots[source_slot] = None;
+            let mut entry = source_entry;
             entry.name = destination_name.to_vec();
             let destination_slot = destination_directory.slots.len();
-            destination_directory.slots.push(Some(entry.clone()));
             destination_directory
                 .by_name
                 .insert(entry.name.clone(), destination_slot);
+            destination_directory.slots.push(Some(entry));
             source_directory.version = source_directory.version.wrapping_add(1).max(1);
             destination_directory.version = destination_directory.version.wrapping_add(1).max(1);
             source_state.metadata.modified_ns = now_ns();
             destination_state.metadata.modified_ns = now_ns();
-            self.node(entry.inode)?.state.write().metadata.parent = destination_parent;
+            moved_node.state.write().metadata.parent = destination_parent;
         }
         if let Some(replaced) = replaced_inode {
             if let Some((_, node)) = self.nodes.remove(&replaced) {

@@ -80,6 +80,17 @@ impl FakeGitHub {
                         ),
                     )
                 } else if target == "/download/readme" {
+                    // The branch moved after we indexed the original blob.
+                    (
+                        "200 OK",
+                        "application/octet-stream",
+                        "updated readme".to_owned(),
+                    )
+                } else if target == "/repos/specta-rs/fsk/git/blobs/abc123"
+                    && request.lines().any(|line| {
+                        line.eq_ignore_ascii_case("accept: application/vnd.github.raw+json")
+                    })
+                {
                     (
                         "200 OK",
                         "application/octet-stream",
@@ -144,9 +155,12 @@ fn end_to_end_github_semantics_and_local_reopen() {
     let count = filesystem
         .read(readme, 0, &mut output)
         .expect("API-backed read");
-    assert_eq!(&output[..count], b"hello github");
+    assert_eq!(&output[..count], b"hello github", "read the indexed blob");
     let local = filesystem.open_file(readme, false).expect("cached open");
-    assert!(matches!(local, NetworkFile::Local(_)));
+    let NetworkFile::Local(lease) = &local else {
+        panic!("expected a cached local file");
+    };
+    assert_eq!(fs::read(lease.path()).unwrap(), b"hello github");
     filesystem.close_file(readme, local).expect("close lease");
     assert_eq!(
         filesystem.write(readme, 0, b"no"),
@@ -192,7 +206,6 @@ fn cleanup_evicts_idle_files_but_not_leases() {
         path: "f".into(),
         sha: "s".into(),
         size: 4,
-        download_url: None,
         inline: None,
     };
     let path = cache
