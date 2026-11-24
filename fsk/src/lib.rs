@@ -318,7 +318,9 @@
 //! # Mounting
 //!
 //! [`MountSession`] owns the mount and the service that answers the kernel.
-//! Dropping it unmounts the volume and releases file leases:
+//! Dropping it attempts to unmount and always stops the local service, then
+//! releases file leases. If the platform unmount fails, the path can remain
+//! mounted:
 //!
 //! ```no_run
 //! # use fsk::{Filesystem, MountSession};

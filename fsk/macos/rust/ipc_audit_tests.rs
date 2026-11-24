@@ -258,6 +258,96 @@ fn legacy_peers_acknowledge_open_on_response_write() {
 }
 
 #[test]
+fn ack_from_another_connection_is_rejected_without_clearing_pending_lease() {
+    let directory = tempfile::tempdir().unwrap();
+    let local_path = directory.path().join("materialized.bin");
+    std::fs::write(&local_path, b"cached bytes").unwrap();
+    let close_calls = Arc::new(AtomicU64::new(0));
+    let service = Arc::new(Service::network(
+        LeaseTrackingFilesystem {
+            inner: TestFilesystem::default(),
+            local_path,
+            close_calls: Arc::clone(&close_calls),
+            open_entered: None,
+            open_release: None,
+        },
+        [7; 32],
+    ));
+    let (mut creator, creator_server) = UnixStream::pair().unwrap();
+    creator
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let worker_service = Arc::clone(&service);
+    let creator_worker =
+        std::thread::spawn(move || worker_service.serve_connection(creator_server));
+    send(&mut creator, 1, opcode::HELLO, &[7; 32]);
+    assert_eq!(response(&mut creator).1, 0);
+
+    let mut open = Encoder::with_capacity(9);
+    open.u64(2);
+    open.u8(0);
+    send(&mut creator, 2, opcode::OPEN, &open.finish());
+    let (_, status, body) = response(&mut creator);
+    assert_eq!(status, 0);
+    let lease = u64::from_le_bytes(body[..8].try_into().unwrap());
+    assert!(
+        service
+            .leases
+            .lock()
+            .get(&lease)
+            .unwrap()
+            .pending_connection
+            .is_some()
+    );
+
+    let (mut other, other_server) = UnixStream::pair().unwrap();
+    other
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let worker_service = Arc::clone(&service);
+    let other_worker = std::thread::spawn(move || worker_service.serve_connection(other_server));
+    send(&mut other, 1, opcode::HELLO, &[7; 32]);
+    assert_eq!(response(&mut other).1, 0);
+
+    send(&mut other, 2, opcode::ACK_LEASE, &lease.to_le_bytes());
+    assert_eq!(response(&mut other).1, Error::INVALID.0);
+    assert_eq!(close_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        service
+            .leases
+            .lock()
+            .get(&lease)
+            .unwrap()
+            .pending_connection
+            .is_some()
+    );
+
+    send(&mut creator, 3, opcode::ACK_LEASE, &lease.to_le_bytes());
+    assert_eq!(response(&mut creator).1, 0);
+    assert!(
+        service
+            .leases
+            .lock()
+            .get(&lease)
+            .unwrap()
+            .pending_connection
+            .is_none()
+    );
+
+    drop(creator);
+    creator_worker.join().unwrap().unwrap();
+    assert_eq!(close_calls.load(Ordering::SeqCst), 0);
+    assert!(service.leases.lock().contains_key(&lease));
+
+    send(&mut other, 3, opcode::CLOSE, &lease.to_le_bytes());
+    assert_eq!(response(&mut other).1, 0);
+    drop(other);
+    other_worker.join().unwrap().unwrap();
+    assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+    assert!(service.leases.lock().is_empty());
+}
+
+#[test]
 fn acknowledged_disconnect_preserves_local_file_lease_until_kernel_close() {
     let directory = tempfile::tempdir().unwrap();
     let local_path = directory.path().join("materialized.bin");
@@ -307,10 +397,10 @@ fn acknowledged_disconnect_preserves_local_file_lease_until_kernel_close() {
     assert_eq!(status, 0);
     let lease2 = u64::from_le_bytes(body2[..8].try_into().unwrap());
     assert_ne!(lease, lease2);
-    // ACK is connection-independent: this pooled peer acknowledges both opens.
-    send(&mut client2, 3, opcode::ACK_LEASE, &lease.to_le_bytes());
-    assert_eq!(response(&mut client2).1, 0);
-    send(&mut client2, 4, opcode::ACK_LEASE, &lease2.to_le_bytes());
+    // Each lease must be acknowledged by the connection that created it.
+    send(&mut client, 3, opcode::ACK_LEASE, &lease.to_le_bytes());
+    assert_eq!(response(&mut client).1, 0);
+    send(&mut client2, 3, opcode::ACK_LEASE, &lease2.to_le_bytes());
     assert_eq!(response(&mut client2).1, 0);
     assert!(
         service

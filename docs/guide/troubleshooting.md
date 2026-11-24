@@ -216,8 +216,9 @@ There is no `link` method. macOS replies `ENOTSUP` and the volume reports a maxi
 
 ### The mount is not visible, or disappears immediately
 
-The `MountSession` was dropped. It owns the mount and the service; when it goes out of scope the
-volume unmounts. Keep it in a variable or thread that lives for as long as the mount should.
+The `MountSession` was dropped. Drop attempts to unmount and always stops the local service, but
+it cannot guarantee the path unmounts if the platform unmount fails. Keep the session in a
+variable or thread that lives for as long as the mount should.
 
 ## Next
 

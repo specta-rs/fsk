@@ -74,8 +74,9 @@ extension, not in the process that owns the backend.
 4. The Rust process decodes each request, calls the user's `Filesystem`
    implementation, and returns the response. The Swift `FSKVolume` maps the
    portable model onto `FSItem` and `FSVolume` APIs.
-5. Dropping `MountSession` unmounts with `diskutil`, stops the accept loop,
-   closes the socket, and drops outstanding local-file leases.
+5. Dropping `MountSession` attempts to unmount with `diskutil`, always stops
+   the accept loop, closes the socket, and drops outstanding local-file leases.
+   The path can remain mounted if `diskutil` fails.
 
 The extension is sandboxed and uses the `group.dev.specta.fsk` app group to
 reach the socket; it also carries `com.apple.developer.fskit.fsmodule`.
@@ -261,10 +262,13 @@ Peers use the lower of the two minor versions. When an operation needs a newer
 revision, the app passes `minimumMinor` to the Swift connection pool so it fails
 with `protocolTooOld` instead of sending a frame an older SDK cannot decode.
 `ACK_LEASE` requires minor 2 and carries a little-endian `u64` lease ID with an
-empty success response. Swift sends it after installing an OPEN lease, and it
-may use any authenticated pooled connection. At negotiated minors 0 and 1, a
-successful OPEN response write remains the acknowledgement and no ACK is
-expected. Never reuse an opcode number for a different purpose.
+empty success response. Swift must send it on the same connection that created
+the pending OPEN lease, after installing the lease, and keep that connection
+checked out until the ACK completes. An ACK from another connection returns
+`EINVAL` and leaves the lease pending. This ordering prevents ACK from racing
+creator-disconnect cleanup, so pending leases need no timeout. At negotiated
+minors 0 and 1, a successful OPEN response write remains the acknowledgement
+and no ACK is expected. Never reuse an opcode number for a different purpose.
 
 The embedded extension declares the protocol it implements in
 `FSKExtension/Info.plist` as `FSKProtocolMajor` and `FSKProtocolMinor`. The SDK

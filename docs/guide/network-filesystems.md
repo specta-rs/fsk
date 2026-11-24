@@ -100,8 +100,10 @@ the subdirectory is what keeps independent mounts from colliding.
 ## Open and close
 
 A lease starts in `open_file` and ends in `close_file`. Keep the cache entry alive between them.
-On macOS protocol 1.2, Swift acknowledges an installed OPEN with `ACK_LEASE`. Until that ACK,
-the lease is pending and tied to the connection that created it. A failed OPEN response or a
+On macOS protocol 1.2, Swift acknowledges an installed OPEN with `ACK_LEASE` on the same
+connection that created it. Swift must hold that connection until install and ACK complete; an
+ACK from another connection is rejected and leaves the lease pending. This ordering avoids an
+ACK-versus-disconnect race, so pending leases need no timeout. A failed OPEN response or a
 disconnect before ACK releases the pending lease, possibly before Swift opened any local
 descriptor. An acknowledged lease follows the kernel open: it survives transport disconnects,
 and a later `CLOSE` on another authenticated connection releases it. Older peers that negotiate

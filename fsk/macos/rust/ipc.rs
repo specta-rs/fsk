@@ -55,6 +55,7 @@ pub(crate) mod opcode {
     pub const OPEN: u16 = 15;
     pub const CLOSE: u16 = 16;
     /// A little-endian `u64` lease ID; returns an empty success response.
+    /// Must arrive on the connection that created the pending OPEN lease.
     pub const ACK_LEASE: u16 = 17;
 }
 
@@ -90,8 +91,9 @@ pub(crate) struct Service {
     token: [u8; 32],
     raw_mask: RawEventMask,
     /// Acknowledged leases belong to kernel opens and survive reconnects.
-    /// Pending leases retain their creating connection until `ACK_LEASE`, so
-    /// disconnect cleanup can release only opens Swift never acknowledged.
+    /// Pending leases retain their creating connection until that same
+    /// connection sends `ACK_LEASE`, so disconnect cleanup can release only
+    /// opens Swift never acknowledged.
     leases: Mutex<HashMap<u64, Lease>>,
     next_lease: AtomicU64,
     next_connection: AtomicU64,
@@ -408,7 +410,7 @@ impl Service {
                 if !requires_lease_ack {
                     return Err(Error::NOT_SUPPORTED);
                 }
-                self.ack_lease(input.u64()?)?;
+                self.ack_lease(connection_id, input.u64()?)?;
                 Ok(Vec::new())
             }
             opcode::OPEN => self.open(
@@ -461,12 +463,15 @@ impl Service {
         Ok(output.finish())
     }
 
-    fn ack_lease(&self, lease: u64) -> crate::Result<()> {
+    fn ack_lease(&self, connection_id: u64, lease: u64) -> crate::Result<()> {
         if lease == 0 {
             return Ok(());
         }
         let mut leases = self.leases.lock();
         let entry = leases.get_mut(&lease).ok_or(Error::INVALID)?;
+        if entry.pending_connection != Some(connection_id) {
+            return Err(Error::INVALID);
+        }
         entry.pending_connection = None;
         Ok(())
     }

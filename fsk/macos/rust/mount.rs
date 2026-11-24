@@ -32,9 +32,10 @@ pub struct MountOptions {
 
 /// An active `FSKit` mount backed by this process.
 ///
-/// Dropping the value unmounts the path, closes the IPC listener, and removes
-/// its private socket. Keep it alive for as long as the filesystem should be
-/// available.
+/// Dropping the value attempts to unmount the path and always stops the local
+/// IPC service, closes its listener, and removes its private socket. If
+/// `diskutil` fails, the path can remain mounted. Keep the value alive for as
+/// long as the filesystem should be available.
 pub struct MountSession {
     mount_path: PathBuf,
     socket_path: PathBuf,
@@ -113,7 +114,7 @@ impl MountSession {
         &self.mount_path
     }
 
-    /// Explicitly unmount. Calling this is optional; [`Drop`] does the same.
+    /// Explicitly unmount. Calling this is optional; [`Drop`] also attempts it.
     ///
     /// A failed explicit unmount leaves the mount and its service alive so the
     /// caller can retry through the same immutable session binding. In contrast,

@@ -8,8 +8,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- macOS IPC protocol 1.2 adds `ACK_LEASE`, allowing Swift to acknowledge an
-  installed OPEN lease independently of the pooled connection that created it.
+- macOS IPC protocol 1.2 adds `ACK_LEASE`. Swift acknowledges an installed
+  OPEN lease on the connection that created it and holds that connection until
+  the ACK completes, avoiding an ACK-versus-disconnect cleanup race.
 
 ### Changed
 
