@@ -381,6 +381,47 @@ fn another_cache_instance_must_not_evict_a_leased_file() {
 }
 
 #[test]
+fn capacity_cleanup_skips_an_aged_leased_blob() {
+    let directory = tempfile::tempdir().expect("cache directory");
+    let first =
+        Cache::new(directory.path().to_owned(), 4, Duration::from_secs(10)).expect("first cache");
+    let leased_file = FileNode {
+        owner: "o".into(),
+        repo: "r".into(),
+        path: "leased".into(),
+        sha: "leased-sha".into(),
+        size: 4,
+        inline: None,
+    };
+    let other_file = FileNode {
+        path: "other".into(),
+        sha: "other-sha".into(),
+        ..leased_file.clone()
+    };
+    let leased_path = first.path(&leased_file);
+    let other_path = first.path(&other_file);
+    // Write directly so the first cache's own capacity cleanup does not run
+    // before the lease is established.
+    fs::write(&leased_path, b"data").expect("write leased blob");
+    fs::write(&other_path, b"temp").expect("write other blob");
+    let _lease = first.acquire(&leased_file).expect("acquire lease");
+    let old = filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(60));
+    filetime::set_file_mtime(&leased_path, old).expect("age leased blob");
+
+    let _second = Cache::new(directory.path().to_owned(), 4, Duration::from_secs(10))
+        .expect("capacity cleanup while another instance holds a lease");
+
+    assert!(
+        leased_path.is_file(),
+        "capacity cleanup evicted an aged blob held by another cache instance"
+    );
+    assert!(
+        !other_path.exists(),
+        "capacity cleanup did not evict the unleased blob"
+    );
+}
+
+#[test]
 fn startup_cleanup_removes_stale_interrupted_downloads() {
     let directory = tempfile::tempdir().expect("cache directory");
     Cache::new(directory.path().to_owned(), 1024, Duration::from_secs(10)).expect("initial cache");

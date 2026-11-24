@@ -688,7 +688,7 @@ impl Cache {
             Err(error) => return Err(io_error(error)),
         };
         if let Err(error) = fs2::FileExt::try_lock_shared(&file) {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
+            if is_lock_contended(&error) {
                 return Ok(None);
             }
             return Err(io_error(error));
@@ -781,7 +781,7 @@ impl Cache {
             Err(error) => return Err(io_error(error)),
         };
         if let Err(error) = fs2::FileExt::try_lock_exclusive(&file) {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
+            if is_lock_contended(&error) {
                 return Ok(false);
             }
             return Err(io_error(error));
@@ -877,6 +877,10 @@ struct CacheEntry {
     path: PathBuf,
     size: u64,
     accessed: SystemTime,
+}
+
+fn is_lock_contended(error: &std::io::Error) -> bool {
+    error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
 fn touch(path: &Path) -> Result<()> {
