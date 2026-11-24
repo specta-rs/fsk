@@ -1,12 +1,20 @@
 use super::*;
-use std::sync::{Mutex, MutexGuard};
+use tempfile::TempDir;
 
-static CACHE_LOCK: Mutex<()> = Mutex::new(());
-
-fn cache_lock() -> MutexGuard<'static, ()> {
-    CACHE_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+fn test_filesystem(resource: &[u8]) -> (ExampleNetworkFilesystem, TempDir) {
+    let cache = tempfile::tempdir().unwrap();
+    let downloaded = b"This file is read locally.\n".to_vec();
+    let downloaded_path = cache.path().join("downloaded.txt");
+    std::fs::write(&downloaded_path, &downloaded).unwrap();
+    let filesystem = ExampleNetworkFilesystem {
+        remote: resource.to_vec(),
+        downloaded,
+        downloaded_inode: 3,
+        downloaded_path,
+        cache_generation: std::sync::atomic::AtomicU64::new(1),
+        cache_lock: std::sync::Mutex::new(()),
+    };
+    (filesystem, cache)
 }
 
 #[derive(Default)]
@@ -27,8 +35,7 @@ impl DirectorySink for VecSink {
 
 #[test]
 fn audit_writable_open_does_not_lease_a_read_only_local_file() {
-    let _lock = cache_lock();
-    let filesystem = filesystem(b"remote").unwrap();
+    let (filesystem, _cache) = test_filesystem(b"remote");
 
     let opened = filesystem.open_file(3, true).unwrap();
     assert!(
@@ -39,8 +46,7 @@ fn audit_writable_open_does_not_lease_a_read_only_local_file() {
 
 #[test]
 fn audit_local_open_never_leases_a_missing_cache_file() {
-    let _lock = cache_lock();
-    let filesystem = filesystem(b"remote").unwrap();
+    let (filesystem, _cache) = test_filesystem(b"remote");
     let NetworkFile::Local(initial) = filesystem.open_file(3, false).unwrap() else {
         panic!("downloaded file should use a local lease");
     };
@@ -58,8 +64,7 @@ fn audit_local_open_never_leases_a_missing_cache_file() {
 
 #[test]
 fn audit_local_open_detects_and_repairs_stale_cache_bytes() {
-    let _lock = cache_lock();
-    let filesystem = filesystem(b"remote").unwrap();
+    let (filesystem, _cache) = test_filesystem(b"remote");
     let NetworkFile::Local(initial) = filesystem.open_file(3, false).unwrap() else {
         panic!("downloaded file should use a local lease");
     };
@@ -82,8 +87,7 @@ fn audit_local_open_detects_and_repairs_stale_cache_bytes() {
 
 #[test]
 fn audit_open_rejects_unknown_inodes() {
-    let _lock = cache_lock();
-    let filesystem = filesystem(b"remote").unwrap();
+    let (filesystem, _cache) = test_filesystem(b"remote");
 
     assert_eq!(filesystem.open_file(999, false), Err(Error::NOT_FOUND));
     assert_eq!(filesystem.open_file(2, false), Ok(NetworkFile::Remote));
@@ -91,8 +95,7 @@ fn audit_open_rejects_unknown_inodes() {
 
 #[test]
 fn audit_open_rejects_the_root_directory() {
-    let _lock = cache_lock();
-    let filesystem = filesystem(b"remote").unwrap();
+    let (filesystem, _cache) = test_filesystem(b"remote");
 
     assert_eq!(
         filesystem.open_file(ROOT_INODE, false),
@@ -102,8 +105,7 @@ fn audit_open_rejects_the_root_directory() {
 
 #[test]
 fn audit_lookup_rejects_unknown_parents() {
-    let _lock = cache_lock();
-    let filesystem = filesystem(b"remote").unwrap();
+    let (filesystem, _cache) = test_filesystem(b"remote");
 
     assert_eq!(filesystem.lookup(999, b"origin.txt"), Err(Error::NOT_FOUND));
     assert_eq!(
@@ -114,8 +116,7 @@ fn audit_lookup_rejects_unknown_parents() {
 
 #[test]
 fn audit_read_directory_rejects_unknown_inodes() {
-    let _lock = cache_lock();
-    let filesystem = filesystem(b"remote").unwrap();
+    let (filesystem, _cache) = test_filesystem(b"remote");
     let mut sink = VecSink::default();
 
     assert_eq!(
@@ -130,8 +131,7 @@ fn audit_read_directory_rejects_unknown_inodes() {
 
 #[test]
 fn audit_remote_reads_and_directory_pages_match_namespace() {
-    let _lock = cache_lock();
-    let filesystem = filesystem(b"abcdef").unwrap();
+    let (filesystem, _cache) = test_filesystem(b"abcdef");
     assert_eq!(
         filesystem.lookup(ROOT_INODE, b"origin.txt"),
         Ok((2, FileType::File))

@@ -50,14 +50,16 @@ A minimal immutable network filesystem that shows the lease path end to end.
 
 **What it shows.** It implements `NetworkFilesystem: Filesystem` with two files. `origin.txt` is
 served lazily through `read`. `downloaded.txt` is materialized into
-`local_file_directory()/network-backend/downloaded.txt` and returned as
-`NetworkFile::Local(LocalFile::new(path, 1))` for inode `3`. `close_file` is the hook for
-last-access tracking and eviction. The content of `origin.txt` comes from the second CLI
-argument.
+`local_file_directory()/network-backend/downloaded.txt`. Each read-only open checks the cached
+bytes and repairs missing or stale contents before returning
+`NetworkFile::Local(LocalFile::new(path, generation))` for inode `3`. The generation increments
+after a repair so the kernel can invalidate data cached under the previous lease. Writable opens
+stay remote because the downloaded file is immutable. `close_file` is the hook for last-access
+tracking and eviction. The content of `origin.txt` comes from the second CLI argument.
 
-**Storage and consistency.** The "remote" is a byte buffer supplied at startup; the local file is
-written once and never changes. There is no cache eviction because there is only one materialized
-file.
+**Storage and consistency.** The "remote" is a byte buffer supplied at startup. The downloaded
+bytes never change, but the local cache is validated and repaired on read-only opens. There is no
+cache eviction because there is only one materialized file.
 
 ```sh
 cargo run -p fsk-network-backend -- /path/to/mount "Content returned by origin.txt"
@@ -69,8 +71,9 @@ No required environment variables; the second argument is optional and sets the 
 example uses. On Linux the same path resolves to the process temp directory. On Windows
 `open_file` is not consulted; ProjFS hydrates into its own cache.
 
-**What to copy.** The `LocalFile` lease and the `local_file_directory()` subdirectory. Add a real
-eviction policy before using it for a large tree.
+**What to copy.** The `LocalFile` lease, the `local_file_directory()` subdirectory, and the
+generation bump when cached contents change. Add a real eviction policy before using it for a
+large tree.
 
 ## github-filesystem
 
