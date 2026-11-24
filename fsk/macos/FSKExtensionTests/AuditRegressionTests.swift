@@ -5,7 +5,7 @@ import Darwin
 import ObjectiveC
 import XCTest
 
-@Suite("FSK audit regressions")
+@Suite("FSK audit regressions", .serialized)
 struct AuditRegressionTests {
     @Test("local reads honor offsets and partial end-of-file")
     func localReadOffsets() throws {
@@ -87,6 +87,37 @@ struct AuditRegressionTests {
             volume.getAttributes(request, of: item) { attributes = $0; error = $1 }
             #expect(error == nil)
             #expect(attributes?.parentID == .rootDirectory)
+        }
+    }
+
+    @Test("child inode identifiers avoid reserved FSKit values")
+    func childIdentifiersAvoidReservedValues() throws {
+        try withAuditBackend([[
+            auditHello(), auditLocalConfiguration(),
+            auditGetAttributes(auditAttributes(inode: 2, parent: 1)),
+            auditGetAttributes(auditAttributes(inode: 3, parent: 1)),
+            auditGetAttributes(auditAttributes(inode: 0, parent: 1)),
+        ]]) { backend in
+            let volume = FSKVolume(backend: backend)
+            let request = FSItem.GetAttributesRequest()
+            request.wantedAttributes = [.fileID]
+            var first: FSItem.Attributes?
+            var second: FSItem.Attributes?
+            var zero: FSItem.Attributes?
+            var error: Error?
+            volume.getAttributes(request, of: FSKItem(inode: 2, kind: .file)) { first = $0; error = $1 }
+            #expect(error == nil)
+            volume.getAttributes(request, of: FSKItem(inode: 3, kind: .file)) { second = $0; error = $1 }
+            #expect(error == nil)
+            volume.getAttributes(request, of: FSKItem(inode: 0, kind: .file)) { zero = $0; error = $1 }
+            #expect(error == nil)
+            let firstID = try #require(first?.fileID)
+            let secondID = try #require(second?.fileID)
+            let zeroID = try #require(zero?.fileID)
+            #expect(firstID != .rootDirectory)
+            #expect(firstID != .parentOfRoot)
+            #expect(firstID != secondID)
+            #expect(zeroID == .invalid)
         }
     }
 
@@ -233,6 +264,65 @@ struct AuditRegressionTests {
         }
     }
 
+    @Test("a failed reclaim close retains the lease and cache entry")
+    func failedReclaimCloseRetainsState() throws {
+        var inode = Data()
+        auditAppend(UInt64(2), to: &inode)
+        var lookup = Data()
+        auditAppend(UInt64(2), to: &lookup)
+        auditAppend(FSK_KIND_FILE, to: &lookup)
+        var opened = Data()
+        auditAppend(UInt64(7), to: &opened)
+        auditAppend(UInt8(0), to: &opened)
+        auditAppend(UInt64(0), to: &opened)
+        try withAuditBackend([[
+            auditHello(), auditNetworkConfiguration(),
+            .init(opcode: 9, behavior: .respond(body: inode)),
+            .init(opcode: 15, behavior: .respond(body: opened)),
+            .init(opcode: 16, behavior: .respond(status: EIO)),
+            .init(opcode: 5, behavior: .respond(body: lookup)),
+        ]]) { backend in
+            let volume = FSKVolume(backend: backend)
+            var created: FSKItem?
+            volume.createItem(named: FSFileName(string: "file"), type: .file, inDirectory: volume.rootItem, attributes: FSItem.SetAttributesRequest()) { item, _, error in
+                #expect(error == nil)
+                created = item as? FSKItem
+            }
+            let item = try #require(created)
+            var error: Error?
+            volume.openItem(item, modes: [.read]) { error = $0 }
+            #expect(error == nil)
+
+            var reclaimMethod: Method?
+            var originalReclaimIMP: IMP?
+            if #available(macOS 27.0, *) {
+                let method = try #require(class_getInstanceMethod(FSItem.self, NSSelectorFromString("tryReclaimWithBlock:")))
+                reclaimMethod = method
+                let accept: @convention(c) (AnyObject, Selector, @convention(block) () -> Void) -> Bool = { _, _, block in
+                    block()
+                    return true
+                }
+                originalReclaimIMP = method_setImplementation(method, unsafeBitCast(accept, to: IMP.self))
+            }
+            defer {
+                if let reclaimMethod, let originalReclaimIMP {
+                    method_setImplementation(reclaimMethod, originalReclaimIMP)
+                }
+            }
+
+            volume.reclaimItem(item) { error = $0 }
+            #expect(auditPOSIX(error) == EIO)
+            #expect(item.releaseOpenState() == 7)
+
+            var found: FSKItem?
+            volume.lookupItem(named: FSFileName(string: "file"), inDirectory: volume.rootItem) { candidate, _, lookupError in
+                #expect(lookupError == nil)
+                found = candidate as? FSKItem
+            }
+            #expect(found === item)
+        }
+    }
+
     @Test("a non-final directory cookie must advance")
     func rewindingDirectoryCookie() throws {
         let body = auditDirectoryBody(entries: [(inode: 2, next: 0, name: "a")], next: 0, eof: false)
@@ -263,6 +353,28 @@ struct AuditRegressionTests {
     func probeRejectsIncompleteResource() throws {
         let fileSystem = FSKFileSystem()
         let resource = FSGenericURLResource(url: URL(string: "fsk://mount")!)
+        var result: FSProbeResult?
+        var error: Error?
+        fileSystem.probeResource(resource: resource) { result = $0; error = $1 }
+        #expect(result == nil)
+        #expect(error != nil)
+    }
+
+    @Test("probe rejects an FSK URL whose socket path contains NUL")
+    func probeRejectsNULSocketPath() throws {
+        let resource = try auditResource(socketPath: "/tmp/a\0b")
+        let fileSystem = FSKFileSystem()
+        var result: FSProbeResult?
+        var error: Error?
+        fileSystem.probeResource(resource: resource) { result = $0; error = $1 }
+        #expect(result == nil)
+        #expect(error != nil)
+    }
+
+    @Test("probe rejects an FSK URL whose socket path is too long")
+    func probeRejectsOverlongSocketPath() throws {
+        let resource = try auditResource(socketPath: "/" + String(repeating: "a", count: 200))
+        let fileSystem = FSKFileSystem()
         var result: FSProbeResult?
         var error: Error?
         fileSystem.probeResource(resource: resource) { result = $0; error = $1 }
@@ -311,7 +423,10 @@ struct AuditRegressionTests {
         let server = try AuditIPCServer(scripts: scripts)
         server.start()
         defer { server.stop() }
-        let backend = try RustBackend(resourceURL: server.resourceURL)
+        let backend = try RustBackend(
+            resourceURL: server.resourceURL,
+            requestTimeout: auditIPCRequestTimeout
+        )
         let group = DispatchGroup()
         let errors = AuditErrorList()
         for _ in 0..<4 {
@@ -338,7 +453,10 @@ struct AuditRegressionTests {
         ]])
         server.start()
         defer { server.stop() }
-        let backend = try RustBackend(resourceURL: server.resourceURL)
+        let backend = try RustBackend(
+            resourceURL: server.resourceURL,
+            requestTimeout: auditIPCRequestTimeout
+        )
         let finished = DispatchSemaphore(value: 0)
         let box = AuditResultBox()
         DispatchQueue.global(qos: .userInitiated).async {
@@ -361,6 +479,27 @@ struct AuditRegressionTests {
         #expect(box.value != nil)
     }
 
+    @Test("an immediately closed IPC peer fails without waiting for the deadline")
+    func immediatelyClosedIPCRequest() throws {
+        let server = try AuditIPCServer(scripts: [[
+            auditHello(), auditLocalConfiguration(),
+            .init(opcode: 2, behavior: .close),
+        ]])
+        server.start()
+        defer { server.stop() }
+        let backend = try RustBackend(
+            resourceURL: server.resourceURL,
+            requestTimeout: auditIPCRequestTimeout
+        )
+        let start = DispatchTime.now()
+        #expect(throws: RustBackendError.self) {
+            _ = try backend.statfs()
+        }
+        let elapsed = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
+        #expect(elapsed < UInt64(auditIPCRequestTimeout * 800_000_000))
+        try server.wait()
+    }
+
     @Test("a trickling IPC peer cannot exceed the request deadline")
     func tricklingIPCRequest() throws {
         let server = try AuditIPCServer(scripts: [[
@@ -369,7 +508,10 @@ struct AuditRegressionTests {
         ]])
         server.start()
         defer { server.stop() }
-        let backend = try RustBackend(resourceURL: server.resourceURL)
+        let backend = try RustBackend(
+            resourceURL: server.resourceURL,
+            requestTimeout: auditIPCRequestTimeout
+        )
         let finished = DispatchSemaphore(value: 0)
         let box = AuditResultBox()
         DispatchQueue.global(qos: .userInitiated).async {
@@ -394,6 +536,7 @@ struct AuditRegressionTests {
 
     @Test("reclaimItem calls tryReclaim and honors a false result")
     func reclaimHonorsTryReclaim() throws {
+        guard #available(macOS 27.0, *) else { return }
         var lookup = Data()
         auditAppend(UInt64(2), to: &lookup)
         auditAppend(FSK_KIND_FILE, to: &lookup)
@@ -468,6 +611,17 @@ private enum AuditReclaimProbe {
 
 private func auditPOSIX(_ error: Error?) -> Int32? {
     (error as? POSIXError)?.code.rawValue
+}
+
+private func auditResource(socketPath: String) throws -> FSGenericURLResource {
+    var components = URLComponents()
+    components.scheme = "fsk"
+    components.host = "audit"
+    components.queryItems = [
+        URLQueryItem(name: "socket", value: socketPath),
+        URLQueryItem(name: "token", value: String(repeating: "00", count: 32)),
+    ]
+    return FSGenericURLResource(url: try #require(components.url))
 }
 
 private func auditDirectoryBody(entries: [(inode: UInt64, next: UInt64, name: String)], next: UInt64, eof: Bool) -> Data {

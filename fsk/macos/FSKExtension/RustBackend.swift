@@ -9,12 +9,9 @@ let ipcProtocolMajor: UInt16 = 1
 let ipcProtocolMinor: UInt16 = 1
 private let ipcHeaderLength = 24
 private let ipcMaximumFrame = 16 * 1024 * 1024
+// Two UInt64s, one UInt32, one UInt16, and one UInt8 on the wire.
+private let ipcDirectoryEntryWireSize = 23
 let fskDirectoryCookieBias: UInt64 = 2
-#if DEBUG
-private let ipcRequestTimeout: TimeInterval = 0.25
-#else
-private let ipcRequestTimeout: TimeInterval = 30
-#endif
 
 private enum IPCOperation: UInt16 {
     case hello = 0
@@ -169,6 +166,8 @@ struct RustOpenFile: Sendable {
 /// A pooled client for one Rust process. Each checked-out connection processes
 /// one request at a time, while independent FSKit callbacks run in parallel.
 final class RustBackend: @unchecked Sendable {
+    static let defaultRequestTimeout: TimeInterval = 30
+
     private let pool: IPCConnectionPool
     let configuration: RustBackendConfiguration
 
@@ -176,9 +175,15 @@ final class RustBackend: @unchecked Sendable {
         (try? resourceParameters(resourceURL)) != nil
     }
 
-    init(resourceURL: URL) throws {
+    init(
+        resourceURL: URL,
+        requestTimeout: TimeInterval = RustBackend.defaultRequestTimeout
+    ) throws {
+        guard requestTimeout.isFinite, requestTimeout > 0 else {
+            throw RustBackendError.posix(EINVAL)
+        }
         let (socketPath, token) = try Self.resourceParameters(resourceURL)
-        pool = IPCConnectionPool(socketPath: socketPath, token: token)
+        pool = IPCConnectionPool(socketPath: socketPath, token: token, requestTimeout: requestTimeout)
         let response = try pool.request(.configuration)
         var decoder = IPCDecoder(response)
         configuration = RustBackendConfiguration(
@@ -200,6 +205,7 @@ final class RustBackend: @unchecked Sendable {
         else {
             throw RustBackendError.invalidResource
         }
+        _ = try unixSocketPathBytes(socketPath)
         return (socketPath, token)
     }
 
@@ -263,6 +269,9 @@ final class RustBackend: @unchecked Sendable {
         let eof = try decoder.uint8() != 0
         let entryCount = Int(try decoder.uint32())
         let nameCount = Int(try decoder.uint32())
+        guard entryCount <= decoder.remainingCount / ipcDirectoryEntryWireSize else {
+            throw RustBackendError.invalidProtocol
+        }
         var entries = [FSKDirEntry]()
         entries.reserveCapacity(entryCount)
         for _ in 0..<entryCount {
@@ -432,14 +441,16 @@ private func decodeAttributes(_ data: Data) throws -> FSKAttributes {
 private final class IPCConnectionPool: @unchecked Sendable {
     private let socketPath: String
     private let token: Data
+    private let requestTimeout: TimeInterval
     private let condition = NSCondition()
     private var idle = [IPCConnection]()
     private var connectionCount = 0
     private let maximumConnections = max(4, min(32, ProcessInfo.processInfo.activeProcessorCount))
 
-    init(socketPath: String, token: Data) {
+    init(socketPath: String, token: Data, requestTimeout: TimeInterval) {
         self.socketPath = socketPath
         self.token = token
+        self.requestTimeout = requestTimeout
     }
 
     /// Send a request. `minimumMinor` is the protocol revision the operation
@@ -471,7 +482,11 @@ private final class IPCConnectionPool: @unchecked Sendable {
                 connectionCount += 1
                 condition.unlock()
                 do {
-                    return try IPCConnection(socketPath: socketPath, token: token)
+                    return try IPCConnection(
+                        socketPath: socketPath,
+                        token: token,
+                        requestTimeout: requestTimeout
+                    )
                 } catch {
                     condition.lock()
                     connectionCount -= 1
@@ -498,16 +513,18 @@ private final class IPCConnectionPool: @unchecked Sendable {
 
 private final class IPCConnection {
     private var descriptor: Int32
+    private let requestTimeout: TimeInterval
     private var nextRequestID: UInt64 = 2
     /// Protocol revision agreed during `hello`: the lower of the two sides.
     private(set) var negotiatedMinor: UInt16 = 0
 
-    init(socketPath: String, token: Data) throws {
+    init(socketPath: String, token: Data, requestTimeout: TimeInterval) throws {
+        self.requestTimeout = requestTimeout
         descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw RustBackendError.posix(errno) }
         do {
-            let seconds = Int(ipcRequestTimeout)
-            let microseconds = Int((ipcRequestTimeout - TimeInterval(seconds)) * 1_000_000)
+            let seconds = Int(requestTimeout)
+            let microseconds = Int((requestTimeout - TimeInterval(seconds)) * 1_000_000)
             var timeout = timeval(tv_sec: seconds, tv_usec: Int32(microseconds))
             for option in [SO_RCVTIMEO, SO_SNDTIMEO] {
                 guard setsockopt(
@@ -569,7 +586,7 @@ private final class IPCConnection {
         header.append(UInt32(body.count))
         header.append(ipcProtocolMinor)
         header.append(UInt16(0))
-        let deadline = DispatchTime.now() + ipcRequestTimeout
+        let deadline = DispatchTime.now() + requestTimeout
         try writePair(header.data, body, deadline: deadline)
 
         let responseHeader = try readExactly(ipcHeaderLength, deadline: deadline)
@@ -700,12 +717,30 @@ private final class IPCConnection {
             }
             guard result > 0 else { throw RustBackendError.posix(ETIMEDOUT) }
             if descriptor.revents & events != 0 { return }
+            if descriptor.revents & Int16(POLLHUP) != 0 {
+                throw RustBackendError.posix(ECONNRESET)
+            }
             if descriptor.revents & Int16(POLLERR | POLLNVAL) != 0 { return }
         }
     }
 }
 
 func unixSocketAddress(path: String) throws -> (sockaddr_un, socklen_t) {
+    let bytes = try unixSocketPathBytes(path)
+    let pathOffset = MemoryLayout<sockaddr_un>.offset(of: \.sun_path)!
+    let length = pathOffset + bytes.count - 1
+    var address = sockaddr_un()
+    address.sun_len = UInt8(length)
+    address.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &address) { destination in
+        bytes.withUnsafeBytes { source in
+            destination[pathOffset..<(pathOffset + bytes.count)].copyBytes(from: source)
+        }
+    }
+    return (address, socklen_t(length))
+}
+
+private func unixSocketPathBytes(_ path: String) throws -> [CChar] {
     guard !path.utf8.contains(0) else { throw RustBackendError.posix(EINVAL) }
     let bytes = Array(path.utf8CString)
     let pathOffset = MemoryLayout<sockaddr_un>.offset(of: \.sun_path)!
@@ -716,16 +751,7 @@ func unixSocketAddress(path: String) throws -> (sockaddr_un, socklen_t) {
     guard length <= UInt8.max else {
         throw RustBackendError.posix(ENAMETOOLONG)
     }
-
-    var address = sockaddr_un()
-    address.sun_len = UInt8(length)
-    address.sun_family = sa_family_t(AF_UNIX)
-    withUnsafeMutableBytes(of: &address) { destination in
-        bytes.withUnsafeBytes { source in
-            destination[pathOffset..<(pathOffset + bytes.count)].copyBytes(from: source)
-        }
-    }
-    return (address, socklen_t(length))
+    return bytes
 }
 
 private struct IPCEncoder {
@@ -749,6 +775,8 @@ private struct IPCEncoder {
 private struct IPCDecoder {
     private let data: Data
     private var offset = 0
+
+    var remainingCount: Int { data.count - offset }
 
     init(_ data: Data) {
         self.data = data

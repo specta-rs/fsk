@@ -216,11 +216,10 @@ private func withIPCPeer(
     client: @escaping @Sendable (RustBackend) throws -> Void
 ) async throws {
     let uniqueDirectory = "fsk-\(UUID().uuidString.prefix(8))"
-    let relativeDirectory = "audit/tmp/\(uniqueDirectory)"
     let directory = auditTemporaryDirectory().appending(path: uniqueDirectory)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
     defer { try? FileManager.default.removeItem(at: directory) }
-    let path = "\(relativeDirectory)/ipc"
+    let path = directory.appending(path: "ipc").path
     var (address, length) = try unixSocketAddress(path: path)
     let listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
     try #require(listener >= 0)

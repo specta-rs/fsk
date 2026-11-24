@@ -1,10 +1,16 @@
 import Foundation
 // FSKit volume operations.
 import FSKit
+import ObjectiveC
 import os
 
 private let rootInode: UInt64 = 1
 private let directoryCookieBias: UInt64 = fskDirectoryCookieBias
+private typealias FSKTryReclaimIMP = @convention(c) (
+    FSItem,
+    Selector,
+    @convention(block) () -> Void
+) -> Bool
 
 private final class FSKItemCache: @unchecked Sendable {
     var items: [UInt64: FSKItem] = [:]
@@ -212,32 +218,27 @@ final class FSKVolume: FSVolume,
         }
         let reclaimError = OSAllocatedUnfairLock<Error?>(initialState: nil)
         let wasReclaimed = itemCache.withLock { cache -> Bool in
-            if #available(macOS 27.0, *) {
-                let cachedItems = cache
-                return item.tryReclaim { [self] in
-                    if item.inode != rootInode {
-                        cachedItems.items.removeValue(forKey: item.inode)
-                    }
-                    do {
-                        if let lease = item.releaseOpenState() {
-                            try self.backend.close(lease: lease)
-                        }
-                    } catch {
-                        reclaimError.withLockUnchecked { $0 = self.posix(error) }
-                    }
+            let cleanup: () -> Void = { [self] in
+                do {
+                    try closeOpenState(of: item)
+                } catch {
+                    reclaimError.withLockUnchecked { $0 = posix(error) }
                 }
             }
-            if item.inode != rootInode {
+            let accepted: Bool
+            if #available(macOS 27.0, *) {
+                accepted = tryReclaim(item, block: cleanup)
+            } else {
+                cleanup()
+                accepted = true
+            }
+            if accepted,
+               reclaimError.withLock({ $0 }) == nil,
+               item.inode != rootInode
+            {
                 cache.items.removeValue(forKey: item.inode)
             }
-            do {
-                if let lease = item.releaseOpenState() {
-                    try backend.close(lease: lease)
-                }
-            } catch {
-                reclaimError.withLockUnchecked { $0 = posix(error) }
-            }
-            return true
+            return accepted
         }
         let error = reclaimError.withLock { $0 }
         replyHandler(wasReclaimed ? error : nil)
@@ -563,6 +564,16 @@ final class FSKVolume: FSVolume,
         }
     }
 
+    private func tryReclaim(_ item: FSItem, block: @escaping () -> Void) -> Bool {
+        let selector = NSSelectorFromString("tryReclaimWithBlock:")
+        guard let method = class_getInstanceMethod(FSItem.self, selector) else {
+            return false
+        }
+        let implementation = unsafeBitCast(method_getImplementation(method), to: FSKTryReclaimIMP.self)
+        let reclaimBlock: @convention(block) () -> Void = block
+        return implementation(item, selector, reclaimBlock)
+    }
+
     private func cachedItem(inode: UInt64, kind: FSItem.ItemType) -> FSKItem {
         itemCache.withLock { cache in
             if let existing = cache.items[inode] {
@@ -606,7 +617,13 @@ final class FSKVolume: FSVolume,
     }
 
     private func itemIdentifier(_ inode: UInt64) -> FSItem.Identifier {
-        inode == rootInode ? .rootDirectory : (FSItem.Identifier(rawValue: inode) ?? .invalid)
+        guard inode != rootInode else { return .rootDirectory }
+        guard inode != 0 else { return .invalid }
+        let (rawValue, overflow) = inode.addingReportingOverflow(1)
+        guard !overflow, let identifier = FSItem.Identifier(rawValue: rawValue) else {
+            return .invalid
+        }
+        return identifier
     }
 
     private func itemType(_ kind: UInt8) -> FSItem.ItemType {

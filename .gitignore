@@ -5,3 +5,9 @@ target/
 *.xcuserstate
 xcuserdata/
 
+/audit/bin/
+/audit/home/
+/audit/logs/
+/audit/swift-cache/
+/audit/test-sandbox.sb
+/audit/tmp/

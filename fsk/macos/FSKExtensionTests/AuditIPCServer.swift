@@ -18,10 +18,11 @@ struct AuditIPCScript: Sendable {
     var expectedRequestBody: Data? = nil
 }
 
+let auditIPCRequestTimeout: TimeInterval = 0.25
+
 /// Deterministic loopback-only FSKit IPC peer used by the audit regressions.
 final class AuditIPCServer: @unchecked Sendable {
     private let listener: Int32
-    private let socketURL: URL
     private let socketPath: String
     private let directory: URL
     private let scripts: [[AuditIPCScript]]
@@ -30,18 +31,17 @@ final class AuditIPCServer: @unchecked Sendable {
     private let done = DispatchSemaphore(value: 0)
     private var scriptsSignaled = false
     private var stopping = false
+    private var listenerClosed = false
     private var peers = Set<Int32>()
     private var failures: [String] = []
     private var completedConnections = 0
 
     init(scripts: [[AuditIPCScript]]) throws {
         self.scripts = scripts
-        let uniqueDirectory = "fsk-audit-\(UUID().uuidString)"
-        let relativeDirectory = "audit/tmp/\(uniqueDirectory)"
+        let uniqueDirectory = "fsk-\(UUID().uuidString.prefix(8))"
         directory = auditTemporaryDirectory().appending(path: uniqueDirectory)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-        socketPath = "\(relativeDirectory)/ipc.sock"
-        socketURL = directory.appending(path: "ipc.sock")
+        socketPath = directory.appending(path: "ipc.sock").path
         var (address, length) = try unixSocketAddress(path: socketPath)
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
@@ -63,7 +63,7 @@ final class AuditIPCServer: @unchecked Sendable {
         }
     }
 
-    deinit { Darwin.close(listener) }
+    deinit { closeListener() }
 
     var resourceURL: URL {
         get throws {
@@ -93,7 +93,11 @@ final class AuditIPCServer: @unchecked Sendable {
         let currentPeers = Array(peers)
         lock.unlock()
         for peer in currentPeers { Darwin.shutdown(peer, SHUT_RDWR) }
-        _ = Darwin.connect(listener, nil, 0)
+        let wake = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        if wake >= 0 {
+            _ = Darwin.connect(wake, nil, 0)
+            Darwin.close(wake)
+        }
         _ = done.wait(timeout: .now() + 3)
     }
 
@@ -114,7 +118,7 @@ final class AuditIPCServer: @unchecked Sendable {
     private func run() {
         defer {
             signalScriptsDone()
-            Darwin.close(listener)
+            closeListener()
             try? FileManager.default.removeItem(at: directory)
             done.signal()
         }
@@ -171,6 +175,17 @@ final class AuditIPCServer: @unchecked Sendable {
         lock.unlock()
     }
 
+    private func closeListener() {
+        lock.lock()
+        guard !listenerClosed else {
+            lock.unlock()
+            return
+        }
+        listenerClosed = true
+        lock.unlock()
+        Darwin.close(listener)
+    }
+
     private func serve(_ peer: Int32, script: [AuditIPCScript]) throws {
         var timeout = timeval(tv_sec: 2, tv_usec: 0)
         guard setsockopt(peer, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)) == 0 else {
@@ -225,6 +240,10 @@ final class AuditIPCServer: @unchecked Sendable {
                     }
                 }
             case .close:
+                lock.lock()
+                peers.remove(peer)
+                lock.unlock()
+                Darwin.close(peer)
                 return
             case .hang:
                 while true {
@@ -243,7 +262,12 @@ final class AuditIPCServer: @unchecked Sendable {
 
 func auditTemporaryDirectory() -> URL {
     let path = ProcessInfo.processInfo.environment["FSK_AUDIT_TMP"] ?? NSTemporaryDirectory()
-    return URL(fileURLWithPath: path, isDirectory: true)
+    if path.hasPrefix("/") {
+        return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+    }
+    return URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        .appending(path: path)
+        .standardizedFileURL
 }
 
 func withAuditBackend(
@@ -254,7 +278,10 @@ func withAuditBackend(
     let server = try AuditIPCServer(scripts: script)
     server.start()
     defer { server.stop() }
-    let backend = try RustBackend(resourceURL: server.resourceURL)
+    let backend = try RustBackend(
+        resourceURL: server.resourceURL,
+        requestTimeout: auditIPCRequestTimeout
+    )
     try body(backend)
     if requireComplete { try server.wait() }
 }

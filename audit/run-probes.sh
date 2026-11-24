@@ -39,7 +39,7 @@ EOF
   "$AUDIT/ProbeRunner.swift"
 
 rc=0
-for mode in readdir-name-bounds write-count-overflow readlink-capacity; do
+for mode in readdir-entry-count readdir-name-bounds write-count-overflow readlink-capacity; do
   printf '\n=== %s ===\n' "$mode"
   set +e
   (

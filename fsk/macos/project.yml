@@ -70,6 +70,8 @@ targets:
         buildPhase: sources
       - path: FSKExtension/FSKVolume.swift
         buildPhase: sources
+      - path: FSKExtension/FSKFileSystem.swift
+        buildPhase: sources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.specta.fsk.tests
