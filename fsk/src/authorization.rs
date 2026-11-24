@@ -276,10 +276,15 @@ mod imp {
     }
 
     fn available_at(path: &Path) -> bool {
-        fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
+        available_with(path, open_device)
+    }
+
+    fn open_device(path: &Path) -> io::Result<fs::File> {
+        fs::OpenOptions::new().read(true).write(true).open(path)
+    }
+
+    fn available_with(path: &Path, open: impl FnOnce(&Path) -> io::Result<fs::File>) -> bool {
+        open(path)
             .and_then(|file| file.metadata())
             .is_ok_and(|metadata| metadata.file_type().is_char_device())
     }
@@ -296,19 +301,13 @@ mod imp {
         use super::*;
 
         #[test]
-        fn authorization_requires_device_open_not_just_metadata() {
-            let path = Path::new("/dev/tty");
-            assert!(fs::metadata(path).unwrap().file_type().is_char_device());
+        fn authorization_requires_an_openable_character_device() {
+            let path = Path::new("/dev/null");
+            assert!(available_with(path, open_device));
             assert!(
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(path)
-                    .is_err(),
-                "this regression expects the headless runner to have no controlling tty"
-            );
-            assert!(
-                !available_at(path),
+                !available_with(path, |_| {
+                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+                }),
                 "an unopenable character device must not report Authorized"
             );
         }

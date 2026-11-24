@@ -263,6 +263,7 @@ struct RawRecord {
 #[derive(Default)]
 struct State {
     created: Vec<(u64, FileType, u32)>,
+    removed: Vec<(u64, Vec<u8>, u64)>,
     opens: Vec<(u64, bool)>,
     closes: Vec<(u64, NetworkFile)>,
     renames: Vec<Option<u64>>,
@@ -354,6 +355,21 @@ impl Filesystem for AuditFilesystem {
         let inode = 100 + state.created.len() as u64;
         state.created.push((inode, kind, mode));
         Ok(inode)
+    }
+
+    fn remove(&self, parent: u64, name: &[u8], inode: u64) -> crate::Result<()> {
+        if parent != ROOT_INODE {
+            return Err(Error::NOT_A_DIRECTORY);
+        }
+        let mut state = self.state.lock();
+        let index = state
+            .created
+            .iter()
+            .position(|(created, _, _)| *created == inode)
+            .ok_or(Error::NOT_FOUND)?;
+        state.created.remove(index);
+        state.removed.push((parent, name.to_vec(), inode));
+        Ok(())
     }
 
     fn rename(
@@ -621,6 +637,8 @@ fn network_create_local_open_failure_releases_the_lease() {
     let state = filesystem.state.lock();
     assert_eq!(state.opens, vec![(100, false)]);
     assert_eq!(state.closes.len(), 1);
+    assert_eq!(state.created, Vec::<(u64, FileType, u32)>::new());
+    assert_eq!(state.removed, vec![(ROOT_INODE, b"new".to_vec(), 100)]);
     drop(state);
     peer.stop();
 }

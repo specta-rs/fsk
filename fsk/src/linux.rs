@@ -780,6 +780,13 @@ impl fuser::Filesystem for FuseAdapter {
                         match self.register_network_file(attr.ino.0, OpenFlags(flags)) {
                             Ok(handle) => handle,
                             Err(error) => {
+                                // The kernel will treat create as failed, so roll back
+                                // the backend entry without replacing the open error.
+                                let _ = self.backend.filesystem().remove(
+                                    parent.0,
+                                    name.as_bytes(),
+                                    attr.ino.0,
+                                );
                                 reply.error(errno(error));
                                 return;
                             }
