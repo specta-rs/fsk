@@ -2,13 +2,21 @@ use fsk::{
     DirectoryEntry, DirectorySink, Error, FileType, Filesystem, LocalFile, Metadata, NetworkFile,
     NetworkFilesystem, ROOT_INODE, ReadDirectoryResult, Result, StatFs,
 };
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 pub struct ExampleNetworkFilesystem {
     remote: Vec<u8>,
     downloaded: Vec<u8>,
     downloaded_inode: u64,
     downloaded_path: PathBuf,
+    cache_generation: AtomicU64,
+    cache_lock: Mutex<()>,
 }
 
 impl Filesystem for ExampleNetworkFilesystem {
@@ -59,7 +67,10 @@ impl Filesystem for ExampleNetworkFilesystem {
 
     fn lookup(&self, parent: u64, name: &[u8]) -> Result<(u64, FileType)> {
         if parent != ROOT_INODE {
-            return Err(Error(20));
+            return match self.metadata(parent)?.kind {
+                FileType::Directory => Err(Error::INVALID),
+                FileType::File | FileType::Symlink => Err(Error::NOT_A_DIRECTORY),
+            };
         }
         match name {
             b"origin.txt" => Ok((2, FileType::File)),
@@ -76,7 +87,10 @@ impl Filesystem for ExampleNetworkFilesystem {
         sink: &mut dyn DirectorySink,
     ) -> Result<ReadDirectoryResult> {
         if inode != ROOT_INODE {
-            return Err(Error(20));
+            return match self.metadata(inode)?.kind {
+                FileType::Directory => Err(Error::INVALID),
+                FileType::File | FileType::Symlink => Err(Error::NOT_A_DIRECTORY),
+            };
         }
         let entries: &[(&[u8], u64)] = &[(b"origin.txt", 2), (b"downloaded.txt", 3)];
         let start = usize::try_from(cookie).map_err(|_| Error::INVALID)?;
@@ -118,14 +132,32 @@ impl Filesystem for ExampleNetworkFilesystem {
 }
 
 impl NetworkFilesystem for ExampleNetworkFilesystem {
-    fn open_file(&self, inode: u64, _writable: bool) -> Result<NetworkFile> {
+    fn open_file(&self, inode: u64, writable: bool) -> Result<NetworkFile> {
         if inode == self.downloaded_inode {
+            if writable {
+                return Ok(NetworkFile::Remote);
+            }
+            let _cache = self
+                .cache_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let current = std::fs::read(&self.downloaded_path)
+                .is_ok_and(|bytes| bytes.as_slice() == self.downloaded.as_slice());
+            if !current {
+                std::fs::write(&self.downloaded_path, &self.downloaded)
+                    .map_err(|error| io_error(&error))?;
+                self.cache_generation.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(NetworkFile::Local(LocalFile::new(
                 self.downloaded_path.clone(),
-                1,
+                self.cache_generation.load(Ordering::Relaxed),
             )));
         }
-        Ok(NetworkFile::Remote)
+        match self.metadata(inode)?.kind {
+            FileType::File => Ok(NetworkFile::Remote),
+            FileType::Directory => Err(Error::IS_A_DIRECTORY),
+            FileType::Symlink => Err(Error::INVALID),
+        }
     }
 
     fn close_file(&self, _inode: u64, _file: NetworkFile) -> Result<()> {
@@ -157,9 +189,15 @@ pub fn filesystem(resource: &[u8]) -> Result<ExampleNetworkFilesystem> {
         downloaded,
         downloaded_inode: 3,
         downloaded_path,
+        cache_generation: AtomicU64::new(1),
+        cache_lock: Mutex::new(()),
     })
 }
 
 fn io_error(error: &std::io::Error) -> Error {
     Error(error.raw_os_error().unwrap_or(5))
 }
+
+#[cfg(test)]
+#[path = "../tests/fs/mod.rs"]
+mod tests;
