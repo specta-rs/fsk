@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## Unreleased
 
+### Added
+
+- macOS IPC protocol 1.2 adds `ACK_LEASE`, allowing Swift to acknowledge an
+  installed OPEN lease independently of the pooled connection that created it.
+
 ### Changed
 
 - macOS `MountSession::unmount` now borrows the session immutably. A failed
@@ -15,11 +20,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- macOS network-file leases now follow the kernel open rather than an IPC
-  connection. Transport disconnects preserve the local file until a later
-  `CLOSE`, including one sent over another pooled connection.
-- A failed macOS OPEN response now releases only its pending network-file
-  lease, without affecting leases whose responses were written successfully.
+- macOS network-file leases acknowledged with `ACK_LEASE` now follow the
+  kernel open and survive transport disconnects until a later `CLOSE`. If an
+  OPEN response fails or its creating connection disconnects before ACK, the
+  pending lease is released; `close_file` can therefore run before Swift ever
+  opened a local descriptor. Peers negotiating minor 0 or 1 retain successful
+  OPEN response writes as acknowledgement.
 
 ## 0.2.0 - 2026-11-12
 

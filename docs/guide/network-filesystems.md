@@ -73,8 +73,9 @@ hands the adapter a fully materialized file, and reads of that file bypass your 
   adapter forwards it to the kernel so cached data can be invalidated. Bump it whenever you
   rewrite the file, including after re-downloading the same path.
 
-The adapter never deletes or evicts a leased file. It only tells you when the kernel is done
-with it.
+The adapter never deletes or evicts a leased file. `close_file` normally means the kernel is
+done with it, but macOS can also call it for an OPEN whose response failed or was never
+acknowledged. No Swift local descriptor existed in that case.
 
 ## Where local files may live
 
@@ -98,7 +99,14 @@ the subdirectory is what keeps independent mounts from colliding.
 
 ## Open and close
 
-A lease starts in `open_file` and ends in `close_file`. Keep the cache entry alive between them:
+A lease starts in `open_file` and ends in `close_file`. Keep the cache entry alive between them.
+On macOS protocol 1.2, Swift acknowledges an installed OPEN with `ACK_LEASE`. Until that ACK,
+the lease is pending and tied to the connection that created it. A failed OPEN response or a
+disconnect before ACK releases the pending lease, possibly before Swift opened any local
+descriptor. An acknowledged lease follows the kernel open: it survives transport disconnects,
+and a later `CLOSE` on another authenticated connection releases it. Older peers that negotiate
+minor 0 or 1 keep the legacy behavior where a successful OPEN response write acknowledges the
+lease without an ACK.
 
 ```rust
 use fsk::{
@@ -146,8 +154,9 @@ impl NetworkFilesystem for Drive {
     }
 
     fn close_file(&self, inode: u64, _file: NetworkFile) -> Result<()> {
-        // The kernel has closed its descriptor. Record the activity here and
-        // schedule eviction from a worker rather than deleting on this call:
+        // Usually the kernel has closed its descriptor. An unacknowledged
+        // macOS OPEN can also reach this hook without a Swift descriptor.
+        // Record activity and schedule eviction rather than deleting here:
         // another open may share the same path.
         if let Some(cached) = self.cache.lock().unwrap().get_mut(&inode) {
             cached.last_used = std::time::Instant::now();

@@ -124,9 +124,11 @@ impl LocalFile {
     ///
     /// The path must remain readable until the matching
     /// [`NetworkFilesystem::close_file`] call completes and must be valid UTF-8
-    /// for Foundation to open it. On macOS the path must also be inside the
-    /// sandboxed extension's App Group; use [`local_file_directory`] to find a
-    /// suitable directory.
+    /// for Foundation to open it. On macOS, `close_file` can also run for an
+    /// OPEN whose response failed or was never acknowledged, before Swift
+    /// opened a local descriptor. The path must also be inside the sandboxed
+    /// extension's App Group; use [`local_file_directory`] to find a suitable
+    /// directory.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>, generation: u64) -> Self {
         Self {
@@ -178,8 +180,11 @@ pub enum NetworkFile {
 /// [`Filesystem::read`]. Return [`NetworkFile::Remote`] to keep reads flowing
 /// through the backend.
 ///
-/// Ownership of cached files stays with the backend. The adapter only calls
-/// [`close_file`](Self::close_file) when the kernel is done with a lease.
+/// Ownership of cached files stays with the backend. The adapter calls
+/// [`close_file`](Self::close_file) when the kernel is done with a lease. It can
+/// also call `close_file` for a macOS OPEN whose response failed or whose
+/// connection disconnected before Swift acknowledged the installed lease; in
+/// that case no Swift local descriptor ever existed.
 ///
 /// See the [crate documentation](crate#defining-a-network-filesystem) for an
 /// example.
@@ -210,10 +215,13 @@ pub trait NetworkFilesystem: Filesystem {
         Ok(NetworkFile::Remote)
     }
 
-    /// Releases a file lease after Swift has closed any local descriptor.
+    /// Releases a file lease.
     ///
-    /// This is a suitable point to update last-access state or schedule cache
-    /// cleanup. The default implementation is a no-op.
+    /// This usually runs after Swift has closed any local descriptor. On macOS
+    /// it can also run when an OPEN response was not delivered or was never
+    /// acknowledged, so no Swift local descriptor may have existed. This is a
+    /// suitable point to update last-access state or schedule cache cleanup.
+    /// The default implementation is a no-op.
     ///
     /// # Errors
     ///

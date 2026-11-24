@@ -30,7 +30,9 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// reserved bytes. Peers use the lower of the two advertised minor versions, so
 /// an old app keeps working with a new SDK and vice versa. Bump it whenever an
 /// opcode or field is added.
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 2;
+/// Revision that adds explicit acknowledgement for installed OPEN leases.
+pub(crate) const LEASE_ACK_MINOR: u16 = 2;
 pub(crate) const HEADER_LEN: usize = 24;
 pub(crate) const MAX_FRAME: usize = 16 * 1024 * 1024;
 
@@ -52,6 +54,8 @@ pub(crate) mod opcode {
     pub const SYNC: u16 = 14;
     pub const OPEN: u16 = 15;
     pub const CLOSE: u16 = 16;
+    /// A little-endian `u64` lease ID; returns an empty success response.
+    pub const ACK_LEASE: u16 = 17;
 }
 
 pub(crate) enum ServiceBackend {
@@ -75,15 +79,22 @@ impl ServiceBackend {
     }
 }
 
+struct Lease {
+    inode: u64,
+    file: NetworkFile,
+    pending_connection: Option<u64>,
+}
+
 pub(crate) struct Service {
     backend: ServiceBackend,
     token: [u8; 32],
     raw_mask: RawEventMask,
-    /// Leases belong to kernel opens, not IPC connections. Swift can keep
-    /// reading a local descriptor after reconnect and send `CLOSE` over any
-    /// pooled connection, so only `CLOSE` or service teardown releases them.
-    leases: Mutex<HashMap<u64, (u64, NetworkFile)>>,
+    /// Acknowledged leases belong to kernel opens and survive reconnects.
+    /// Pending leases retain their creating connection until `ACK_LEASE`, so
+    /// disconnect cleanup can release only opens Swift never acknowledged.
+    leases: Mutex<HashMap<u64, Lease>>,
     next_lease: AtomicU64,
+    next_connection: AtomicU64,
 }
 
 impl Service {
@@ -95,6 +106,7 @@ impl Service {
             raw_mask,
             leases: Mutex::new(HashMap::new()),
             next_lease: AtomicU64::new(1),
+            next_connection: AtomicU64::new(1),
         }
     }
 
@@ -106,11 +118,17 @@ impl Service {
             raw_mask,
             leases: Mutex::new(HashMap::new()),
             next_lease: AtomicU64::new(1),
+            next_connection: AtomicU64::new(1),
         }
     }
 
     pub(crate) fn serve_connection(&self, mut stream: UnixStream) -> io::Result<()> {
         stream.set_nonblocking(false)?;
+        let connection_id = self.next_connection.fetch_add(1, Ordering::Relaxed).max(1);
+        let _connection_cleanup = ConnectionCleanup {
+            service: self,
+            connection_id,
+        };
         let request = Request::read(&mut stream)?;
         if request.major != PROTOCOL_MAJOR {
             write_response(&mut stream, request.id, PROTOCOL_MINOR, libc::EPROTO, &[])?;
@@ -126,6 +144,7 @@ impl Service {
         // The app and the SDK each advertise the newest revision they
         // understand; both then restrict themselves to the lower one.
         let negotiated_minor = request.minor.min(PROTOCOL_MINOR);
+        let requires_lease_ack = negotiated_minor >= LEASE_ACK_MINOR;
         write_response(&mut stream, request.id, negotiated_minor, 0, &[])?;
 
         loop {
@@ -150,7 +169,13 @@ impl Service {
                 return Err(protocol_mismatch(request.major, request.minor));
             }
             let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.dispatch(request.id, request.operation, &request.payload)
+                self.dispatch_for_connection(
+                    connection_id,
+                    requires_lease_ack,
+                    request.id,
+                    request.operation,
+                    &request.payload,
+                )
             }))
             .unwrap_or(Err(Error::IO));
             let mut pending_cleanup = if request.operation == opcode::OPEN {
@@ -185,8 +210,20 @@ impl Service {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     fn dispatch(&self, request_id: u64, operation: u16, payload: &[u8]) -> crate::Result<Vec<u8>> {
+        self.dispatch_for_connection(0, false, request_id, operation, payload)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn dispatch_for_connection(
+        &self,
+        connection_id: u64,
+        requires_lease_ack: bool,
+        request_id: u64,
+        operation: u16,
+        payload: &[u8],
+    ) -> crate::Result<Vec<u8>> {
         let fs = self.backend.filesystem();
         if let Some(raw_operation) = raw_operation(operation)
             && self.raw_mask.contains(raw_operation)
@@ -367,7 +404,19 @@ impl Service {
                 fs.synchronize()?;
                 Ok(Vec::new())
             }
-            opcode::OPEN => self.open(input.u64()?, input.u8()? != 0),
+            opcode::ACK_LEASE => {
+                if !requires_lease_ack {
+                    return Err(Error::NOT_SUPPORTED);
+                }
+                self.ack_lease(input.u64()?)?;
+                Ok(Vec::new())
+            }
+            opcode::OPEN => self.open(
+                connection_id,
+                requires_lease_ack,
+                input.u64()?,
+                input.u8()? != 0,
+            ),
             opcode::CLOSE => {
                 self.close(input.u64()?)?;
                 Ok(Vec::new())
@@ -376,7 +425,13 @@ impl Service {
         }
     }
 
-    fn open(&self, inode: u64, writable: bool) -> crate::Result<Vec<u8>> {
+    fn open(
+        &self,
+        connection_id: u64,
+        requires_lease_ack: bool,
+        inode: u64,
+        writable: bool,
+    ) -> crate::Result<Vec<u8>> {
         let Some(network) = self.backend.network() else {
             return Ok(vec![0; 17]);
         };
@@ -395,8 +450,25 @@ impl Service {
                 output.bytes(local.path().as_os_str().as_encoded_bytes());
             }
         }
-        self.leases.lock().insert(lease, (inode, file));
+        self.leases.lock().insert(
+            lease,
+            Lease {
+                inode,
+                file,
+                pending_connection: requires_lease_ack.then_some(connection_id),
+            },
+        );
         Ok(output.finish())
+    }
+
+    fn ack_lease(&self, lease: u64) -> crate::Result<()> {
+        if lease == 0 {
+            return Ok(());
+        }
+        let mut leases = self.leases.lock();
+        let entry = leases.get_mut(&lease).ok_or(Error::INVALID)?;
+        entry.pending_connection = None;
+        Ok(())
     }
 
     fn close(&self, lease: u64) -> crate::Result<()> {
@@ -404,14 +476,45 @@ impl Service {
             return Ok(());
         }
         let network = self.backend.network().ok_or(Error::INVALID)?;
-        let (inode, file) = self.leases.lock().remove(&lease).ok_or(Error::INVALID)?;
-        network.close_file(inode, file)
+        let lease = self.leases.lock().remove(&lease).ok_or(Error::INVALID)?;
+        network.close_file(lease.inode, lease.file)
     }
 }
 
-/// Releases an OPEN lease unless its response was successfully written.
-/// Once disarmed, the lease belongs to the kernel open and survives later
-/// transport disconnects.
+/// Releases leases still awaiting acknowledgement when their creating
+/// connection exits. Acknowledged leases are left untouched.
+struct ConnectionCleanup<'a> {
+    service: &'a Service,
+    connection_id: u64,
+}
+
+impl Drop for ConnectionCleanup<'_> {
+    fn drop(&mut self) {
+        let files = {
+            let mut leases = self.service.leases.lock();
+            let pending: Vec<u64> = leases
+                .iter()
+                .filter_map(|(id, lease)| {
+                    (lease.pending_connection == Some(self.connection_id)).then_some(*id)
+                })
+                .collect();
+            pending
+                .into_iter()
+                .filter_map(|id| leases.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        let Some(network) = self.service.backend.network() else {
+            return;
+        };
+        for lease in files {
+            let _ = network.close_file(lease.inode, lease.file);
+        }
+    }
+}
+
+/// Releases an OPEN lease if its response write fails. A successful write
+/// disarms immediate cleanup: ACK-mode leases remain pending on their creating
+/// connection, while legacy leases are acknowledged by the write itself.
 struct PendingLeaseCleanup<'a> {
     service: &'a Service,
     lease: u64,
@@ -452,8 +555,8 @@ impl Drop for Service {
         let Some(network) = self.backend.network() else {
             return;
         };
-        for (_, (inode, file)) in self.leases.get_mut().drain() {
-            let _ = network.close_file(inode, file);
+        for (_, lease) in self.leases.get_mut().drain() {
+            let _ = network.close_file(lease.inode, lease.file);
         }
     }
 }

@@ -4,7 +4,8 @@ description: "Mount a backend, choose platform options, keep the session alive a
 ---
 
 `MountSession` turns a backend into a live volume. It owns the mount and the service that
-answers the kernel. The mount stays active until the session is explicitly unmounted or dropped.
+answers the kernel. The mount stays active until it is successfully unmounted. Dropping the
+session attempts unmount and always stops the local service, even if `diskutil` fails on macOS.
 
 ## Mount
 
@@ -54,7 +55,7 @@ mounts over it, and a busy or invalid path is reported by `mount(8)` or FUSE. Wi
 ProjFS requires an empty directory or one already initialized as a virtualization root, and
 rejects anything else before the mount starts.
 
-Dropping the session unmounts:
+Dropping the session attempts to unmount:
 
 | Platform | What `Drop` does                                                |
 | -------- | --------------------------------------------------------------- |

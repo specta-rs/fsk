@@ -216,9 +216,11 @@
 //!
 //! A [`LocalFile`] path must stay readable and unchanged until
 //! [`NetworkFilesystem::close_file`] returns. The adapter does not own cache
-//! eviction; it only tells the backend when the kernel has finished with a
-//! lease. Return [`NetworkFile::Remote`] for writes unless the backend can make
-//! them durable itself.
+//! eviction; it normally tells the backend when the kernel has finished with a
+//! lease. On macOS it can also close an OPEN whose response failed or was never
+//! acknowledged, before Swift opened a local descriptor. Return
+//! [`NetworkFile::Remote`] for writes unless the backend can make them durable
+//! itself.
 //!
 //! # Evicting hydrated content
 //!

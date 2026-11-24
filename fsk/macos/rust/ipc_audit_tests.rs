@@ -117,7 +117,148 @@ fn failed_open_response_releases_the_pending_lease() {
 }
 
 #[test]
-fn disconnect_preserves_local_file_lease_until_kernel_close() {
+fn unacknowledged_disconnect_releases_only_pending_lease() {
+    let directory = tempfile::tempdir().unwrap();
+    let local_path = directory.path().join("materialized.bin");
+    std::fs::write(&local_path, b"cached bytes").unwrap();
+    let close_calls = Arc::new(AtomicU64::new(0));
+    let service = Arc::new(Service::network(
+        LeaseTrackingFilesystem {
+            inner: TestFilesystem::default(),
+            local_path: local_path.clone(),
+            close_calls: Arc::clone(&close_calls),
+            open_entered: None,
+            open_release: None,
+        },
+        [7; 32],
+    ));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let worker_service = Arc::clone(&service);
+    let worker = std::thread::spawn(move || worker_service.serve_connection(server));
+    send(&mut client, 1, opcode::HELLO, &[7; 32]);
+    assert_eq!(response(&mut client).1, 0);
+
+    let mut open = Encoder::with_capacity(9);
+    open.u64(2);
+    open.u8(0);
+    let open = open.finish();
+    send(&mut client, 2, opcode::OPEN, &open);
+    let (_, status, body) = response(&mut client);
+    assert_eq!(status, 0);
+    let pending = u64::from_le_bytes(body[..8].try_into().unwrap());
+    assert!(
+        service
+            .leases
+            .lock()
+            .get(&pending)
+            .unwrap()
+            .pending_connection
+            .is_some()
+    );
+
+    let (mut client2, server2) = UnixStream::pair().unwrap();
+    client2
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let worker_service2 = Arc::clone(&service);
+    let worker2 = std::thread::spawn(move || worker_service2.serve_connection(server2));
+    send(&mut client2, 1, opcode::HELLO, &[7; 32]);
+    assert_eq!(response(&mut client2).1, 0);
+    send(&mut client2, 2, opcode::OPEN, &open);
+    let (_, status, body) = response(&mut client2);
+    assert_eq!(status, 0);
+    let acknowledged = u64::from_le_bytes(body[..8].try_into().unwrap());
+    send(
+        &mut client2,
+        3,
+        opcode::ACK_LEASE,
+        &acknowledged.to_le_bytes(),
+    );
+    assert_eq!(response(&mut client2).1, 0);
+
+    drop(client);
+    worker.join().unwrap().unwrap();
+    assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+    assert!(!service.leases.lock().contains_key(&pending));
+    assert!(service.leases.lock().contains_key(&acknowledged));
+
+    send(&mut client2, 4, opcode::CLOSE, &acknowledged.to_le_bytes());
+    assert_eq!(response(&mut client2).1, 0);
+    drop(client2);
+    worker2.join().unwrap().unwrap();
+    assert_eq!(close_calls.load(Ordering::SeqCst), 2);
+    assert!(service.leases.lock().is_empty());
+}
+
+#[test]
+fn legacy_peers_acknowledge_open_on_response_write() {
+    for minor in [0, LEASE_ACK_MINOR - 1] {
+        let directory = tempfile::tempdir().unwrap();
+        let local_path = directory.path().join("materialized.bin");
+        std::fs::write(&local_path, b"cached bytes").unwrap();
+        let close_calls = Arc::new(AtomicU64::new(0));
+        let service = Arc::new(Service::network(
+            LeaseTrackingFilesystem {
+                inner: TestFilesystem::default(),
+                local_path,
+                close_calls: Arc::clone(&close_calls),
+                open_entered: None,
+                open_release: None,
+            },
+            [7; 32],
+        ));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let worker_service = Arc::clone(&service);
+        let worker = std::thread::spawn(move || worker_service.serve_connection(server));
+        send_with_minor(&mut client, 1, opcode::HELLO, minor, &[7; 32]);
+        let (_, negotiated, status, _) = response_full(&mut client);
+        assert_eq!(negotiated, minor);
+        assert_eq!(status, 0);
+
+        let mut open = Encoder::with_capacity(9);
+        open.u64(2);
+        open.u8(0);
+        send_with_minor(&mut client, 2, opcode::OPEN, minor, &open.finish());
+        let (_, status, body) = response(&mut client);
+        assert_eq!(status, 0);
+        let lease = u64::from_le_bytes(body[..8].try_into().unwrap());
+        assert!(
+            service
+                .leases
+                .lock()
+                .get(&lease)
+                .unwrap()
+                .pending_connection
+                .is_none()
+        );
+
+        drop(client);
+        worker.join().unwrap().unwrap();
+        assert_eq!(close_calls.load(Ordering::SeqCst), 0);
+        assert!(service.leases.lock().contains_key(&lease));
+
+        let (mut client2, server2) = UnixStream::pair().unwrap();
+        let worker_service2 = Arc::clone(&service);
+        let worker2 = std::thread::spawn(move || worker_service2.serve_connection(server2));
+        send_with_minor(&mut client2, 1, opcode::HELLO, minor, &[7; 32]);
+        assert_eq!(response(&mut client2).1, 0);
+        send_with_minor(&mut client2, 2, opcode::CLOSE, minor, &lease.to_le_bytes());
+        assert_eq!(response(&mut client2).1, 0);
+        drop(client2);
+        worker2.join().unwrap().unwrap();
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+        assert!(service.leases.lock().is_empty());
+    }
+}
+
+#[test]
+fn acknowledged_disconnect_preserves_local_file_lease_until_kernel_close() {
     let directory = tempfile::tempdir().unwrap();
     let local_path = directory.path().join("materialized.bin");
     std::fs::write(&local_path, b"cached bytes").unwrap();
@@ -166,6 +307,20 @@ fn disconnect_preserves_local_file_lease_until_kernel_close() {
     assert_eq!(status, 0);
     let lease2 = u64::from_le_bytes(body2[..8].try_into().unwrap());
     assert_ne!(lease, lease2);
+    // ACK is connection-independent: this pooled peer acknowledges both opens.
+    send(&mut client2, 3, opcode::ACK_LEASE, &lease.to_le_bytes());
+    assert_eq!(response(&mut client2).1, 0);
+    send(&mut client2, 4, opcode::ACK_LEASE, &lease2.to_le_bytes());
+    assert_eq!(response(&mut client2).1, 0);
+    assert!(
+        service
+            .leases
+            .lock()
+            .get(&lease)
+            .unwrap()
+            .pending_connection
+            .is_none()
+    );
 
     drop(client);
     worker.join().unwrap().unwrap();
@@ -432,16 +587,13 @@ fn frame(id: u64, operation: u16, minor: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 fn send(stream: &mut UnixStream, id: u64, operation: u16, payload: &[u8]) {
-    let mut frame = Encoder::with_capacity(HEADER_LEN + payload.len());
-    frame.u32(MAGIC);
-    frame.u16(PROTOCOL_MAJOR);
-    frame.u16(operation);
-    frame.u64(id);
-    frame.u32(u32::try_from(payload.len()).unwrap());
-    frame.u16(PROTOCOL_MINOR);
-    frame.u16(0);
-    frame.bytes(payload);
-    stream.write_all(&frame.finish()).unwrap();
+    send_with_minor(stream, id, operation, PROTOCOL_MINOR, payload);
+}
+
+fn send_with_minor(stream: &mut UnixStream, id: u64, operation: u16, minor: u16, payload: &[u8]) {
+    stream
+        .write_all(&frame(id, operation, minor, payload))
+        .unwrap();
 }
 
 fn response(stream: &mut UnixStream) -> (u64, i32, Vec<u8>) {

@@ -259,10 +259,12 @@ changes the major later in the same connection is rejected the same way.
 
 Peers use the lower of the two minor versions. When an operation needs a newer
 revision, the app passes `minimumMinor` to the Swift connection pool so it fails
-with `protocolTooOld` instead of sending a frame an older SDK cannot decode. No
-operation currently requires more than minor 0, but the plumbing exists so the
-first minor-gated opcode does not need a protocol redesign. Never reuse an
-opcode number for a different purpose.
+with `protocolTooOld` instead of sending a frame an older SDK cannot decode.
+`ACK_LEASE` requires minor 2 and carries a little-endian `u64` lease ID with an
+empty success response. Swift sends it after installing an OPEN lease, and it
+may use any authenticated pooled connection. At negotiated minors 0 and 1, a
+successful OPEN response write remains the acknowledgement and no ACK is
+expected. Never reuse an opcode number for a different purpose.
 
 The embedded extension declares the protocol it implements in
 `FSKExtension/Info.plist` as `FSKProtocolMajor` and `FSKProtocolMinor`. The SDK
