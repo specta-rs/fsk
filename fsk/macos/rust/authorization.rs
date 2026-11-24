@@ -2,17 +2,20 @@
 
 use std::{
     env,
-    ffi::CString,
-    fs, io,
+    ffi::{CString, OsStr},
+    fs,
+    io::{self, Read},
     os::unix::{
         ffi::OsStrExt,
         fs::{DirBuilderExt, MetadataExt, PermissionsExt},
         io::AsRawFd,
+        process::CommandExt,
     },
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::authorization::AuthorizationStatus;
@@ -39,6 +42,12 @@ const LEGACY_PROTOCOL_MAJOR: u16 = 1;
 const RELEASE_BASE_URL: &str = "https://github.com/specta-rs/fsk/releases/download";
 const RELEASE_API_URL: &str = "https://api.github.com/repos/specta-rs/fsk/releases/tags";
 const STALE_ENTRY_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const AUTHORIZATION_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_AUTHORIZATION_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_RELEASE_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_RELEASE_METADATA_BYTES: u64 = 1024 * 1024;
+const MAX_RELEASE_EXPANDED_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_RELEASE_ENTRIES: u64 = 10_000;
 static APP_MUTATION: Mutex<()> = Mutex::new(());
 static ENTRY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -143,7 +152,7 @@ pub fn install() -> io::Result<AppInstallOutcome> {
 /// the network round-trip and code-signature checks. The callback runs on the
 /// calling thread; keep it cheap and do not block.
 ///
-/// ```
+/// ```no_run
 /// # #[cfg(target_os = "macos")]
 /// # fn main() -> std::io::Result<()> {
 /// let outcome = fsk::install_with_progress(|phase| match phase {
@@ -172,7 +181,10 @@ fn install_inner(progress: &mut dyn FnMut(InstallPhase)) -> io::Result<AppInstal
     let configured = env::var_os("FSK_APP_PATH");
     let destination = app_path_from(configured.clone(), env::var_os("HOME"))?;
     let parent = destination_parent(&destination)?;
-    fs::create_dir_all(parent).map_err(|error| fs_error("create", parent, &error))?;
+    create_install_parent(parent)?;
+    if configured.is_none() {
+        make_default_install_parent_private(parent)?;
+    }
     // The lock is held on the directory itself, so no lock file is created and
     // only read permission on the parent is required.
     let _lock = AppLock::acquire(parent)?;
@@ -280,22 +292,42 @@ pub fn uninstall() -> io::Result<bool> {
 /// `~/Library/Application Support/dev.specta.fsk/FSK.app` location, which is
 /// useful for development and app-local distributions. The value must be the
 /// full path of an `.app` bundle, not a directory that contains it.
+/// At the default location, an app that fails signature or Gatekeeper
+/// validation is treated as absent and is never executed. An explicit
+/// `FSK_APP_PATH` override may select an unsigned development build.
 ///
 /// # Errors
 ///
 /// Returns an error when the path is invalid, or when the app cannot be
-/// executed or returns invalid data.
+/// executed or returns invalid data. A default-location app is only executed
+/// after its release signature and Gatekeeper assessment pass; an explicit
+/// `FSK_APP_PATH` override may select an unsigned development build.
 pub fn authorization_status() -> io::Result<AuthorizationStatus> {
-    authorization_status_at(&app_path()?)
+    let configured = env::var_os("FSK_APP_PATH");
+    let app = app_path_from(configured.clone(), env::var_os("HOME"))?;
+    // Development overrides may be unsigned. The default location, however,
+    // must contain the verified release before its executable is run.
+    if !app_is_safe_to_execute(&app, configured.is_some()) {
+        return Ok(AuthorizationStatus::NotInstalled);
+    }
+    authorization_status_at(&app)
+}
+
+fn app_is_safe_to_execute(app: &Path, development_override: bool) -> bool {
+    if !app_matches_sdk(app) {
+        return false;
+    }
+    development_override || (default_install_parent_is_private(app) && validate_app(app).is_ok())
 }
 
 fn authorization_status_at(app: &Path) -> io::Result<AuthorizationStatus> {
     if !app_matches_sdk(app) {
         return Ok(AuthorizationStatus::NotInstalled);
     }
-    let output = Command::new(app.join(APP_EXECUTABLE))
-        .arg("--fsk-authorization-status")
-        .output()?;
+    let output = output_with_timeout(
+        Command::new(app.join(APP_EXECUTABLE)).arg("--fsk-authorization-status"),
+        AUTHORIZATION_STATUS_TIMEOUT,
+    )?;
     if !output.status.success() {
         return Err(io::Error::other(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
@@ -315,10 +347,9 @@ fn authorization_status_at(app: &Path) -> io::Result<AuthorizationStatus> {
 
 /// Whether the app bundle at `app` can serve this SDK.
 ///
-/// This mirrors the bundle-identifier and protocol checks in [`validate_app`]
-/// without verifying the code signature: the status query only needs to decide
-/// whether [`install`] should run, and a development build selected through
-/// `FSK_APP_PATH` is not signed by the release identity.
+/// This mirrors the bundle-identifier and protocol checks in [`validate_app`].
+/// Public entry points separately require a valid release signature unless a
+/// development build was explicitly selected through `FSK_APP_PATH`.
 fn app_matches_sdk(app: &Path) -> bool {
     app.join(APP_EXECUTABLE).is_file()
         && app_bundle_identifier(app).ok().flatten().as_deref() == Some(APP_BUNDLE_IDENTIFIER)
@@ -371,14 +402,18 @@ fn extension_info_plist(app: &Path) -> Option<PathBuf> {
 /// Set `FSK_APP_PATH` to override the normal
 /// `~/Library/Application Support/dev.specta.fsk/FSK.app` location. The value
 /// must be the full path of an `.app` bundle, not a directory that contains it.
+/// The default-location app must pass release signature and Gatekeeper
+/// validation before it is opened. An explicit `FSK_APP_PATH` override may
+/// select an unsigned development build.
 ///
 /// # Errors
 ///
 /// Returns an error when the path is invalid, when the app is missing or does
 /// not match this SDK, or when macOS cannot open it.
 pub fn launch_app() -> io::Result<()> {
-    let app = app_path()?;
-    if !app_matches_sdk(&app) {
+    let configured = env::var_os("FSK_APP_PATH");
+    let app = app_path_from(configured.clone(), env::var_os("HOME"))?;
+    if !app_is_safe_to_execute(&app, configured.is_some()) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
@@ -426,6 +461,7 @@ fn install_from_release(
     let tag = format!("v{APP_VERSION}");
     progress(InstallPhase::Downloading);
     download_release(temporary, &archive, &tag)?;
+    validate_archive_limits(&archive)?;
     run(
         Command::new("/usr/bin/ditto")
             .args(["-x", "-k"])
@@ -433,6 +469,7 @@ fn install_from_release(
             .arg(&extracted),
         "unpack FSK.app",
     )?;
+    validate_extracted_limits(&extracted)?;
 
     let source = extracted.join("FSK.app");
     require_real_directory(&source)?;
@@ -442,7 +479,7 @@ fn install_from_release(
     // The destination was validated in `install`, so it has a
     // parent and a final component.
     let parent = destination_parent(destination)?;
-    fs::create_dir_all(parent).map_err(|error| fs_error("create", parent, &error))?;
+    create_install_parent(parent)?;
     let name = app_name(destination)?;
     let staging = new_entry_path(parent, name, "install");
     progress(InstallPhase::Installing);
@@ -465,11 +502,48 @@ fn install_from_release(
     }
 
     let backup = new_entry_path(parent, name, "backup");
+    let staged_identity = path_identity(&staged_app)?;
     let result = replace_app(&staged_app, destination, &backup);
-    // `replace_app` consumes the staged app on success; the staging directory
-    // that contained it is always ours to remove.
-    let _ = remove_path(&staging);
+    // replace_app consumes the staged app on success. On a failed race
+    // rollback it may instead contain an unexpected directory; preserve that
+    // directory rather than deleting it with our staging container.
+    let safe_to_remove = match path_identity(&staged_app) {
+        Ok(identity) => identity == staged_identity,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    };
+    if safe_to_remove {
+        let _ = remove_path(&staging);
+    }
     result
+}
+
+fn create_install_parent(parent: &Path) -> io::Result<()> {
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(parent)
+        .map_err(|error| fs_error("create", parent, &error))
+}
+
+fn make_default_install_parent_private(parent: &Path) -> io::Result<()> {
+    let metadata =
+        fs::symlink_metadata(parent).map_err(|error| fs_error("inspect", parent, &error))?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a real install directory", parent.display()),
+        ));
+    }
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+        .map_err(|error| fs_error("make the install directory private", parent, &error))
+}
+
+fn default_install_parent_is_private(app: &Path) -> bool {
+    destination_parent(app)
+        .ok()
+        .and_then(|parent| fs::symlink_metadata(parent).ok())
+        .is_some_and(|metadata| metadata.is_dir() && metadata.permissions().mode() & 0o022 == 0)
 }
 
 fn create_staging_directory(staging: &Path) -> io::Result<()> {
@@ -486,21 +560,114 @@ fn create_staging_directory(staging: &Path) -> io::Result<()> {
     }
 }
 
+fn validate_archive_limits(archive: &Path) -> io::Result<()> {
+    let output = Command::new("/usr/bin/zipinfo")
+        .env("LC_ALL", "C")
+        .arg("-t")
+        .arg(archive)
+        .output()?;
+    if !output.status.success() {
+        return Err(command_error(
+            "inspect FSK.app archive limits",
+            &output.stderr,
+        ));
+    }
+    let summary = String::from_utf8_lossy(&output.stdout);
+    let mut fields = summary.split(',');
+    let entries = fields
+        .next()
+        .and_then(|field| field.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "could not read FSK.app archive entry count",
+            )
+        })?;
+    let expanded = fields
+        .next()
+        .and_then(|field| field.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "could not read FSK.app expanded size",
+            )
+        })?;
+    if entries > MAX_RELEASE_ENTRIES || expanded > MAX_RELEASE_EXPANDED_BYTES {
+        return Err(archive_limit_error(entries, expanded));
+    }
+    Ok(())
+}
+
+fn validate_extracted_limits(root: &Path) -> io::Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut entries = 0_u64;
+    let mut expanded = 0_u64;
+    while let Some(path) = pending.pop() {
+        entries = entries
+            .checked_add(1)
+            .ok_or_else(|| archive_limit_error(entries, expanded))?;
+        if entries > MAX_RELEASE_ENTRIES {
+            return Err(archive_limit_error(entries, expanded));
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| fs_error("inspect extracted FSK.app entry", &path, &error))?;
+        if metadata.file_type().is_dir() {
+            for entry in fs::read_dir(&path)
+                .map_err(|error| fs_error("read extracted FSK.app directory", &path, &error))?
+            {
+                pending.push(entry?.path());
+            }
+        } else {
+            expanded = expanded
+                .checked_add(metadata.len())
+                .ok_or_else(|| archive_limit_error(entries, expanded))?;
+            if expanded > MAX_RELEASE_EXPANDED_BYTES {
+                return Err(archive_limit_error(entries, expanded));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn archive_limit_error(entries: u64, expanded: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "FSK.app archive exceeds extraction limits: {entries} entries and {expanded} expanded bytes (maximum {MAX_RELEASE_ENTRIES} entries and {MAX_RELEASE_EXPANDED_BYTES} bytes)"
+        ),
+    )
+}
+
 fn download_release(temporary: &Path, archive: &Path, tag: &str) -> io::Result<()> {
-    if let Some(base) = release_base_from(env::var_os("FSK_RELEASE_BASE_URL"))? {
-        return run(
+    let result = if let Some(base) = release_base_from(env::var_os("FSK_RELEASE_BASE_URL"))? {
+        run(
             curl_download(archive).arg(mirror_url(&base, tag)),
             "download FSK.app",
-        );
+        )
+    } else if let Some(token) = github_token() {
+        download_release_with_token(temporary, archive, tag, &token)
+    } else {
+        run(curl_download(archive).arg(public_release_url(tag)), "download FSK.app").map_err(
+            |error| {
+                io::Error::other(format!(
+                    "{error}. FSK.app releases must be publicly downloadable; for a private repository set GITHUB_TOKEN or FSK_RELEASE_BASE_URL"
+                ))
+            },
+        )
+    };
+    result?;
+    let size = fs::metadata(archive)
+        .map_err(|error| fs_error("inspect", archive, &error))?
+        .len();
+    if size > MAX_RELEASE_ARCHIVE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("FSK.app archive is {size} bytes (maximum {MAX_RELEASE_ARCHIVE_BYTES} bytes)"),
+        ));
     }
-    if let Some(token) = github_token() {
-        return download_release_with_token(temporary, archive, tag, &token);
-    }
-    run(curl_download(archive).arg(public_release_url(tag)), "download FSK.app").map_err(|error| {
-        io::Error::other(format!(
-            "{error}. FSK.app releases must be publicly downloadable; for a private repository set GITHUB_TOKEN or FSK_RELEASE_BASE_URL"
-        ))
-    })
+    Ok(())
 }
 
 fn release_base_from(configured: Option<std::ffi::OsString>) -> io::Result<Option<String>> {
@@ -524,6 +691,7 @@ fn mirror_url(base: &str, tag: &str) -> String {
 
 fn curl_download(archive: &Path) -> Command {
     let mut command = Command::new("/usr/bin/curl");
+    command.env("LC_ALL", "C");
     command.args([
         "--disable",
         "--proto",
@@ -543,9 +711,11 @@ fn curl_download(archive: &Path) -> Command {
         "30",
         "--max-time",
         "600",
-        "--output",
     ]);
-    command.arg(archive);
+    command
+        .arg("--max-filesize")
+        .arg(MAX_RELEASE_ARCHIVE_BYTES.to_string());
+    command.args(["--output"]).arg(archive);
     command
 }
 
@@ -582,6 +752,8 @@ fn download_release_with_token(
             "30",
             "--max-time",
             "120",
+            "--max-filesize",
+            MAX_RELEASE_METADATA_BYTES.to_string().as_str(),
             "--config",
         ])
         .arg(&config)
@@ -655,43 +827,109 @@ fn replace_app(staging: &Path, destination: &Path, backup: &Path) -> io::Result<
     replace_app_with(staging, destination, backup, atomic_swap)
 }
 
+fn path_identity(path: &Path) -> io::Result<(u64, u64)> {
+    let metadata = fs::symlink_metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn destination_race_error(destination: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "refusing to delete {} because it changed during installation",
+            destination.display()
+        ),
+    )
+}
+
+enum AppSwap {
+    Completed,
+    Unsupported,
+}
+
 fn replace_app_with(
     staging: &Path,
     destination: &Path,
     backup: &Path,
     swap: impl Fn(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
+    let staging_identity = path_identity(staging).ok();
+    let remove_staging = || {
+        remove_owned_path(staging, staging_identity);
+    };
     let destination_present = match path_present(destination) {
         Ok(present) => present,
         Err(error) => {
-            let _ = remove_path(staging);
+            remove_staging();
             return Err(error);
         }
     };
-    if destination_present {
-        match swap(staging, destination) {
-            Ok(()) => {
-                // The previous app is now at `staging`; removing it is
-                // best-effort because the new app is already installed.
-                let _ = remove_path(staging);
-                let _ = remove_path(backup);
-                return Ok(());
-            }
-            Err(error) if swap_unsupported(&error) => {}
+    let destination_identity = if destination_present {
+        match path_identity(destination) {
+            Ok(identity) => Some(identity),
             Err(error) => {
-                let _ = remove_path(staging);
-                return Err(fs_error("install FSK.app at", destination, &error));
+                remove_staging();
+                return Err(error);
             }
         }
-        if let Err(error) = fs::rename(destination, backup) {
-            let _ = remove_path(staging);
+    } else {
+        None
+    };
+    if destination_present {
+        let Some(identity) = destination_identity else {
+            remove_staging();
+            return Err(destination_race_error(destination));
+        };
+        // Re-check immediately before mutation. The download and verification
+        // happened after install() first accepted this destination.
+        if path_identity(destination).ok().as_ref() != Some(&identity) {
+            remove_staging();
+            return Err(destination_race_error(destination));
+        }
+        if is_fsk_app(destination)? {
+            if let Err(error) = terminate_app_at(destination) {
+                remove_staging();
+                return Err(error);
+            }
+        }
+        match swap_existing_app(
+            staging,
+            destination,
+            backup,
+            identity,
+            staging_identity,
+            swap,
+        ) {
+            Ok(AppSwap::Completed) => return Ok(()),
+            Ok(AppSwap::Unsupported) => {}
+            Err(error) => return Err(error),
+        }
+        if let Err(error) = rename_exclusive(destination, backup) {
+            remove_staging();
             return Err(fs_error("move the previous FSK.app to", backup, &error));
         }
+        if path_identity(backup).ok().as_ref() != Some(&identity) {
+            // Never move an unexpected directory into the install location
+            // merely to roll back. Preserve it for inspection instead.
+            remove_staging();
+            return Err(destination_race_error(destination));
+        }
     }
-    if let Err(error) = fs::rename(staging, destination) {
-        let _ = remove_path(staging);
+    if let Err(error) = rename_exclusive(staging, destination) {
+        remove_staging();
         if destination_present {
-            return match fs::rename(backup, destination) {
+            let restored = if path_identity(backup).ok().as_ref() == destination_identity.as_ref() {
+                rename_exclusive(backup, destination)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "the previous FSK.app at {} changed during installation",
+                        backup.display()
+                    ),
+                ))
+            };
+            return match restored {
                 Ok(()) => Err(fs_error("install FSK.app at", destination, &error)),
                 Err(restore_error) => Err(io::Error::new(
                     restore_error.kind(),
@@ -706,9 +944,84 @@ fn replace_app_with(
         return Err(fs_error("install FSK.app at", destination, &error));
     }
     // The new app is in place, so a stale backup is not an installation
-    // failure. Leave it behind rather than reporting a false error.
-    let _ = remove_path(backup);
+    // failure. Leave it behind rather than reporting a false error. Do not
+    // remove a pre-existing backup when there was no destination to replace.
+    if destination_present {
+        if let Some(identity) = destination_identity {
+            let _ = remove_path_if_identity(backup, identity);
+        }
+    }
     Ok(())
+}
+
+fn swap_existing_app(
+    staging: &Path,
+    destination: &Path,
+    backup: &Path,
+    destination_identity: (u64, u64),
+    staging_identity: Option<(u64, u64)>,
+    swap: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<AppSwap> {
+    match swap(staging, destination) {
+        Ok(()) => {
+            // A successful exchange must put the exact directory we inspected
+            // at staging. Otherwise a non-cooperating process raced us; swap
+            // back rather than recursively deleting it.
+            if path_identity(staging).ok().as_ref() != Some(&destination_identity) {
+                return match swap(staging, destination) {
+                    Ok(()) => {
+                        // The second exchange should restore our original
+                        // staging directory. Verify it before removing it.
+                        remove_owned_path(staging, staging_identity);
+                        Err(destination_race_error(destination))
+                    }
+                    Err(rollback_error) => {
+                        if let Err(preserve_error) = rename_exclusive(staging, backup) {
+                            return Err(io::Error::new(
+                                preserve_error.kind(),
+                                format!(
+                                    "could not roll back {} ({rollback_error}) or preserve the unexpected destination at {} ({preserve_error})",
+                                    destination.display(),
+                                    backup.display(),
+                                ),
+                            ));
+                        }
+                        Err(io::Error::new(
+                            rollback_error.kind(),
+                            format!(
+                                "could not roll back {} after its destination changed ({rollback_error}); the unexpected directory was preserved at {}",
+                                destination.display(),
+                                backup.display(),
+                            ),
+                        ))
+                    }
+                };
+            }
+            // The previous app is now at staging. The backup path was not used
+            // by the atomic exchange and may belong to someone else.
+            let _ = remove_path_if_identity(staging, destination_identity);
+            Ok(AppSwap::Completed)
+        }
+        Err(error) if swap_unsupported(&error) => Ok(AppSwap::Unsupported),
+        Err(error) => {
+            remove_owned_path(staging, staging_identity);
+            Err(fs_error("install FSK.app at", destination, &error))
+        }
+    }
+}
+
+fn remove_owned_path(path: &Path, identity: Option<(u64, u64)>) {
+    if let Some(identity) = identity {
+        let _ = remove_path_if_identity(path, identity);
+    }
+}
+
+fn remove_path_if_identity(path: &Path, expected: (u64, u64)) -> bool {
+    if path_identity(path).is_ok_and(|identity| identity == expected) {
+        remove_path(path).is_ok()
+    } else {
+        false
+    }
 }
 
 /// Atomically exchange two paths using `renamex_np(RENAME_SWAP)`.
@@ -718,6 +1031,24 @@ fn atomic_swap(first: &Path, second: &Path) -> io::Result<()> {
     // SAFETY: both pointers are valid, NUL-terminated C strings that outlive
     // the call. `renamex_np` does not retain them after returning.
     let result = unsafe { libc::renamex_np(first.as_ptr(), second.as_ptr(), libc::RENAME_SWAP) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Move a path only when the destination does not already exist.
+///
+/// Unlike `fs::rename`, this cannot silently replace an empty directory that
+/// appeared after the installer checked the destination.
+fn rename_exclusive(source: &Path, destination: &Path) -> io::Result<()> {
+    let source = path_c_string(source)?;
+    let destination = path_c_string(destination)?;
+    // SAFETY: both pointers are valid, NUL-terminated C strings that outlive
+    // the call. `renamex_np` does not retain them after returning.
+    let result =
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
     if result == 0 {
         Ok(())
     } else {
@@ -759,18 +1090,14 @@ fn recover_interrupted_install_with(
     let _ = cleanup_stale_entries(parent, name, "install");
 
     if !path_present(destination)? {
-        if let Some(backup) = newest_entry(parent, name, "backup")? {
+        // A corrupt newest backup must not hide an older recoverable app.
+        // Invalid backups remain available for manual inspection while young.
+        for (_, backup) in newest_entries(parent, name, "backup")? {
             if validate(&backup).is_ok() {
                 fs::rename(&backup, destination).map_err(|error| {
                     fs_error("restore the interrupted FSK.app from", &backup, &error)
                 })?;
-            } else {
-                // Restoring an unverified bundle would install arbitrary
-                // bytes. Keep it for manual inspection while it is young, but
-                // still remove stale entries so the same corrupt backup is not
-                // re-selected on every run.
-                let _ = cleanup_stale_entries(parent, name, "backup");
-                return Ok(());
+                break;
             }
         }
     }
@@ -849,14 +1176,14 @@ fn remove_matching_entries(parent: &Path, name: &str, kind: &str) -> io::Result<
     Ok(())
 }
 
-fn newest_entry(parent: &Path, name: &str, kind: &str) -> io::Result<Option<PathBuf>> {
+fn newest_entries(parent: &Path, name: &str, kind: &str) -> io::Result<Vec<(SystemTime, PathBuf)>> {
     let prefix = entry_prefix(name, kind);
     let entries = match fs::read_dir(parent) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(fs_error("read", parent, &error)),
     };
-    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    let mut matching = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else { continue };
         let file_name = entry.file_name();
@@ -873,12 +1200,22 @@ fn newest_entry(parent: &Path, name: &str, kind: &str) -> io::Result<Option<Path
         if !(metadata.file_type().is_dir() || metadata.file_type().is_symlink()) {
             continue;
         }
-        let created = entry_time(file_name, &prefix, &metadata);
-        if newest.as_ref().is_none_or(|(time, _)| created > *time) {
-            newest = Some((created, path));
-        }
+        matching.push((entry_time(file_name, &prefix, &metadata), path));
     }
-    Ok(newest.map(|(_, path)| path))
+    matching.sort_by(|(left_time, left_path), (right_time, right_path)| {
+        right_time
+            .cmp(left_time)
+            .then_with(|| right_path.cmp(left_path))
+    });
+    Ok(matching)
+}
+
+#[cfg(test)]
+fn newest_entry(parent: &Path, name: &str, kind: &str) -> io::Result<Option<PathBuf>> {
+    Ok(newest_entries(parent, name, kind)?
+        .into_iter()
+        .next()
+        .map(|(_, path)| path))
 }
 
 fn entry_prefix(name: &str, kind: &str) -> String {
@@ -1055,6 +1392,7 @@ fn uninstall_app_at(app: &Path) -> io::Result<bool> {
         fs::remove_file(&app).map_err(|error| fs_error("remove", &app, &error))?;
         return Ok(true);
     }
+    let app_identity = path_identity(&app)?;
     if !is_fsk_app(&app)? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1079,6 +1417,16 @@ fn uninstall_app_at(app: &Path) -> io::Result<bool> {
             ),
         ));
     }
+    terminate_app_at(&app)?;
+    if path_identity(&app)? != app_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "refusing to remove {} because it changed during uninstall",
+                app.display()
+            ),
+        ));
+    }
     fs::remove_dir_all(&app).map_err(|error| fs_error("remove", &app, &error))?;
     Ok(true)
 }
@@ -1092,7 +1440,6 @@ fn uninstall_app_at(app: &Path) -> io::Result<bool> {
 /// the legacy destination are cleaned up as well.
 fn remove_legacy_install() -> bool {
     let app = Path::new(LEGACY_APP_PATH);
-    terminate_legacy_app();
     let removed = uninstall_app_at(app).unwrap_or(false);
     if let (Some(parent), Some(name)) =
         (app.parent(), app.file_name().and_then(|name| name.to_str()))
@@ -1103,18 +1450,123 @@ fn remove_legacy_install() -> bool {
     removed
 }
 
-/// Stops a running legacy app before its bundle is removed.
-///
-/// macOS keeps an unlinked executable running, so a stale `/Applications` copy
-/// would otherwise survive the upgrade as a second menu bar item that can never
-/// be launched again. The pattern is anchored to the legacy bundle path so the
-/// per-user copy that is being installed is never matched.
-fn terminate_legacy_app() {
-    // `/Applications/FSK\.app/` is a regular expression: the dot is escaped.
-    let _ = Command::new("/usr/bin/pkill")
-        .arg("-f")
-        .arg(r"^/Applications/FSK\.app/")
-        .status();
+/// Stop processes executing from this exact bundle before replacing or
+/// removing it. macOS otherwise leaves an unlinked executable running, and
+/// `open` may reactivate that stale process after an upgrade.
+fn terminate_app_at(app: &Path) -> io::Result<()> {
+    signal_bundle_processes(app, libc::SIGTERM)?;
+    for _ in 0..20 {
+        if processes_executing_in(app)?.is_empty() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    signal_bundle_processes(app, libc::SIGKILL)?;
+    for _ in 0..20 {
+        if processes_executing_in(app)?.is_empty() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(io::Error::other(format!(
+        "processes executing from {} did not stop; refusing to replace or remove the running bundle",
+        app.display()
+    )))
+}
+
+fn signal_bundle_processes(app: &Path, signal: i32) -> io::Result<()> {
+    for pid in processes_executing_in(app)? {
+        // Re-check the executable immediately before signaling. Matching the
+        // command line alone would also kill editors and shells that merely
+        // mention the bundle path as an argument.
+        if !process_executes_in(pid, app) {
+            continue;
+        }
+        // SAFETY: pid is a positive process ID returned by proc_listallpids and
+        // rechecked with proc_pidpath. ESRCH means the process already exited.
+        if unsafe { libc::kill(pid, signal) } == 0 {
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "could not stop process {pid} executing from {}: {error}",
+                    app.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn processes_executing_in(app: &Path) -> io::Result<Vec<i32>> {
+    let mut capacity = 256_usize;
+    loop {
+        let bytes = capacity
+            .checked_mul(size_of::<i32>())
+            .and_then(|bytes| i32::try_from(bytes).ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "process list is too large to inspect safely",
+                )
+            })?;
+        let mut pids = vec![0_i32; capacity];
+        // SAFETY: the writable buffer remains valid for the call, and its
+        // byte length is passed explicitly. proc_listallpids writes at most
+        // that many bytes and returns the number of process IDs written.
+        let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let count = usize::try_from(count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "process list contains an invalid process count",
+            )
+        })?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if count >= capacity {
+            capacity = capacity.checked_mul(2).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "process list is too large to inspect safely",
+                )
+            })?;
+            continue;
+        }
+        return Ok(pids[..count]
+            .iter()
+            .copied()
+            .filter(|pid| *pid > 1 && process_executes_in(*pid, app))
+            .collect());
+    }
+}
+
+fn process_executes_in(pid: i32, app: &Path) -> bool {
+    process_executable_path(pid).is_some_and(|path| path.starts_with(app))
+}
+
+fn process_executable_path(pid: i32) -> Option<PathBuf> {
+    let mut buffer = [0_u8; libc::MAXPATHLEN as usize];
+    let buffer_size = u32::try_from(buffer.len()).ok()?;
+    // SAFETY: pid is a positive process ID and the writable buffer remains
+    // valid for the duration of the call. proc_pidpath always NUL-terminates a
+    // successful result within the supplied buffer.
+    let length = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer_size) };
+    if length <= 0 {
+        return None;
+    }
+    let length = usize::try_from(length).ok()?;
+    if length >= buffer.len() {
+        return None;
+    }
+    let path = OsStr::from_bytes(&buffer[..length - 1]);
+    Some(PathBuf::from(path))
 }
 
 fn remove_path(path: &Path) -> io::Result<bool> {
@@ -1254,6 +1706,115 @@ impl Drop for AppLock {
     }
 }
 
+fn output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> io::Result<std::process::Output> {
+    command.process_group(0);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
+        stop_process_group(&mut child);
+        return Err(error);
+    }
+    let deadline = Instant::now() + timeout;
+    let result = (|| -> io::Result<std::process::Output> {
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let mut stdout_eof = false;
+        let mut stderr_eof = false;
+        let mut status = None;
+        loop {
+            if status.is_none() {
+                status = child.try_wait()?;
+            }
+            if !stdout_eof {
+                stdout_eof = read_available(&mut stdout, &mut stdout_bytes)?;
+            }
+            if !stderr_eof {
+                stderr_eof = read_available(&mut stderr, &mut stderr_bytes)?;
+            }
+            if stdout_eof && stderr_eof {
+                if let Some(status) = status {
+                    return Ok(std::process::Output {
+                        status,
+                        stdout: stdout_bytes,
+                        stderr: stderr_bytes,
+                    });
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "FSK.app did not return an authorization status in time",
+                ));
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    })();
+    if result.is_err() {
+        stop_process_group(&mut child);
+    }
+    result
+}
+
+fn set_nonblocking(file: &impl AsRawFd) -> io::Result<()> {
+    let descriptor = file.as_raw_fd();
+    // SAFETY: file owns a valid descriptor for the duration of both calls.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the same valid descriptor is used to set its nonblocking flag.
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn read_available(file: &mut impl Read, output: &mut Vec<u8>) -> io::Result<bool> {
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(count) => {
+                if output.len().saturating_add(count) > MAX_AUTHORIZATION_OUTPUT_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "FSK.app authorization status output is too large",
+                    ));
+                }
+                output.extend_from_slice(&buffer[..count]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn stop_process_group(child: &mut std::process::Child) {
+    if let Ok(group) = i32::try_from(child.id()) {
+        // SAFETY: process_group(0) made the child its process group leader, so
+        // its positive PID also identifies the group. A negative PID signals
+        // that group, including descendants holding pipes open.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    // A sandbox may deny signals. Never turn cleanup into another unbounded
+    // wait; production callers still get the original timeout/error.
+    for _ in 0..100 {
+        if child.try_wait().is_ok_and(|status| status.is_some()) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn run(command: &mut Command, operation: &str) -> io::Result<()> {
     let output = command.output()?;
     if output.status.success() {
@@ -1273,10 +1834,6 @@ fn fs_error(operation: &str, path: &Path, error: &io::Error) -> io::Error {
         error.kind(),
         format!("could not {operation} {}: {error}", path.display()),
     )
-}
-
-fn app_path() -> io::Result<PathBuf> {
-    app_path_from(env::var_os("FSK_APP_PATH"), env::var_os("HOME"))
 }
 
 fn app_path_from(
@@ -1652,6 +2209,34 @@ TeamIdentifier=68994Z5PT3
     }
 
     #[test]
+    fn default_execution_policy_rejects_unsigned_apps_and_writable_parents() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = app_fixture(directory.path());
+
+        assert!(app_is_safe_to_execute(&app, true));
+        assert!(!app_is_safe_to_execute(&app, false));
+        assert!(default_install_parent_is_private(&app));
+
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!default_install_parent_is_private(&app));
+    }
+
+    #[test]
+    fn an_existing_default_install_parent_is_made_private() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("dev.specta.fsk");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+
+        make_default_install_parent_private(&parent).unwrap();
+
+        assert_eq!(
+            fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
     fn uninstall_is_idempotent() {
         let directory = tempfile::tempdir().unwrap();
         let app = app_fixture(directory.path());
@@ -1810,6 +2395,49 @@ TeamIdentifier=68994Z5PT3
         assert_eq!(fs::read(destination.join("marker")).unwrap(), b"new app");
         assert!(!staging.exists());
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn fallback_replacement_never_overwrites_an_existing_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("FSK.app");
+        let staging = directory.path().join("staged.app");
+        let backup = directory.path().join("backup");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("marker"), b"old app").unwrap();
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("marker"), b"new app").unwrap();
+        fs::create_dir(&backup).unwrap();
+        fs::write(backup.join("marker"), b"unrelated backup").unwrap();
+
+        assert!(
+            replace_app_with(&staging, &destination, &backup, |_, _| {
+                Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+            })
+            .is_err()
+        );
+
+        assert_eq!(fs::read(destination.join("marker")).unwrap(), b"old app");
+        assert_eq!(
+            fs::read(backup.join("marker")).unwrap(),
+            b"unrelated backup"
+        );
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn exclusive_rename_refuses_to_replace_an_empty_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("marker"), b"new app").unwrap();
+        fs::create_dir(&destination).unwrap();
+
+        assert!(rename_exclusive(&source, &destination).is_err());
+
+        assert_eq!(fs::read(source.join("marker")).unwrap(), b"new app");
+        assert!(fs::read_dir(destination).unwrap().next().is_none());
     }
 
     #[test]
@@ -2279,3 +2907,7 @@ TeamIdentifier=68994Z5PT3
         assert!(!app.exists());
     }
 }
+
+#[cfg(test)]
+#[path = "authorization_audit_tests.rs"]
+mod audit_tests;
