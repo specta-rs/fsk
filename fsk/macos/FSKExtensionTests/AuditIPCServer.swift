@@ -20,12 +20,89 @@ struct AuditIPCScript: Sendable {
 
 let auditIPCRequestTimeout: TimeInterval = 0.25
 
+final class AuditIPCBarrier: @unchecked Sendable {
+    let responseBody: Data
+    private let expected: Int
+    private let lock = NSLock()
+    private let arrivals = DispatchGroup()
+    private let completions = DispatchGroup()
+    private var arrivalCount = 0
+    private var completionCount = 0
+    private var cancelled = false
+
+    init(expecting: Int, responseBody: Data = Data(count: 52)) {
+        precondition(expecting > 0)
+        self.expected = expecting
+        self.responseBody = responseBody
+        for _ in 0..<expecting {
+            arrivals.enter()
+            completions.enter()
+        }
+    }
+
+    func arriveAndWait() {
+        lock.lock()
+        if arrivalCount < expected {
+            arrivalCount += 1
+            arrivals.leave()
+        }
+        lock.unlock()
+        arrivals.wait()
+    }
+
+    func complete() {
+        lock.lock()
+        if completionCount < expected {
+            completionCount += 1
+            completions.leave()
+        }
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        guard !cancelled else {
+            lock.unlock()
+            return
+        }
+        cancelled = true
+        while arrivalCount < expected {
+            arrivalCount += 1
+            arrivals.leave()
+        }
+        while completionCount < expected {
+            completionCount += 1
+            completions.leave()
+        }
+        lock.unlock()
+    }
+
+    func wait(timeout: TimeInterval) -> DispatchTimeoutResult {
+        completions.wait(timeout: .now() + timeout)
+    }
+
+    var completedNormally: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !cancelled && completionCount == expected
+    }
+
+    var isCancelled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return cancelled
+    }
+}
+
 /// Deterministic loopback-only FSKit IPC peer used by the audit regressions.
 final class AuditIPCServer: @unchecked Sendable {
+    private enum ServerMode: Sendable {
+        case scripts([[AuditIPCScript]])
+        case concurrent(AuditIPCBarrier)
+    }
+
     private let listener: Int32
     private let socketPath: String
     private let directory: URL
-    private let scripts: [[AuditIPCScript]]
+    private let mode: ServerMode
     private let lock = NSLock()
     private let scriptsDone = DispatchSemaphore(value: 0)
     private let done = DispatchSemaphore(value: 0)
@@ -36,8 +113,8 @@ final class AuditIPCServer: @unchecked Sendable {
     private var failures: [String] = []
     private var completedConnections = 0
 
-    init(scripts: [[AuditIPCScript]]) throws {
-        self.scripts = scripts
+    private init(mode: ServerMode) throws {
+        self.mode = mode
         let uniqueDirectory = "fsk-\(UUID().uuidString.prefix(8))"
         directory = auditTemporaryDirectory().appending(path: uniqueDirectory)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
@@ -61,6 +138,14 @@ final class AuditIPCServer: @unchecked Sendable {
             try? FileManager.default.removeItem(at: directory)
             throw POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO)
         }
+    }
+
+    convenience init(scripts: [[AuditIPCScript]]) throws {
+        try self.init(mode: .scripts(scripts))
+    }
+
+    convenience init(barrier: AuditIPCBarrier) throws {
+        try self.init(mode: .concurrent(barrier))
     }
 
     deinit { closeListener() }
@@ -90,6 +175,9 @@ final class AuditIPCServer: @unchecked Sendable {
             return
         }
         stopping = true
+        if case .concurrent(let barrier) = mode {
+            barrier.cancel()
+        }
         let currentPeers = Array(peers)
         lock.unlock()
         for peer in currentPeers { Darwin.shutdown(peer, SHUT_RDWR) }
@@ -102,20 +190,41 @@ final class AuditIPCServer: @unchecked Sendable {
     }
 
     func wait(timeout: TimeInterval = 3) throws {
-        if scriptsDone.wait(timeout: .now() + timeout) == .timedOut {
-            throw AuditIPCPeerError(description: "IPC peer did not consume its script")
-        }
-        lock.lock()
-        let errors = failures
-        let count = completedConnections
-        lock.unlock()
-        if !errors.isEmpty { throw AuditIPCPeerError(description: errors.joined(separator: "; ")) }
-        if count != scripts.count {
-            throw AuditIPCPeerError(description: "IPC peer served \(count) of \(scripts.count) connections")
+        switch mode {
+        case .scripts(let scripts):
+            if scriptsDone.wait(timeout: .now() + timeout) == .timedOut {
+                throw AuditIPCPeerError(description: "IPC peer did not consume its script")
+            }
+            lock.lock()
+            let errors = failures
+            let count = completedConnections
+            lock.unlock()
+            if !errors.isEmpty { throw AuditIPCPeerError(description: errors.joined(separator: "; ")) }
+            if count != scripts.count {
+                throw AuditIPCPeerError(description: "IPC peer served \(count) of \(scripts.count) connections")
+            }
+        case .concurrent(let barrier):
+            let result = barrier.wait(timeout: timeout)
+            lock.lock()
+            let errors = failures
+            lock.unlock()
+            if !errors.isEmpty { throw AuditIPCPeerError(description: errors.joined(separator: "; ")) }
+            guard result == .success, barrier.completedNormally else {
+                throw AuditIPCPeerError(description: "IPC peer did not complete its concurrent requests")
+            }
         }
     }
 
     private func run() {
+        switch mode {
+        case .scripts(let scripts):
+            runScripted(scripts)
+        case .concurrent(let barrier):
+            runConcurrent(barrier)
+        }
+    }
+
+    private func runScripted(_ scripts: [[AuditIPCScript]]) {
         defer {
             signalScriptsDone()
             closeListener()
@@ -161,6 +270,57 @@ final class AuditIPCServer: @unchecked Sendable {
         }
         lock.lock()
         let currentPeers = Array(peers)
+        peers.removeAll()
+        lock.unlock()
+        for peer in currentPeers { Darwin.close(peer) }
+    }
+
+    private func runConcurrent(_ barrier: AuditIPCBarrier) {
+        defer {
+            signalScriptsDone()
+            closeListener()
+            try? FileManager.default.removeItem(at: directory)
+            done.signal()
+        }
+        let group = DispatchGroup()
+        var accepted = 0
+        while true {
+            var ready = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
+            let polled = Darwin.poll(&ready, 1, 100)
+            if polled < 0 && errno == EINTR { continue }
+            lock.lock()
+            let shouldStop = stopping
+            lock.unlock()
+            if shouldStop { break }
+            guard polled > 0 else {
+                if polled < 0 { record("poll failed: \(errno)"); break }
+                continue
+            }
+            let peer = Darwin.accept(listener, nil, nil)
+            guard peer >= 0 else { record("accept failed: \(errno)"); break }
+            let includeConfiguration = accepted == 0
+            accepted += 1
+            lock.lock(); peers.insert(peer); lock.unlock()
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                defer { group.leave() }
+                do {
+                    try serveConcurrent(
+                        peer,
+                        barrier: barrier,
+                        includeConfiguration: includeConfiguration
+                    )
+                } catch {
+                    record(String(describing: error))
+                }
+            }
+        }
+        lock.lock()
+        let currentPeers = Array(peers)
+        lock.unlock()
+        for peer in currentPeers { Darwin.shutdown(peer, SHUT_RDWR) }
+        group.wait()
+        lock.lock()
         peers.removeAll()
         lock.unlock()
         for peer in currentPeers { Darwin.close(peer) }
@@ -252,6 +412,48 @@ final class AuditIPCServer: @unchecked Sendable {
                     usleep(10_000)
                 }
             }
+        }
+    }
+
+    private func serveConcurrent(
+        _ peer: Int32,
+        barrier: AuditIPCBarrier,
+        includeConfiguration: Bool
+    ) throws {
+        var handshake = [auditHello()]
+        if includeConfiguration { handshake.append(auditLocalConfiguration()) }
+        try serve(peer, script: handshake)
+        var timeout = timeval(tv_sec: 10, tv_usec: 0)
+        guard setsockopt(peer, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        while true {
+            let header: Data
+            do {
+                header = try auditReadExactly(24, from: peer)
+            } catch let error as POSIXError where error.code == .ECONNRESET || error.code == .ETIMEDOUT {
+                return
+            }
+            let opcode = header.withUnsafeBytes { UInt16(littleEndian: $0.loadUnaligned(fromByteOffset: 6, as: UInt16.self)) }
+            guard opcode == 2 else {
+                throw AuditIPCPeerError(description: "expected concurrent statfs request, got \(opcode)")
+            }
+            let length = header.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 16, as: UInt32.self)) }
+            guard length <= 16 * 1024 * 1024 else { throw AuditIPCPeerError(description: "oversized request") }
+            _ = try auditReadExactly(Int(length), from: peer)
+
+            barrier.arriveAndWait()
+            guard !barrier.isCancelled else { return }
+            var response = Data()
+            auditAppend(UInt32(0x4653_4249), to: &response)
+            auditAppend(ipcProtocolMajor, to: &response)
+            auditAppend(ipcProtocolMinor, to: &response)
+            response.append(header[8..<16])
+            auditAppend(Int32(0), to: &response)
+            auditAppend(UInt32(barrier.responseBody.count), to: &response)
+            response.append(barrier.responseBody)
+            try auditWriteAll(response, to: peer)
+            barrier.complete()
         }
     }
 

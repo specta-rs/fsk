@@ -103,9 +103,7 @@ final class FSKVolume: FSVolume,
                 try closeOpenState(of: item)
             } catch {
                 if firstError == nil { firstError = posix(error) }
-                if item.inode != rootInode {
-                    itemCache.withLock { $0.items[item.inode] = item }
-                }
+                itemCache.withLock { $0.items[item.inode] = item }
             }
         }
         replyHandler(firstError)
@@ -131,7 +129,7 @@ final class FSKVolume: FSVolume,
         }
         do {
             let value = try backend.attributes(inode: item.inode)
-            replyHandler(attributes(value, wanted: desiredAttributes), nil)
+            replyHandler(try attributes(value, wanted: desiredAttributes), nil)
         } catch {
             replyHandler(nil, posix(error))
         }
@@ -187,7 +185,7 @@ final class FSKVolume: FSVolume,
             if newAttributes.isValid(.gid) { newAttributes.consumedAttributes.insert(.gid) }
             if newAttributes.isValid(.accessTime) { newAttributes.consumedAttributes.insert(.accessTime) }
             if newAttributes.isValid(.modifyTime) { newAttributes.consumedAttributes.insert(.modifyTime) }
-            replyHandler(attributes(value, wanted: nil), nil)
+            replyHandler(try attributes(value, wanted: nil), nil)
         } catch {
             replyHandler(nil, posix(error))
         }
@@ -379,34 +377,40 @@ final class FSKVolume: FSVolume,
             return
         }
 
-        if requestedAttributes == nil && cookie.rawValue < directoryCookieBias {
-            if cookie.rawValue == 0 && !packer.packEntry(
-                name: FSFileName(string: "."),
-                itemType: .directory,
-                itemID: itemIdentifier(directory.inode),
-                nextCookie: FSDirectoryCookie(1),
-                attributes: nil
-            ) {
-                replyHandler(verifier, nil)
-                return
-            }
-            let parent = (try? backend.attributes(inode: directory.inode).parent) ?? directory.inode
-            if !packer.packEntry(
-                name: FSFileName(string: ".."),
-                itemType: .directory,
-                itemID: directory.inode == rootInode ? .parentOfRoot : itemIdentifier(parent),
-                nextCookie: FSDirectoryCookie(directoryCookieBias),
-                attributes: nil
-            ) {
-                replyHandler(verifier, nil)
-                return
-            }
-        }
-
-        let rustCookie = cookie.rawValue >= directoryCookieBias
-            ? cookie.rawValue - directoryCookieBias
-            : 0
         do {
+            if requestedAttributes == nil && cookie.rawValue < directoryCookieBias {
+                if cookie.rawValue == 0 {
+                    let itemID = try itemIdentifier(directory.inode)
+                    if !packer.packEntry(
+                        name: FSFileName(string: "."),
+                        itemType: .directory,
+                        itemID: itemID,
+                        nextCookie: FSDirectoryCookie(1),
+                        attributes: nil
+                    ) {
+                        replyHandler(verifier, nil)
+                        return
+                    }
+                }
+                let parent = (try? backend.attributes(inode: directory.inode).parent) ?? directory.inode
+                let parentID: FSItem.Identifier = directory.inode == rootInode
+                    ? .parentOfRoot
+                    : try itemIdentifier(parent)
+                if !packer.packEntry(
+                    name: FSFileName(string: ".."),
+                    itemType: .directory,
+                    itemID: parentID,
+                    nextCookie: FSDirectoryCookie(directoryCookieBias),
+                    attributes: nil
+                ) {
+                    replyHandler(verifier, nil)
+                    return
+                }
+            }
+
+            let rustCookie = cookie.rawValue >= directoryCookieBias
+                ? cookie.rawValue - directoryCookieBias
+                : 0
             let batch = try backend.readDirectory(
                 inode: directory.inode,
                 cookie: rustCookie,
@@ -416,14 +420,15 @@ final class FSKVolume: FSVolume,
                 let entryAttributes: FSItem.Attributes?
                 if let requestedAttributes,
                    let raw = try? backend.attributes(inode: entry.inode) {
-                    entryAttributes = attributes(raw, wanted: requestedAttributes)
+                    entryAttributes = try attributes(raw, wanted: requestedAttributes)
                 } else {
                     entryAttributes = nil
                 }
+                let itemID = try itemIdentifier(entry.inode)
                 if !packer.packEntry(
                     name: FSFileName(data: batch.name(for: entry)),
                     itemType: itemType(entry.kind),
-                    itemID: itemIdentifier(entry.inode),
+                    itemID: itemID,
                     nextCookie: FSDirectoryCookie(entry.next_cookie + directoryCookieBias),
                     attributes: entryAttributes
                 ) {
@@ -539,7 +544,15 @@ final class FSKVolume: FSVolume,
             replyHandler(POSIXError(.EINVAL))
             return
         }
-        guard modes.isEmpty, let lease = item.beginClose() else {
+        guard modes.isEmpty else {
+            replyHandler(nil)
+            return
+        }
+        let lease: UInt64
+        switch item.beginClose() {
+        case .started(let value):
+            lease = value
+        case .idle, .closing:
             replyHandler(nil)
             return
         }
@@ -554,7 +567,15 @@ final class FSKVolume: FSVolume,
     }
 
     private func closeOpenState(of item: FSKItem) throws {
-        guard let lease = item.beginClose() else { return }
+        let lease: UInt64
+        switch item.beginClose() {
+        case .started(let value):
+            lease = value
+        case .idle:
+            return
+        case .closing:
+            throw POSIXError(.EBUSY)
+        }
         do {
             try backend.close(lease: lease)
             item.finishClose(lease: lease, succeeded: true)
@@ -588,14 +609,14 @@ final class FSKVolume: FSVolume,
     private func attributes(
         _ value: FSKAttributes,
         wanted: FSItem.GetAttributesRequest?
-    ) -> FSItem.Attributes {
+    ) throws -> FSItem.Attributes {
         let result = FSItem.Attributes()
         func wants(_ attribute: FSItem.Attribute) -> Bool {
             wanted?.isAttributeWanted(attribute) ?? true
         }
-        if wants(.fileID) { result.fileID = itemIdentifier(value.inode) }
+        if wants(.fileID) { result.fileID = try itemIdentifier(value.inode) }
         if wants(.parentID) {
-            result.parentID = value.inode == rootInode ? .parentOfRoot : itemIdentifier(value.parent)
+            result.parentID = value.inode == rootInode ? .parentOfRoot : try itemIdentifier(value.parent)
         }
         if wants(.type) { result.type = itemType(value.kind) }
         if wants(.mode) { result.mode = value.mode }
@@ -616,12 +637,12 @@ final class FSKVolume: FSVolume,
         return result
     }
 
-    private func itemIdentifier(_ inode: UInt64) -> FSItem.Identifier {
+    private func itemIdentifier(_ inode: UInt64) throws -> FSItem.Identifier {
         guard inode != rootInode else { return .rootDirectory }
         guard inode != 0 else { return .invalid }
         let (rawValue, overflow) = inode.addingReportingOverflow(1)
         guard !overflow, let identifier = FSItem.Identifier(rawValue: rawValue) else {
-            return .invalid
+            throw POSIXError(.EOVERFLOW)
         }
         return identifier
     }

@@ -61,6 +61,19 @@ Switcher; it only shows its setup window when launched.
 If a future macOS refuses to register an extension outside Applications, set
 `FSK_APP_PATH=/Applications/FSK.app` before calling the lifecycle helpers.
 
+## FSKit identifier mapping
+
+FSKit reserves raw identifier values 1 and 2 for `rootDirectory` and
+`parentOfRoot`. The bridge therefore reports backend root inode 1 as
+`rootDirectory`, its parent as `parentOfRoot`, and every other valid backend
+inode `n` as `n + 1`. This keeps backend child inode 2 from colliding with the
+root identifier. Backend inode 0 maps to `invalid`.
+
+The shift reduces the representable non-root range to `2...UInt64.max - 1`.
+Backend inode `UInt64.max` cannot be represented without overflow, so metadata
+and directory-enumeration paths return `EOVERFLOW` instead of silently
+reporting an invalid identifier.
+
 ## Build and test
 
 ```sh

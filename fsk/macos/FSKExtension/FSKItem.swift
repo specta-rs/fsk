@@ -11,6 +11,12 @@ private struct OpenState: Sendable {
 }
 
 final class FSKItem: FSItem, @unchecked Sendable {
+    enum CloseBeginResult {
+        case idle
+        case closing
+        case started(lease: UInt64)
+    }
+
     let inode: UInt64
     let kind: FSItem.ItemType
     private let openState = OSAllocatedUnfairLock<OpenState?>(initialState: nil)
@@ -68,18 +74,19 @@ final class FSKItem: FSItem, @unchecked Sendable {
         }
     }
 
-    func beginClose() -> UInt64? {
+    func beginClose() -> CloseBeginResult {
         openState.withLockUnchecked { state in
-            guard var current = state, !current.closing else { return nil }
+            guard var current = state else { return .idle }
+            guard !current.closing else { return .closing }
             current.closing = true
             state = current
-            return current.lease
+            return .started(lease: current.lease)
         }
     }
 
     func finishClose(lease: UInt64, succeeded: Bool) {
         let descriptor = openState.withLockUnchecked { state -> Int32? in
-            guard let current = state, current.lease == lease else { return nil }
+            guard let current = state, current.lease == lease, current.closing else { return nil }
             guard succeeded else {
                 var retry = current
                 retry.closing = false

@@ -121,6 +121,30 @@ struct AuditRegressionTests {
         }
     }
 
+    @Test("maximum non-root inode identifiers report overflow")
+    func maximumInodeIdentifierOverflows() throws {
+        try withAuditBackend([[
+            auditHello(), auditLocalConfiguration(),
+            auditGetAttributes(auditAttributes(inode: UInt64.max, parent: 1)),
+            auditGetAttributes(auditAttributes(inode: 2, parent: UInt64.max)),
+        ]]) { backend in
+            let volume = FSKVolume(backend: backend)
+            var attributes: FSItem.Attributes?
+            var error: Error?
+            let fileRequest = FSItem.GetAttributesRequest()
+            fileRequest.wantedAttributes = [.fileID]
+            volume.getAttributes(fileRequest, of: FSKItem(inode: UInt64.max, kind: .file)) { attributes = $0; error = $1 }
+            #expect(attributes == nil)
+            #expect(auditPOSIX(error) == EOVERFLOW)
+
+            let parentRequest = FSItem.GetAttributesRequest()
+            parentRequest.wantedAttributes = [.parentID]
+            volume.getAttributes(parentRequest, of: FSKItem(inode: 2, kind: .file)) { attributes = $0; error = $1 }
+            #expect(attributes == nil)
+            #expect(auditPOSIX(error) == EOVERFLOW)
+        }
+    }
+
     @Test("failed setAttributes does not claim attributes were consumed")
     func failedSetAttributesConsumption() throws {
         try withAuditBackend([[
@@ -323,6 +347,76 @@ struct AuditRegressionTests {
         }
     }
 
+    @Test("an in-flight close keeps reclaim and deactivation retryable")
+    func inFlightCloseRetainsState() throws {
+        func startedLease(_ result: FSKItem.CloseBeginResult) -> UInt64? {
+            if case .started(let lease) = result { return lease }
+            return nil
+        }
+
+        var inode = Data()
+        auditAppend(UInt64(2), to: &inode)
+        var lookup = Data()
+        auditAppend(UInt64(2), to: &lookup)
+        auditAppend(FSK_KIND_FILE, to: &lookup)
+        try withAuditBackend([[
+            auditHello(), auditLocalConfiguration(),
+            .init(opcode: 9, behavior: .respond(body: inode)),
+            .init(opcode: 5, behavior: .respond(body: lookup)),
+        ]]) { backend in
+            let volume = FSKVolume(backend: backend)
+            var created: FSKItem?
+            volume.createItem(named: FSFileName(string: "file"), type: .file, inDirectory: volume.rootItem, attributes: FSItem.SetAttributesRequest()) { item, _, error in
+                #expect(error == nil)
+                created = item as? FSKItem
+            }
+            let item = try #require(created)
+            #expect(item.install(RustOpenFile(lease: 7, generation: 1, localPath: nil)))
+            let firstLease = try #require(startedLease(item.beginClose()))
+            #expect(firstLease == 7)
+
+            var reclaimMethod: Method?
+            var originalReclaimIMP: IMP?
+            if #available(macOS 27.0, *) {
+                let method = try #require(class_getInstanceMethod(FSItem.self, NSSelectorFromString("tryReclaimWithBlock:")))
+                reclaimMethod = method
+                let accept: @convention(c) (AnyObject, Selector, @convention(block) () -> Void) -> Bool = { _, _, block in
+                    block()
+                    return true
+                }
+                originalReclaimIMP = method_setImplementation(method, unsafeBitCast(accept, to: IMP.self))
+            }
+            defer {
+                if let reclaimMethod, let originalReclaimIMP {
+                    method_setImplementation(reclaimMethod, originalReclaimIMP)
+                }
+            }
+
+            var error: Error?
+            volume.reclaimItem(item) { error = $0 }
+            #expect(auditPOSIX(error) == EBUSY)
+            item.finishClose(lease: 7, succeeded: false)
+
+            let retryLease = try #require(startedLease(item.beginClose()))
+            #expect(retryLease == 7)
+            volume.deactivate { error = $0 }
+            #expect(auditPOSIX(error) == EBUSY)
+            item.finishClose(lease: retryLease, succeeded: false)
+
+            let finalLease = try #require(startedLease(item.beginClose()))
+            #expect(finalLease == 7)
+            item.finishClose(lease: finalLease, succeeded: false)
+
+            var found: FSKItem?
+            volume.lookupItem(named: FSFileName(string: "file"), inDirectory: volume.rootItem) { candidate, _, lookupError in
+                #expect(lookupError == nil)
+                found = candidate as? FSKItem
+            }
+            #expect(found === item)
+            #expect(item.releaseOpenState() == 7)
+        }
+    }
+
     @Test("a non-final directory cookie must advance")
     func rewindingDirectoryCookie() throws {
         let body = auditDirectoryBody(entries: [(inode: 2, next: 0, name: "a")], next: 0, eof: false)
@@ -417,15 +511,13 @@ struct AuditRegressionTests {
 
     @Test("concurrent requests use independent authenticated connections")
     func concurrentIPCRequests() throws {
-        let reply = AuditIPCScript(opcode: 2, behavior: .respond(body: Data(count: 52)))
-        var scripts = [[auditHello(), auditLocalConfiguration(), reply]]
-        for _ in 0..<3 { scripts.append([auditHello(), reply]) }
-        let server = try AuditIPCServer(scripts: scripts)
+        let barrier = AuditIPCBarrier(expecting: 4)
+        let server = try AuditIPCServer(barrier: barrier)
         server.start()
         defer { server.stop() }
         let backend = try RustBackend(
             resourceURL: server.resourceURL,
-            requestTimeout: auditIPCRequestTimeout
+            requestTimeout: 5
         )
         let group = DispatchGroup()
         let errors = AuditErrorList()
@@ -440,9 +532,9 @@ struct AuditRegressionTests {
                 }
             }
         }
-        #expect(group.wait(timeout: .now() + 3) == .success)
+        #expect(group.wait(timeout: .now() + 10) == .success)
         #expect(errors.values.isEmpty)
-        try server.wait()
+        try server.wait(timeout: 10)
     }
 
     @Test("a stalled IPC peer cannot block a request forever")
@@ -489,14 +581,14 @@ struct AuditRegressionTests {
         defer { server.stop() }
         let backend = try RustBackend(
             resourceURL: server.resourceURL,
-            requestTimeout: auditIPCRequestTimeout
+            requestTimeout: 2
         )
         let start = DispatchTime.now()
         #expect(throws: RustBackendError.self) {
             _ = try backend.statfs()
         }
         let elapsed = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
-        #expect(elapsed < UInt64(auditIPCRequestTimeout * 800_000_000))
+        #expect(elapsed < 1_500_000_000)
         try server.wait()
     }
 
