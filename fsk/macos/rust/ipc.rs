@@ -1061,3 +1061,7 @@ mod tests {
         value.split("</integer>").next()?.trim().parse().ok()
     }
 }
+
+#[cfg(test)]
+#[path = "ipc_audit_tests.rs"]
+mod audit_tests;

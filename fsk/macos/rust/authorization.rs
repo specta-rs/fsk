@@ -2279,3 +2279,7 @@ TeamIdentifier=68994Z5PT3
         assert!(!app.exists());
     }
 }
+
+#[cfg(test)]
+#[path = "authorization_audit_tests.rs"]
+mod audit_tests;

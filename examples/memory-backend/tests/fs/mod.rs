@@ -2,6 +2,8 @@ use super::*;
 use fsk::DirectorySink;
 use std::sync::Arc;
 
+mod audit;
+
 #[derive(Default)]
 struct VecSink {
     capacity: usize,

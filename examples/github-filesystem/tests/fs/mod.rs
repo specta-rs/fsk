@@ -17,18 +17,33 @@ struct FakeGitHub {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy)]
+enum FakeMode {
+    Normal,
+    Installation,
+    Paginated,
+}
+
 impl FakeGitHub {
     fn start() -> Self {
-        Self::start_with(false)
+        Self::start_configured(FakeMode::Normal, None)
     }
 
     /// Serves the workflow installation token's endpoints: `/user/repos` is
     /// forbidden and repositories come from `/installation/repositories`.
     fn start_installation() -> Self {
-        Self::start_with(true)
+        Self::start_configured(FakeMode::Installation, None)
     }
 
-    fn start_with(installation: bool) -> Self {
+    fn start_with_repository_contents(contents: String) -> Self {
+        Self::start_configured(FakeMode::Normal, Some(contents))
+    }
+
+    fn start_paginated() -> Self {
+        Self::start_configured(FakeMode::Paginated, None)
+    }
+
+    fn start_configured(mode: FakeMode, repository_contents: Option<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake GitHub");
         listener.set_nonblocking(true).expect("nonblocking");
         let address = listener.local_addr().expect("server address");
@@ -51,11 +66,22 @@ impl FakeGitHub {
                 let target = request.split_whitespace().nth(1).expect("request target");
                 request_count.fetch_add(1, Ordering::Relaxed);
                 let (status, content_type, body) = if target.starts_with("/user/repos") {
-                    if installation {
+                    if matches!(mode, FakeMode::Installation) {
                         (
                             "403 Forbidden",
                             "application/json",
                             r#"{"message":"Resource not accessible by integration"}"#.to_owned(),
+                        )
+                    } else if matches!(mode, FakeMode::Paginated) {
+                        let name = if target.contains("page=2") {
+                            "second"
+                        } else {
+                            "first"
+                        };
+                        (
+                            "200 OK",
+                            "application/json",
+                            format!(r#"[{{"name":"{name}","owner":{{"login":"owner"}}}}]"#),
                         )
                     } else {
                         (
@@ -72,13 +98,12 @@ impl FakeGitHub {
                             .to_owned(),
                     )
                 } else if target == "/repos/specta-rs/fsk/contents" {
-                    (
-                        "200 OK",
-                        "application/json",
+                    let body = repository_contents.clone().unwrap_or_else(|| {
                         format!(
                             r#"[{{"name":"README.md","path":"README.md","sha":"abc123","size":12,"type":"file","download_url":"{server_url}/download/readme","content":null}},{{"name":"src","path":"src","sha":"dir1","size":0,"type":"dir","download_url":null,"content":null}}]"#
-                        ),
-                    )
+                        )
+                    });
+                    ("200 OK", "application/json", body)
                 } else if target == "/download/readme" {
                     // The branch moved after we indexed the original blob.
                     (
@@ -99,8 +124,16 @@ impl FakeGitHub {
                 } else {
                     ("200 OK", "application/json", "{}".to_owned())
                 };
+                let link_header = if matches!(mode, FakeMode::Paginated)
+                    && target.starts_with("/user/repos")
+                    && !target.contains("page=2")
+                {
+                    format!("Link: <{server_url}/user/repos?per_page=100&page=2>; rel=\"next\"\r\n")
+                } else {
+                    String::new()
+                };
                 let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{link_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream
@@ -218,6 +251,147 @@ fn cleanup_evicts_idle_files_but_not_leases() {
     assert!(path.exists());
     cache.release(&lease).expect("release");
     assert!(!path.exists());
+}
+
+#[test]
+fn repository_pagination_follows_link_when_a_page_is_short() {
+    let server = FakeGitHub::start_paginated();
+    let api = Api::new(&server.url, "test-token").expect("API client");
+
+    let repositories = api.user_repositories().expect("repository pages");
+    let names: Vec<_> = repositories
+        .into_iter()
+        .map(|repository| repository.name)
+        .collect();
+
+    assert_eq!(names, ["first", "second"], "the Link next page was skipped");
+    assert_eq!(server.requests.load(Ordering::Relaxed), 2);
+}
+
+fn filesystem_with_unsupported_git_entries()
+-> (FakeGitHub, tempfile::TempDir, GitHubFilesystem, u64) {
+    let server = FakeGitHub::start_with_repository_contents(
+        r#"[{"name":"link","path":"link","sha":"symlink-sha","size":4,"type":"symlink","target":"README.md"},{"name":"module","path":"module","sha":"commit-sha","size":0,"type":"submodule","submodule_git_url":"https://example.invalid/module.git"}]"#
+            .to_owned(),
+    );
+    let cache = tempfile::tempdir().expect("cache directory");
+    let filesystem = GitHubFilesystem::new(Options {
+        api_url: server.url.clone(),
+        token: "test-token".to_owned(),
+        cache_dir: cache.path().to_owned(),
+        max_cache_bytes: 1024,
+        max_idle: Duration::from_secs(60),
+        download_on_list: false,
+    })
+    .expect("filesystem");
+    let (owner, _) = filesystem.lookup(ROOT_INODE, b"specta-rs").expect("owner");
+    let (repo, _) = filesystem.lookup(owner, b"fsk").expect("repository");
+    (server, cache, filesystem, repo)
+}
+
+#[test]
+fn symlinks_are_not_exposed_as_regular_files() {
+    let (_server, _cache, filesystem, repo) = filesystem_with_unsupported_git_entries();
+
+    assert_eq!(
+        filesystem.lookup(repo, b"link"),
+        Err(Error(ENOENT)),
+        "a symlink must not be presented as a regular file containing link text"
+    );
+}
+
+#[test]
+fn submodules_are_not_exposed_as_regular_files() {
+    let (_server, _cache, filesystem, repo) = filesystem_with_unsupported_git_entries();
+
+    assert_eq!(
+        filesystem.lookup(repo, b"module"),
+        Err(Error(ENOENT)),
+        "a submodule commit SHA is not a readable Git blob"
+    );
+}
+
+#[test]
+fn contents_page_at_the_api_limit_is_not_reported_as_complete() {
+    let entries = (0..1000)
+        .map(|index| {
+            format!(
+                r#"{{"name":"file-{index:04}","path":"file-{index:04}","sha":"sha-{index}","size":1,"type":"file","content":null}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let server = FakeGitHub::start_with_repository_contents(format!("[{entries}]"));
+    let cache = tempfile::tempdir().expect("cache directory");
+    let filesystem = GitHubFilesystem::new(Options {
+        api_url: server.url.clone(),
+        token: "test-token".to_owned(),
+        cache_dir: cache.path().to_owned(),
+        max_cache_bytes: 1024,
+        max_idle: Duration::from_secs(60),
+        download_on_list: false,
+    })
+    .expect("filesystem");
+    let (owner, _) = filesystem.lookup(ROOT_INODE, b"specta-rs").expect("owner");
+    let (repo, _) = filesystem.lookup(owner, b"fsk").expect("repository");
+
+    assert_eq!(
+        filesystem.lookup(repo, b"missing"),
+        Err(Error::IO),
+        "GitHub's 1,000-entry contents response may be truncated and must not be marked complete"
+    );
+}
+
+#[test]
+fn another_cache_instance_must_not_evict_a_leased_file() {
+    let directory = tempfile::tempdir().expect("cache directory");
+    let first = Cache::new(directory.path().to_owned(), 1024, Duration::from_secs(10))
+        .expect("first cache");
+    let leased_file = FileNode {
+        owner: "o".into(),
+        repo: "r".into(),
+        path: "leased".into(),
+        sha: "leased-sha".into(),
+        size: 4,
+        inline: None,
+    };
+    let other_file = FileNode {
+        path: "other".into(),
+        sha: "other-sha".into(),
+        ..leased_file.clone()
+    };
+    let leased_path = first
+        .materialize(&leased_file, || Ok(b"data".to_vec()))
+        .expect("leased materialize");
+    first
+        .materialize(&other_file, || Ok(b"temp".to_vec()))
+        .expect("other materialize");
+    let _lease = first.acquire(&leased_file).expect("acquire lease");
+    let old = filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(60));
+    filetime::set_file_mtime(&leased_path, old).expect("age leased file");
+
+    let _second = Cache::new(directory.path().to_owned(), 1024, Duration::from_secs(10))
+        .expect("second cache sharing the directory");
+
+    assert!(
+        leased_path.is_file(),
+        "a second cache instance evicted a file held by the first instance"
+    );
+}
+
+#[test]
+fn startup_cleanup_removes_stale_interrupted_downloads() {
+    let directory = tempfile::tempdir().expect("cache directory");
+    Cache::new(directory.path().to_owned(), 1024, Duration::from_secs(10)).expect("initial cache");
+    let temporary = directory.path().join(".1234.5678.tmp");
+    fs::write(&temporary, b"partial download").expect("write interrupted download");
+    let old = filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(60));
+    filetime::set_file_mtime(&temporary, old).expect("age temporary file");
+
+    Cache::new(directory.path().to_owned(), 1024, Duration::from_secs(10))
+        .expect("restarted cache");
+
+    assert!(!temporary.exists(), "stale .tmp files leak across restarts");
 }
 
 /// Mount a real GitHub repository through FUSE and read it.

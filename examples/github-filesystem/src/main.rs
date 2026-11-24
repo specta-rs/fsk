@@ -191,3 +191,156 @@ fn default_cache_dir() -> PathBuf {
 fn to_io(error: fsk::Error) -> io::Error {
     io::Error::from_raw_os_error(error.0)
 }
+#[cfg(all(target_os = "macos", test))]
+#[link(name = "sandbox")]
+unsafe extern "C" {
+    fn sandbox_init(
+        profile: *const std::ffi::c_char,
+        flags: u64,
+        error: *mut *mut std::ffi::c_char,
+    ) -> i32;
+    fn sandbox_free_error(error: *mut std::ffi::c_char);
+    #[link_name = "open"]
+    fn probe_open(path: *const std::ffi::c_char, flags: i32, ...) -> i32;
+    #[link_name = "read"]
+    fn probe_read(fd: i32, buffer: *mut std::ffi::c_void, count: usize) -> isize;
+    #[link_name = "close"]
+    fn probe_close(fd: i32) -> i32;
+}
+
+#[cfg(all(target_os = "macos", test))]
+struct TemporaryHome(Option<std::ffi::OsString>);
+
+#[cfg(all(target_os = "macos", test))]
+impl TemporaryHome {
+    fn new(path: &std::path::Path) -> Self {
+        let previous = env::var_os("HOME");
+        unsafe { env::set_var("HOME", path) };
+        Self(previous)
+    }
+}
+
+#[cfg(all(target_os = "macos", test))]
+impl Drop for TemporaryHome {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take() {
+            unsafe { env::set_var("HOME", previous) };
+        } else {
+            unsafe { env::remove_var("HOME") };
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", test))]
+fn sandbox_read_status(
+    path: &std::path::Path,
+    allowed_root: &std::path::Path,
+    expected: &[u8],
+) -> i32 {
+    std::process::Command::new(env::current_exe().expect("test executable"))
+        .args(["--exact", "sandbox_read_probe"])
+        .env("FSK_SANDBOX_READ_PATH", path)
+        .env("FSK_SANDBOX_ALLOWED_ROOT", allowed_root)
+        .env(
+            "FSK_SANDBOX_EXPECTED",
+            std::str::from_utf8(expected).expect("UTF-8 probe contents"),
+        )
+        .status()
+        .expect("run sandbox read probe")
+        .code()
+        .unwrap_or(99)
+}
+
+#[cfg(all(target_os = "macos", test))]
+#[test]
+fn sandbox_read_probe() {
+    let Some(path) = env::var_os("FSK_SANDBOX_READ_PATH") else {
+        return;
+    };
+    let allowed_root = env::var_os("FSK_SANDBOX_ALLOWED_ROOT").expect("allowed sandbox root");
+    let expected = env::var("FSK_SANDBOX_EXPECTED").expect("expected probe contents");
+    let allowed_root =
+        std::fs::canonicalize(PathBuf::from(allowed_root)).expect("canonical allowed sandbox root");
+    let path = std::fs::canonicalize(PathBuf::from(path)).expect("canonical probe path");
+    let path =
+        std::ffi::CString::new(path.to_str().expect("UTF-8 probe path")).expect("probe path");
+    let expected = expected.into_bytes();
+    let mut buffer = [0_u8; 256];
+    let root = allowed_root
+        .to_str()
+        .expect("UTF-8 sandbox root")
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let profile = std::ffi::CString::new(format!(
+        "(version 1) (deny default) (allow file-read* (subpath \"{root}\"))"
+    ))
+    .expect("sandbox profile");
+    let mut error = std::ptr::null_mut();
+    let status = unsafe { sandbox_init(profile.as_ptr(), 0, &raw mut error) };
+    if status != 0 {
+        let message = if error.is_null() {
+            "unknown sandbox_init error".to_owned()
+        } else {
+            let message = unsafe { std::ffi::CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { sandbox_free_error(error) };
+            message
+        };
+        panic!("sandbox_init failed: {message}");
+    }
+
+    let fd = unsafe { probe_open(path.as_ptr(), 0) };
+    if fd < 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        std::process::exit(if errno == Some(1) { 10 } else { 12 });
+    }
+    let count = unsafe { probe_read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+    unsafe { probe_close(fd) };
+    if count < 0 {
+        std::process::exit(12);
+    }
+    let count = usize::try_from(count).expect("read count fits usize");
+    if buffer[..count] == expected {
+        std::process::exit(0);
+    }
+    std::process::exit(11);
+}
+
+#[cfg(all(target_os = "macos", test))]
+#[test]
+fn default_cache_local_open_is_denied_but_app_group_open_succeeds() {
+    let temporary_home = tempfile::tempdir().expect("temporary HOME");
+    let _home = TemporaryHome::new(temporary_home.path());
+    let legacy_default = temporary_home
+        .path()
+        .join("Library/Caches/fsk-github-filesystem");
+    let app_group_root = temporary_home
+        .path()
+        .join("Library/Group Containers/group.dev.specta.fsk");
+    let app_group_default = app_group_root.join("Caches/fsk-github-filesystem");
+    let contents = b"cached bytes";
+    for directory in [&legacy_default, &app_group_default] {
+        std::fs::create_dir_all(directory).expect("create cache directory");
+        std::fs::write(directory.join("file.blob"), contents).expect("write cached file");
+    }
+
+    let selected_default = default_cache_dir();
+    let legacy_status =
+        sandbox_read_status(&legacy_default.join("file.blob"), &app_group_root, contents);
+    let app_group_status = sandbox_read_status(
+        &app_group_default.join("file.blob"),
+        &app_group_root,
+        contents,
+    );
+    println!(
+        "legacy default sandbox read exit: {legacy_status}; App Group sandbox read exit: {app_group_status}"
+    );
+
+    assert_eq!(legacy_status, 10, "legacy cache open must fail with EPERM");
+    assert_eq!(app_group_status, 0, "App Group cache open must succeed");
+    assert_eq!(
+        selected_default, app_group_default,
+        "local-file leases must use the readable App Group container"
+    );
+}

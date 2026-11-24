@@ -263,12 +263,11 @@ mod imp {
 #[cfg(target_os = "linux")]
 mod imp {
     use super::AuthorizationStatus;
-    use std::{fs, io, os::unix::fs::FileTypeExt};
+    use std::{fs, io, os::unix::fs::FileTypeExt, path::Path};
 
     #[allow(clippy::unnecessary_wraps)]
     pub(super) fn authorization_status() -> io::Result<AuthorizationStatus> {
-        let available =
-            fs::metadata("/dev/fuse").is_ok_and(|metadata| metadata.file_type().is_char_device());
+        let available = available_at(Path::new("/dev/fuse"));
         Ok(if available {
             AuthorizationStatus::Authorized
         } else {
@@ -276,11 +275,38 @@ mod imp {
         })
     }
 
+    fn available_at(path: &Path) -> bool {
+        fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_char_device())
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     pub(super) fn request_approval() -> io::Result<()> {
         // Linux has no standard setup dialog. The error from
         // `ensure_authorization` contains the FUSE requirement instead.
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn authorization_requires_device_open_not_just_metadata() {
+            let path = Path::new("/dev/tty");
+            assert!(fs::metadata(path).unwrap().file_type().is_char_device());
+            assert!(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .is_err(),
+                "this regression expects the headless runner to have no controlling tty"
+            );
+            assert!(
+                !available_at(path),
+                "an unopenable character device must not report Authorized"
+            );
+        }
     }
 }
 

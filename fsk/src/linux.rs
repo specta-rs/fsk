@@ -1000,6 +1000,10 @@ mod tests {
         );
     }
 
+    #[cfg(test)]
+    #[path = "linux_audit.rs"]
+    mod audit;
+
     #[test]
     fn file_handles_are_unique_and_never_zero() {
         let counter = AtomicU64::new(1);

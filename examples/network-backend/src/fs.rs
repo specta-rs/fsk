@@ -163,3 +163,7 @@ pub fn filesystem(resource: &[u8]) -> Result<ExampleNetworkFilesystem> {
 fn io_error(error: &std::io::Error) -> Error {
     Error(error.raw_os_error().unwrap_or(5))
 }
+
+#[cfg(test)]
+#[path = "../tests/fs/mod.rs"]
+mod tests;

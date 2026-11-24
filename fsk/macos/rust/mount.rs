@@ -389,3 +389,7 @@ mod tests {
         assert!(socket.exists());
     }
 }
+
+#[cfg(test)]
+#[path = "mount_audit_tests.rs"]
+mod audit_tests;
