@@ -7,6 +7,7 @@ import os
 private struct OpenState: Sendable {
     let lease: UInt64
     let localDescriptor: Int32?
+    var closing = false
 }
 
 final class FSKItem: FSItem, @unchecked Sendable {
@@ -64,6 +65,32 @@ final class FSKItem: FSItem, @unchecked Sendable {
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             return count
+        }
+    }
+
+    func beginClose() -> UInt64? {
+        openState.withLockUnchecked { state in
+            guard var current = state, !current.closing else { return nil }
+            current.closing = true
+            state = current
+            return current.lease
+        }
+    }
+
+    func finishClose(lease: UInt64, succeeded: Bool) {
+        let descriptor = openState.withLockUnchecked { state -> Int32? in
+            guard let current = state, current.lease == lease else { return nil }
+            guard succeeded else {
+                var retry = current
+                retry.closing = false
+                state = retry
+                return nil
+            }
+            state = nil
+            return current.localDescriptor
+        }
+        if let descriptor {
+            Darwin.close(descriptor)
         }
     }
 

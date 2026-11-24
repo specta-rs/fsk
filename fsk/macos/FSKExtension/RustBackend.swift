@@ -9,6 +9,12 @@ let ipcProtocolMajor: UInt16 = 1
 let ipcProtocolMinor: UInt16 = 1
 private let ipcHeaderLength = 24
 private let ipcMaximumFrame = 16 * 1024 * 1024
+let fskDirectoryCookieBias: UInt64 = 2
+#if DEBUG
+private let ipcRequestTimeout: TimeInterval = 0.25
+#else
+private let ipcRequestTimeout: TimeInterval = 30
+#endif
 
 private enum IPCOperation: UInt16 {
     case hello = 0
@@ -166,16 +172,12 @@ final class RustBackend: @unchecked Sendable {
     private let pool: IPCConnectionPool
     let configuration: RustBackendConfiguration
 
+    static func isValidResource(_ resourceURL: URL) -> Bool {
+        (try? resourceParameters(resourceURL)) != nil
+    }
+
     init(resourceURL: URL) throws {
-        guard resourceURL.scheme?.lowercased() == "fsk",
-              let components = URLComponents(url: resourceURL, resolvingAgainstBaseURL: false),
-              let socketPath = components.queryItems?.first(where: { $0.name == "socket" })?.value,
-              let tokenHex = components.queryItems?.first(where: { $0.name == "token" })?.value,
-              let token = Data(hex: tokenHex),
-              token.count == 32
-        else {
-            throw RustBackendError.invalidResource
-        }
+        let (socketPath, token) = try Self.resourceParameters(resourceURL)
         pool = IPCConnectionPool(socketPath: socketPath, token: token)
         let response = try pool.request(.configuration)
         var decoder = IPCDecoder(response)
@@ -185,6 +187,20 @@ final class RustBackend: @unchecked Sendable {
             supportsLocalFiles: try decoder.uint8() != 0,
             kernelCachePolicy: try decoder.uint8()
         )
+    }
+
+    private static func resourceParameters(_ resourceURL: URL) throws -> (socketPath: String, token: Data) {
+        guard resourceURL.scheme?.lowercased() == "fsk",
+              let components = URLComponents(url: resourceURL, resolvingAgainstBaseURL: false),
+              let socketPath = components.queryItems?.first(where: { $0.name == "socket" })?.value,
+              !socketPath.isEmpty,
+              let tokenHex = components.queryItems?.first(where: { $0.name == "token" })?.value,
+              let token = Data(hex: tokenHex),
+              token.count == 32
+        else {
+            throw RustBackendError.invalidResource
+        }
+        return (socketPath, token)
     }
 
     func statfs() throws -> FSKStatFS {
@@ -261,6 +277,20 @@ final class RustBackend: @unchecked Sendable {
             )
         }
         let names = try decoder.data(count: nameCount)
+        for entry in entries {
+            let start = Int(entry.name_offset)
+            guard start <= names.count,
+                  Int(entry.name_length) <= names.count - start
+            else {
+                throw RustBackendError.invalidProtocol
+            }
+        }
+        guard entries.allSatisfy({ $0.next_cookie > cookie }) else {
+            throw RustBackendError.posix(ERANGE)
+        }
+        guard entries.allSatisfy({ $0.next_cookie <= UInt64.max - fskDirectoryCookieBias }) else {
+            throw RustBackendError.posix(EOVERFLOW)
+        }
         let batch = RustDirectoryBatch(
             entries: entries,
             names: names,
@@ -295,7 +325,11 @@ final class RustBackend: @unchecked Sendable {
         request.append(offset)
         request.append(data)
         var decoder = IPCDecoder(try pool.request(.write, request.data))
-        return Int(try decoder.uint64())
+        let rawCount = try decoder.uint64()
+        guard rawCount <= UInt64(data.count), let count = Int(exactly: rawCount) else {
+            throw RustBackendError.invalidProtocol
+        }
+        return count
     }
 
     func create(parent: UInt64, name: Data, kind: UInt8, mode: UInt32) throws -> UInt64 {
@@ -323,7 +357,9 @@ final class RustBackend: @unchecked Sendable {
         var request = IPCEncoder(capacity: 12)
         request.append(inode)
         request.append(UInt32(capacity))
-        return try pool.request(.readlink, request.data)
+        let response = try pool.request(.readlink, request.data)
+        guard response.count <= capacity else { throw RustBackendError.invalidProtocol }
+        return response
     }
 
     func remove(parent: UInt64, name: Data, inode: UInt64) throws {
@@ -470,6 +506,20 @@ private final class IPCConnection {
         descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw RustBackendError.posix(errno) }
         do {
+            let seconds = Int(ipcRequestTimeout)
+            let microseconds = Int((ipcRequestTimeout - TimeInterval(seconds)) * 1_000_000)
+            var timeout = timeval(tv_sec: seconds, tv_usec: Int32(microseconds))
+            for option in [SO_RCVTIMEO, SO_SNDTIMEO] {
+                guard setsockopt(
+                    descriptor,
+                    SOL_SOCKET,
+                    option,
+                    &timeout,
+                    socklen_t(MemoryLayout<timeval>.size)
+                ) == 0 else {
+                    throw RustBackendError.posix(errno)
+                }
+            }
             try connect(path: socketPath)
             let hello = try requestRaw(.hello, token, requestID: 1)
             _ = try hello.result.get()
@@ -519,9 +569,10 @@ private final class IPCConnection {
         header.append(UInt32(body.count))
         header.append(ipcProtocolMinor)
         header.append(UInt16(0))
-        try writePair(header.data, body)
+        let deadline = DispatchTime.now() + ipcRequestTimeout
+        try writePair(header.data, body, deadline: deadline)
 
-        let responseHeader = try readExactly(ipcHeaderLength)
+        let responseHeader = try readExactly(ipcHeaderLength, deadline: deadline)
         var decoder = IPCDecoder(responseHeader)
         guard try decoder.uint32() == ipcMagic else {
             throw RustBackendError.invalidProtocol
@@ -540,7 +591,7 @@ private final class IPCConnection {
         let status = try decoder.int32()
         let length = Int(try decoder.uint32())
         guard length <= ipcMaximumFrame else { throw RustBackendError.invalidProtocol }
-        let response = try readExactly(length)
+        let response = try readExactly(length, deadline: deadline)
         return (status == 0 ? .success(response) : .failure(.posix(status)), serverMinor)
     }
 
@@ -564,10 +615,11 @@ private final class IPCConnection {
         guard status == 0 else { throw RustBackendError.posix(errno) }
     }
 
-    private func writeAll(_ data: Data) throws {
+    private func writeAll(_ data: Data, deadline: DispatchTime) throws {
         try data.withUnsafeBytes { raw in
             var offset = 0
             while offset < raw.count {
+                try waitUntilReady(Int16(POLLOUT), deadline: deadline)
                 let count = Darwin.write(descriptor, raw.baseAddress! + offset, raw.count - offset)
                 if count < 0 && errno == EINTR { continue }
                 guard count > 0 else { throw RustBackendError.posix(errno == 0 ? EPIPE : errno) }
@@ -576,9 +628,9 @@ private final class IPCConnection {
         }
     }
 
-    private func writePair(_ header: Data, _ body: Data) throws {
+    private func writePair(_ header: Data, _ body: Data, deadline: DispatchTime) throws {
         if body.isEmpty {
-            try writeAll(header)
+            try writeAll(header, deadline: deadline)
             return
         }
         try header.withUnsafeBytes { headerBytes in
@@ -593,34 +645,36 @@ private final class IPCConnection {
                         iov_len: bodyBytes.count
                     ),
                 ]
+                try waitUntilReady(Int16(POLLOUT), deadline: deadline)
                 let count = Darwin.writev(descriptor, &vectors, 2)
                 if count < 0 && errno == EINTR {
-                    try writeAll(header)
-                    try writeAll(body)
+                    try writeAll(header, deadline: deadline)
+                    try writeAll(body, deadline: deadline)
                     return
                 }
                 guard count > 0 else {
                     throw RustBackendError.posix(errno == 0 ? EPIPE : errno)
                 }
                 if count < headerBytes.count {
-                    try writeAll(header.subdata(in: count..<headerBytes.count))
-                    try writeAll(body)
+                    try writeAll(header.subdata(in: count..<headerBytes.count), deadline: deadline)
+                    try writeAll(body, deadline: deadline)
                 } else {
                     let bodyOffset = count - headerBytes.count
                     if bodyOffset < bodyBytes.count {
-                        try writeAll(body.subdata(in: bodyOffset..<bodyBytes.count))
+                        try writeAll(body.subdata(in: bodyOffset..<bodyBytes.count), deadline: deadline)
                     }
                 }
             }
         }
     }
 
-    private func readExactly(_ length: Int) throws -> Data {
+    private func readExactly(_ length: Int, deadline: DispatchTime) throws -> Data {
         if length == 0 { return Data() }
         var data = Data(count: length)
         try data.withUnsafeMutableBytes { raw in
             var offset = 0
             while offset < raw.count {
+                try waitUntilReady(Int16(POLLIN), deadline: deadline)
                 let count = Darwin.read(descriptor, raw.baseAddress! + offset, raw.count - offset)
                 if count < 0 && errno == EINTR { continue }
                 guard count > 0 else { throw RustBackendError.posix(errno == 0 ? ECONNRESET : errno) }
@@ -629,9 +683,30 @@ private final class IPCConnection {
         }
         return data
     }
+
+    private func waitUntilReady(_ events: Int16, deadline: DispatchTime) throws {
+        while true {
+            let now = DispatchTime.now()
+            guard now.uptimeNanoseconds < deadline.uptimeNanoseconds else {
+                throw RustBackendError.posix(ETIMEDOUT)
+            }
+            let remaining = Double(deadline.uptimeNanoseconds - now.uptimeNanoseconds) / 1_000_000
+            let timeout = Int32(min(ceil(remaining), Double(Int32.max)))
+            var descriptor = pollfd(fd: self.descriptor, events: events, revents: 0)
+            let result = Darwin.poll(&descriptor, 1, timeout)
+            if result < 0 {
+                if errno == EINTR { continue }
+                throw RustBackendError.posix(errno)
+            }
+            guard result > 0 else { throw RustBackendError.posix(ETIMEDOUT) }
+            if descriptor.revents & events != 0 { return }
+            if descriptor.revents & Int16(POLLERR | POLLNVAL) != 0 { return }
+        }
+    }
 }
 
 func unixSocketAddress(path: String) throws -> (sockaddr_un, socklen_t) {
+    guard !path.utf8.contains(0) else { throw RustBackendError.posix(EINVAL) }
     let bytes = Array(path.utf8CString)
     let pathOffset = MemoryLayout<sockaddr_un>.offset(of: \.sun_path)!
     guard bytes.count <= MemoryLayout.size(ofValue: sockaddr_un().sun_path) else {

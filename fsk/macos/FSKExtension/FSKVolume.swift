@@ -4,7 +4,11 @@ import FSKit
 import os
 
 private let rootInode: UInt64 = 1
-private let directoryCookieBias: UInt64 = 2
+private let directoryCookieBias: UInt64 = fskDirectoryCookieBias
+
+private final class FSKItemCache: @unchecked Sendable {
+    var items: [UInt64: FSKItem] = [:]
+}
 
 final class FSKVolume: FSVolume,
     FSVolume.Operations,
@@ -14,7 +18,7 @@ final class FSKVolume: FSVolume,
 {
     let backend: RustBackend
     let rootItem = FSKItem(inode: rootInode, kind: .directory)
-    private let itemCache = OSAllocatedUnfairLock(initialState: [UInt64: FSKItem]())
+    private let itemCache = OSAllocatedUnfairLock(initialState: FSKItemCache())
 
     init(backend: RustBackend) {
         self.backend = backend
@@ -22,7 +26,7 @@ final class FSKVolume: FSVolume,
             volumeID: FSVolume.Identifier(uuid: UUID()),
             volumeName: FSFileName(string: "FSK")
         )
-        itemCache.withLock { $0[rootInode] = rootItem }
+        itemCache.withLock { $0.items[rootInode] = rootItem }
     }
 
     var maximumLinkCount: Int { 1 }
@@ -83,16 +87,22 @@ final class FSKVolume: FSVolume,
         replyHandler: @escaping ((any Error)?) -> Void
     ) {
         let items = itemCache.withLock { cache -> [FSKItem] in
-            let items = Array(cache.values)
-            cache.removeAll(keepingCapacity: false)
+            let items = Array(cache.items.values)
+            cache.items.removeAll(keepingCapacity: false)
             return items
         }
+        var firstError: Error?
         for item in items {
-            if let lease = item.releaseOpenState() {
-                try? backend.close(lease: lease)
+            do {
+                try closeOpenState(of: item)
+            } catch {
+                if firstError == nil { firstError = posix(error) }
+                if item.inode != rootInode {
+                    itemCache.withLock { $0.items[item.inode] = item }
+                }
             }
         }
-        replyHandler(nil)
+        replyHandler(firstError)
     }
 
     func synchronize(flags: FSSyncFlags, replyHandler: @escaping ((any Error)?) -> Void) {
@@ -134,35 +144,43 @@ final class FSKVolume: FSVolume,
         if newAttributes.isValid(.size) {
             update.valid |= UInt32(FSK_SET_SIZE)
             update.size = newAttributes.size
-            newAttributes.consumedAttributes.insert(.size)
         }
         if newAttributes.isValid(.mode) {
             update.valid |= UInt32(FSK_SET_MODE)
             update.mode = newAttributes.mode
-            newAttributes.consumedAttributes.insert(.mode)
         }
         if newAttributes.isValid(.uid) {
             update.valid |= UInt32(FSK_SET_UID)
             update.uid = newAttributes.uid
-            newAttributes.consumedAttributes.insert(.uid)
         }
         if newAttributes.isValid(.gid) {
             update.valid |= UInt32(FSK_SET_GID)
             update.gid = newAttributes.gid
-            newAttributes.consumedAttributes.insert(.gid)
         }
         if newAttributes.isValid(.accessTime) {
+            guard let value = nanoseconds(newAttributes.accessTime) else {
+                replyHandler(nil, POSIXError(.EOVERFLOW))
+                return
+            }
             update.valid |= UInt32(FSK_SET_ACCESSED_NS)
-            update.accessed_ns = nanoseconds(newAttributes.accessTime)
-            newAttributes.consumedAttributes.insert(.accessTime)
+            update.accessed_ns = value
         }
         if newAttributes.isValid(.modifyTime) {
+            guard let value = nanoseconds(newAttributes.modifyTime) else {
+                replyHandler(nil, POSIXError(.EOVERFLOW))
+                return
+            }
             update.valid |= UInt32(FSK_SET_MODIFIED_NS)
-            update.modified_ns = nanoseconds(newAttributes.modifyTime)
-            newAttributes.consumedAttributes.insert(.modifyTime)
+            update.modified_ns = value
         }
         do {
             let value = try backend.setAttributes(inode: item.inode, update: update)
+            if newAttributes.isValid(.size) { newAttributes.consumedAttributes.insert(.size) }
+            if newAttributes.isValid(.mode) { newAttributes.consumedAttributes.insert(.mode) }
+            if newAttributes.isValid(.uid) { newAttributes.consumedAttributes.insert(.uid) }
+            if newAttributes.isValid(.gid) { newAttributes.consumedAttributes.insert(.gid) }
+            if newAttributes.isValid(.accessTime) { newAttributes.consumedAttributes.insert(.accessTime) }
+            if newAttributes.isValid(.modifyTime) { newAttributes.consumedAttributes.insert(.modifyTime) }
             replyHandler(attributes(value, wanted: nil), nil)
         } catch {
             replyHandler(nil, posix(error))
@@ -192,13 +210,37 @@ final class FSKVolume: FSVolume,
             replyHandler(POSIXError(.EINVAL))
             return
         }
-        if item.inode != rootInode {
-            _ = itemCache.withLock { $0.removeValue(forKey: item.inode) }
+        let reclaimError = OSAllocatedUnfairLock<Error?>(initialState: nil)
+        let wasReclaimed = itemCache.withLock { cache -> Bool in
+            if #available(macOS 27.0, *) {
+                let cachedItems = cache
+                return item.tryReclaim { [self] in
+                    if item.inode != rootInode {
+                        cachedItems.items.removeValue(forKey: item.inode)
+                    }
+                    do {
+                        if let lease = item.releaseOpenState() {
+                            try self.backend.close(lease: lease)
+                        }
+                    } catch {
+                        reclaimError.withLockUnchecked { $0 = self.posix(error) }
+                    }
+                }
+            }
+            if item.inode != rootInode {
+                cache.items.removeValue(forKey: item.inode)
+            }
+            do {
+                if let lease = item.releaseOpenState() {
+                    try backend.close(lease: lease)
+                }
+            } catch {
+                reclaimError.withLockUnchecked { $0 = posix(error) }
+            }
+            return true
         }
-        if let lease = item.releaseOpenState() {
-            try? backend.close(lease: lease)
-        }
-        replyHandler(nil)
+        let error = reclaimError.withLock { $0 }
+        replyHandler(wasReclaimed ? error : nil)
     }
 
     func readSymbolicLink(
@@ -232,6 +274,7 @@ final class FSKVolume: FSVolume,
         let mode = attributes.isValid(.mode) ? attributes.mode : (type == .directory ? 0o755 : 0o644)
         do {
             let inode = try backend.create(parent: directory.inode, name: name.data, kind: kind, mode: mode)
+            if attributes.isValid(.mode) { attributes.consumedAttributes.insert(.mode) }
             replyHandler(cachedItem(inode: inode, kind: type), name, nil)
         } catch {
             replyHandler(nil, nil, posix(error))
@@ -257,6 +300,7 @@ final class FSKVolume: FSVolume,
                 target: contents.data,
                 mode: mode
             )
+            if attributes.isValid(.mode) { attributes.consumedAttributes.insert(.mode) }
             replyHandler(cachedItem(inode: inode, kind: .symlink), name, nil)
         } catch {
             replyHandler(nil, nil, posix(error))
@@ -338,7 +382,7 @@ final class FSKVolume: FSVolume,
             if cookie.rawValue == 0 && !packer.packEntry(
                 name: FSFileName(string: "."),
                 itemType: .directory,
-                itemID: FSItem.Identifier(rawValue: directory.inode) ?? .invalid,
+                itemID: itemIdentifier(directory.inode),
                 nextCookie: FSDirectoryCookie(1),
                 attributes: nil
             ) {
@@ -349,7 +393,7 @@ final class FSKVolume: FSVolume,
             if !packer.packEntry(
                 name: FSFileName(string: ".."),
                 itemType: .directory,
-                itemID: FSItem.Identifier(rawValue: parent) ?? .invalid,
+                itemID: directory.inode == rootInode ? .parentOfRoot : itemIdentifier(parent),
                 nextCookie: FSDirectoryCookie(directoryCookieBias),
                 attributes: nil
             ) {
@@ -378,7 +422,7 @@ final class FSKVolume: FSVolume,
                 if !packer.packEntry(
                     name: FSFileName(data: batch.name(for: entry)),
                     itemType: itemType(entry.kind),
-                    itemID: FSItem.Identifier(rawValue: entry.inode) ?? .invalid,
+                    itemID: itemIdentifier(entry.inode),
                     nextCookie: FSDirectoryCookie(entry.next_cookie + directoryCookieBias),
                     attributes: entryAttributes
                 ) {
@@ -471,8 +515,12 @@ final class FSKVolume: FSVolume,
                 // one created. Reads and writes go through the backend, so
                 // this open needs no extra state; only the duplicate lease
                 // has to be released.
-                try? backend.close(lease: opened.lease)
-                replyHandler(nil)
+                do {
+                    try backend.close(lease: opened.lease)
+                    replyHandler(nil)
+                } catch {
+                    replyHandler(posix(error))
+                }
                 return
             }
             replyHandler(nil)
@@ -490,25 +538,38 @@ final class FSKVolume: FSVolume,
             replyHandler(POSIXError(.EINVAL))
             return
         }
-        guard modes.isEmpty, let lease = item.releaseOpenState() else {
+        guard modes.isEmpty, let lease = item.beginClose() else {
             replyHandler(nil)
             return
         }
         do {
             try backend.close(lease: lease)
+            item.finishClose(lease: lease, succeeded: true)
             replyHandler(nil)
         } catch {
+            item.finishClose(lease: lease, succeeded: false)
             replyHandler(posix(error))
+        }
+    }
+
+    private func closeOpenState(of item: FSKItem) throws {
+        guard let lease = item.beginClose() else { return }
+        do {
+            try backend.close(lease: lease)
+            item.finishClose(lease: lease, succeeded: true)
+        } catch {
+            item.finishClose(lease: lease, succeeded: false)
+            throw error
         }
     }
 
     private func cachedItem(inode: UInt64, kind: FSItem.ItemType) -> FSKItem {
         itemCache.withLock { cache in
-            if let existing = cache[inode] {
+            if let existing = cache.items[inode] {
                 return existing
             }
             let item = FSKItem(inode: inode, kind: kind)
-            cache[inode] = item
+            cache.items[inode] = item
             return item
         }
     }
@@ -521,8 +582,10 @@ final class FSKVolume: FSVolume,
         func wants(_ attribute: FSItem.Attribute) -> Bool {
             wanted?.isAttributeWanted(attribute) ?? true
         }
-        if wants(.fileID) { result.fileID = FSItem.Identifier(rawValue: value.inode) ?? .invalid }
-        if wants(.parentID) { result.parentID = FSItem.Identifier(rawValue: value.parent) ?? .invalid }
+        if wants(.fileID) { result.fileID = itemIdentifier(value.inode) }
+        if wants(.parentID) {
+            result.parentID = value.inode == rootInode ? .parentOfRoot : itemIdentifier(value.parent)
+        }
         if wants(.type) { result.type = itemType(value.kind) }
         if wants(.mode) { result.mode = value.mode }
         if wants(.uid) { result.uid = value.uid }
@@ -532,7 +595,6 @@ final class FSKVolume: FSVolume,
         if wants(.allocSize) { result.allocSize = value.allocated_size }
         if wants(.birthTime) { result.birthTime = timespec(value.created_ns) }
         if wants(.modifyTime) { result.modifyTime = timespec(value.modified_ns) }
-        if wants(.changeTime) { result.changeTime = timespec(value.modified_ns) }
         if wants(.accessTime) { result.accessTime = timespec(value.accessed_ns) }
         if wants(.inhibitKernelOffloadedIO),
            backend.configuration.isNetwork,
@@ -541,6 +603,10 @@ final class FSKVolume: FSVolume,
             result.inhibitKernelOffloadedIO = true
         }
         return result
+    }
+
+    private func itemIdentifier(_ inode: UInt64) -> FSItem.Identifier {
+        inode == rootInode ? .rootDirectory : (FSItem.Identifier(rawValue: inode) ?? .invalid)
     }
 
     private func itemType(_ kind: UInt8) -> FSItem.ItemType {
@@ -571,8 +637,11 @@ final class FSKVolume: FSVolume,
         )
     }
 
-    private func nanoseconds(_ time: timespec) -> UInt64 {
-        guard time.tv_sec >= 0, time.tv_nsec >= 0 else { return 0 }
-        return UInt64(time.tv_sec) &* 1_000_000_000 &+ UInt64(time.tv_nsec)
+    private func nanoseconds(_ time: timespec) -> UInt64? {
+        guard time.tv_sec >= 0, time.tv_nsec >= 0, time.tv_nsec < 1_000_000_000 else { return nil }
+        let (seconds, secondsOverflow) = UInt64(time.tv_sec).multipliedReportingOverflow(by: 1_000_000_000)
+        let (total, additionOverflow) = seconds.addingReportingOverflow(UInt64(time.tv_nsec))
+        guard !secondsOverflow, !additionOverflow else { return nil }
+        return total
     }
 }

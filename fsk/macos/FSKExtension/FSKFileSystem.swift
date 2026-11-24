@@ -9,7 +9,7 @@ final class FSKFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         replyHandler: @escaping (FSProbeResult?, (any Error)?) -> Void
     ) {
         guard let resource = resource as? FSGenericURLResource,
-              resource.url.scheme?.lowercased() == "fsk"
+              RustBackend.isValidResource(resource.url)
         else {
             replyHandler(nil, POSIXError(.ENODEV))
             return

@@ -86,7 +86,7 @@ struct RustBackendTests {
 
     @Test("local network files read through a leased descriptor")
     func localFileLease() throws {
-        let url = FileManager.default.temporaryDirectory
+        let url = auditTemporaryDirectory()
             .appending(path: "fsk-local-\(UUID().uuidString)")
         try Data("downloaded".utf8).write(to: url)
         defer { try? FileManager.default.removeItem(at: url) }
@@ -123,7 +123,7 @@ struct RustBackendTests {
 
     @Test("an unreadable local file falls back to backend reads")
     func unreadableLocalFileFallsBack() throws {
-        let missing = FileManager.default.temporaryDirectory
+        let missing = auditTemporaryDirectory()
             .appending(path: "fsk-missing-\(UUID().uuidString)")
         let item = FSKItem(inode: 99, kind: .file)
         // The lease stays usable even though the cached path can't be opened.
@@ -215,11 +215,12 @@ private func withIPCPeer(
     _ scripts: [[IPCReply]],
     client: @escaping @Sendable (RustBackend) throws -> Void
 ) async throws {
-    let directory = FileManager.default.temporaryDirectory
-        .appending(path: "fsk-\(UUID().uuidString.prefix(8))")
+    let uniqueDirectory = "fsk-\(UUID().uuidString.prefix(8))"
+    let relativeDirectory = "audit/tmp/\(uniqueDirectory)"
+    let directory = auditTemporaryDirectory().appending(path: uniqueDirectory)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
     defer { try? FileManager.default.removeItem(at: directory) }
-    let path = directory.appending(path: "ipc").path
+    let path = "\(relativeDirectory)/ipc"
     var (address, length) = try unixSocketAddress(path: path)
     let listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
     try #require(listener >= 0)
