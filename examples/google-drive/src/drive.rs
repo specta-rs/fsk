@@ -1,14 +1,17 @@
 use fsk::{
     DirectoryEntry, DirectorySink, Error, FileType, Filesystem, KernelCachePolicy, Metadata,
     NetworkConfiguration, NetworkFile, NetworkFilesystem, ROOT_INODE, ReadDirectoryResult, Result,
-    SetMetadata, StatFs, current_gid, current_uid,
+    SetMetadata, StatFs, current_gid, current_uid, now_ns,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Deserializer, de::Error as _};
 use std::{
     collections::{HashMap, HashSet},
     io::{self, Read},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use unicode_normalization::UnicodeNormalization;
 
@@ -181,6 +184,8 @@ struct Node {
     size: u64,
     remote: Option<RemoteFile>,
     writable: bool,
+    generation: AtomicU64,
+    modified_ns: AtomicU64,
 }
 
 pub struct GoogleDrive {
@@ -212,6 +217,8 @@ impl GoogleDrive {
                 size: 0,
                 remote: None,
                 writable: false,
+                generation: AtomicU64::new(1),
+                modified_ns: AtomicU64::new(0),
             }],
             children: HashMap::new(),
             cache: Mutex::new(HashMap::new()),
@@ -294,11 +301,10 @@ impl GoogleDrive {
                 let index = inode_index(inode).expect("allocated inode fits usize");
                 self.nodes[index].size = u64::try_from(data.len()).unwrap_or(u64::MAX);
             } else {
-                let index = inode_index(inode).expect("allocated inode fits usize");
-                let parent = self.nodes[index].parent;
-                if let Some(children) = self.children.get_mut(&parent) {
-                    children.retain(|child| *child != inode);
-                }
+                // Keep the entry so a transient export failure does not
+                // silently remove a document from the mounted namespace. A
+                // later read retries the export and refreshes its size.
+                eprintln!("drive: could not hydrate export for inode {inode}");
             }
         }
     }
@@ -684,13 +690,89 @@ impl GoogleDrive {
             size,
             remote,
             writable,
+            generation: AtomicU64::new(1),
+            modified_ns: AtomicU64::new(0),
         });
         self.children.entry(parent).or_default().push(inode);
         inode
     }
 
     fn download(&self, remote: &RemoteFile) -> Result<Vec<u8>> {
-        if let Some(data) = self.cache.lock().map_err(|_| Error(5))?.get(&remote.id) {
+        if self.is_dirty(&remote.id)? {
+            return self.cached_download(&remote.id);
+        }
+
+        // Revalidation and invalidation must exclude writes. Otherwise a clean
+        // read could remove a buffer that a concurrent write just made dirty.
+        let write_guard = self.writes.lock().map_err(|_| Error::IO)?;
+        let changed = if self.is_dirty(&remote.id)? {
+            false
+        } else {
+            self.revalidate_cached_download(remote)?
+        };
+        drop(write_guard);
+        self.finish_download(remote, changed)
+    }
+
+    // Mutations already hold `writes`; revalidate without taking it again.
+    fn download_for_write(&self, remote: &RemoteFile) -> Result<Vec<u8>> {
+        let changed = if self.is_dirty(&remote.id)? {
+            false
+        } else {
+            self.revalidate_cached_download(remote)?
+        };
+        self.finish_download(remote, changed)
+    }
+
+    fn is_dirty(&self, id: &str) -> Result<bool> {
+        Ok(self.dirty.lock().map_err(|_| Error::IO)?.contains(id))
+    }
+
+    fn cached_download(&self, id: &str) -> Result<Vec<u8>> {
+        self.cache
+            .lock()
+            .map_err(|_| Error::IO)?
+            .get(id)
+            .cloned()
+            .ok_or(Error::IO)
+    }
+
+    fn revalidate_cached_download(&self, remote: &RemoteFile) -> Result<bool> {
+        if !self
+            .cache
+            .lock()
+            .map_err(|_| Error::IO)?
+            .contains_key(&remote.id)
+        {
+            return Ok(false);
+        }
+
+        // A remote id is immutable, but its bytes are not. Revalidate the
+        // server version before reusing a clean download.
+        let (current_version, _) = self.remote_version(&remote.id)?;
+        let mut versions = self.versions.lock().map_err(|_| Error::IO)?;
+        let changed = versions
+            .get(&remote.id)
+            .is_some_and(|expected| expected != &current_version);
+        versions.insert(remote.id.clone(), current_version);
+        drop(versions);
+        if changed {
+            self.cache.lock().map_err(|_| Error::IO)?.remove(&remote.id);
+            self.sizes.lock().map_err(|_| Error::IO)?.remove(&remote.id);
+        }
+        Ok(changed)
+    }
+
+    fn finish_download(&self, remote: &RemoteFile, changed: bool) -> Result<Vec<u8>> {
+        let selected = self.download_content(remote)?;
+        if changed {
+            self.note_content_change(&remote.id);
+        }
+        Ok(selected)
+    }
+
+    fn download_content(&self, remote: &RemoteFile) -> Result<Vec<u8>> {
+        if let Some(data) = self.cache.lock().map_err(|_| Error::IO)?.get(&remote.id) {
             return Ok(data.clone());
         }
         let (_, export_mime) = export_format(&remote.mime_type);
@@ -721,6 +803,40 @@ impl GoogleDrive {
             return Err(Error(27));
         }
         cache_download(&self.cache, &remote.id, data)
+    }
+
+    fn note_content_change(&self, remote_id: &str) {
+        let modified_ns = now_ns();
+        for node in &self.nodes {
+            if node
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.id == remote_id)
+            {
+                node.generation.fetch_add(1, Ordering::Relaxed);
+                node.modified_ns.store(modified_ns, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn record_cached_size(&self, id: &str, size: usize) -> Result<()> {
+        let _write = self.writes.lock().map_err(|_| Error::IO)?;
+        if self.is_dirty(id)? {
+            return Ok(());
+        }
+        let matches = self
+            .cache
+            .lock()
+            .map_err(|_| Error::IO)?
+            .get(id)
+            .is_some_and(|data| data.len() == size);
+        if matches {
+            self.sizes
+                .lock()
+                .map_err(|_| Error::IO)?
+                .insert(id.to_owned(), u64::try_from(size).unwrap_or(u64::MAX));
+        }
+        Ok(())
     }
 
     fn upload(&self, remote: &RemoteFile, data: &[u8]) -> Result<()> {
@@ -1043,9 +1159,9 @@ impl Filesystem for GoogleDrive {
             parent: node.parent,
             size,
             allocated_size: 0,
-            generation: 1,
+            generation: node.generation.load(Ordering::Relaxed),
             created_ns: 0,
-            modified_ns: 0,
+            modified_ns: node.modified_ns.load(Ordering::Relaxed),
             accessed_ns: 0,
             mode: if node.kind == FileType::Directory {
                 0o555
@@ -1062,6 +1178,12 @@ impl Filesystem for GoogleDrive {
     }
 
     fn lookup(&self, parent: u64, name: &[u8]) -> Result<(u64, FileType)> {
+        let parent_node = inode_index(parent)
+            .and_then(|index| self.nodes.get(index))
+            .ok_or(Error(2))?;
+        if parent_node.kind != FileType::Directory {
+            return Err(Error(20));
+        }
         self.children
             .get(&parent)
             .and_then(|children| {
@@ -1118,6 +1240,7 @@ impl Filesystem for GoogleDrive {
             .ok_or(Error(2))?;
         let remote = node.remote.as_ref().ok_or(Error(21))?;
         let data = self.download(remote)?;
+        self.record_cached_size(&remote.id, data.len())?;
         let start = usize::try_from(offset).map_err(|_| Error::INVALID)?;
         let Some(input) = data.get(start..) else {
             return Ok(0);
@@ -1136,12 +1259,15 @@ impl Filesystem for GoogleDrive {
             return Err(Error(30));
         }
         let remote = node.remote.as_ref().ok_or(Error(21))?;
+        if input.is_empty() {
+            return Ok(0);
+        }
         let start = usize::try_from(offset).map_err(|_| Error::INVALID)?;
         let end = start.checked_add(input.len()).ok_or(Error::INVALID)?;
         if u64::try_from(end).unwrap_or(u64::MAX) > MAX_BUFFERED_FILE_SIZE {
             return Err(Error(27));
         }
-        let mut data = self.download(remote)?;
+        let mut data = self.download_for_write(remote)?;
         if data.len() < end {
             data.resize(end, 0);
         }
@@ -1159,6 +1285,7 @@ impl Filesystem for GoogleDrive {
             .lock()
             .map_err(|_| Error::IO)?
             .insert(remote.id.clone());
+        self.note_content_change(&remote.id);
         Ok(input.len())
     }
 
@@ -1185,7 +1312,7 @@ impl Filesystem for GoogleDrive {
             return Err(Error(27));
         }
         let remote = node.remote.as_ref().ok_or(Error(21))?;
-        let mut data = self.download(remote)?;
+        let mut data = self.download_for_write(remote)?;
         data.resize(usize::try_from(size).map_err(|_| Error::INVALID)?, 0);
         self.upload(remote, &data)?;
         self.cache
@@ -1197,6 +1324,7 @@ impl Filesystem for GoogleDrive {
             .map_err(|_| Error::IO)?
             .insert(remote.id.clone(), size);
         self.dirty.lock().map_err(|_| Error::IO)?.remove(&remote.id);
+        self.note_content_change(&remote.id);
         self.metadata(inode)
     }
 
@@ -1226,7 +1354,7 @@ impl NetworkFilesystem for GoogleDrive {
         NetworkConfiguration {
             lazy: true,
             supports_local_files: false,
-            kernel_cache_policy: KernelCachePolicy::Read,
+            kernel_cache_policy: KernelCachePolicy::MetadataOnly,
         }
     }
     fn open_file(&self, inode: u64, writable: bool) -> Result<NetworkFile> {

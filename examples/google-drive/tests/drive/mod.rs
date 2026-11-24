@@ -11,6 +11,8 @@ fn filesystem() -> GoogleDrive {
             size: 0,
             remote: None,
             writable: false,
+            generation: AtomicU64::new(1),
+            modified_ns: AtomicU64::new(0),
         }],
         children: HashMap::new(),
         cache: Mutex::new(HashMap::new()),
@@ -80,6 +82,15 @@ fn file(mime_type: &str, can_modify_content: bool) -> DriveFile {
         resolved_target: None,
         version: "1".to_owned(),
     }
+}
+
+fn offline_client() -> Client {
+    Client::builder()
+        .no_proxy()
+        .proxy(reqwest::Proxy::all("http://127.0.0.1:9").expect("offline proxy"))
+        .timeout(std::time::Duration::from_millis(100))
+        .build()
+        .expect("offline client")
 }
 
 #[test]
@@ -845,6 +856,12 @@ fn writes_buffer_by_remote_id_until_close() {
         .lock()
         .expect("cache")
         .insert("id".to_owned(), b"abc".to_vec());
+    // Model the second write after the first write has already buffered data.
+    filesystem
+        .dirty
+        .lock()
+        .expect("dirty")
+        .insert("id".to_owned());
 
     assert_eq!(filesystem.write(inode, 1, b"XY"), Ok(2));
     assert_eq!(
@@ -873,6 +890,165 @@ fn writes_buffer_by_remote_id_until_close() {
     assert_eq!(*filesystem.cache.lock().expect("cache"), cached);
     assert_eq!(*filesystem.sizes.lock().expect("sizes"), sizes);
     assert_eq!(*filesystem.dirty.lock().expect("dirty"), dirty);
+}
+
+#[test]
+fn remote_reads_do_not_request_unsafe_kernel_read_caching() {
+    let filesystem = filesystem();
+
+    assert_eq!(
+        filesystem.network_configuration().kernel_cache_policy,
+        KernelCachePolicy::MetadataOnly
+    );
+}
+
+#[test]
+fn changed_remote_version_does_not_reuse_old_cached_bytes() {
+    let mut filesystem = filesystem();
+    filesystem.client = offline_client();
+    let inode = filesystem.add_node(
+        ROOT_INODE,
+        "file",
+        FileType::File,
+        3,
+        Some(RemoteFile {
+            id: "id".to_owned(),
+            mime_type: "text/plain".to_owned(),
+        }),
+        false,
+    );
+    filesystem
+        .cache
+        .lock()
+        .expect("cache")
+        .insert("id".to_owned(), b"old".to_vec());
+    filesystem
+        .versions
+        .lock()
+        .expect("versions")
+        .insert("id".to_owned(), "1".to_owned());
+    // Represent another client changing the file and this mount learning the
+    // new remote version. The old bytes must not be returned from the cache.
+    filesystem
+        .versions
+        .lock()
+        .expect("versions")
+        .insert("id".to_owned(), "2".to_owned());
+
+    let mut output = [0_u8; 3];
+    let result = filesystem.read(inode, 0, &mut output);
+
+    assert!(
+        result.is_err(),
+        "read served stale cached bytes after the remote version changed: {output:?}"
+    );
+}
+
+#[test]
+fn transient_export_failure_does_not_silently_remove_document() {
+    let mut filesystem = filesystem();
+    filesystem.client = offline_client();
+    let inode = filesystem.add_node(
+        ROOT_INODE,
+        "Document.docx",
+        FileType::File,
+        0,
+        Some(RemoteFile {
+            id: "doc".to_owned(),
+            mime_type: "application/vnd.google-apps.document".to_owned(),
+        }),
+        false,
+    );
+
+    filesystem.hydrate_exports();
+
+    assert_eq!(
+        filesystem.lookup(ROOT_INODE, b"Document.docx"),
+        Ok((inode, FileType::File)),
+        "a transient export error must not make the document disappear"
+    );
+}
+
+#[test]
+fn lookup_below_a_file_returns_not_a_directory() {
+    let mut filesystem = filesystem();
+    let inode = filesystem.add_node(ROOT_INODE, "file", FileType::File, 0, None, false);
+
+    assert_eq!(filesystem.lookup(inode, b"child"), Err(Error(20)));
+}
+
+#[test]
+fn zero_length_write_beyond_the_buffer_limit_is_a_no_op() {
+    let mut filesystem = filesystem();
+    let inode = filesystem.add_node(
+        ROOT_INODE,
+        "file",
+        FileType::File,
+        3,
+        Some(RemoteFile {
+            id: "id".to_owned(),
+            mime_type: "text/plain".to_owned(),
+        }),
+        true,
+    );
+    filesystem
+        .cache
+        .lock()
+        .expect("cache")
+        .insert("id".to_owned(), b"abc".to_vec());
+    filesystem
+        .dirty
+        .lock()
+        .expect("dirty")
+        .insert("id".to_owned());
+
+    assert_eq!(
+        filesystem.write(inode, MAX_BUFFERED_FILE_SIZE + 1, &[]),
+        Ok(0)
+    );
+    assert_eq!(
+        filesystem.cache.lock().expect("cache").get("id"),
+        Some(&b"abc".to_vec())
+    );
+}
+
+#[test]
+fn writes_update_mtime_for_every_remote_alias() {
+    let mut filesystem = filesystem();
+    let remote = RemoteFile {
+        id: "id".to_owned(),
+        mime_type: "text/plain".to_owned(),
+    };
+    let first = filesystem.add_node(
+        ROOT_INODE,
+        "first",
+        FileType::File,
+        3,
+        Some(remote.clone()),
+        true,
+    );
+    let second = filesystem.add_node(ROOT_INODE, "second", FileType::File, 3, Some(remote), true);
+    filesystem
+        .cache
+        .lock()
+        .expect("cache")
+        .insert("id".to_owned(), b"abc".to_vec());
+    filesystem
+        .dirty
+        .lock()
+        .expect("dirty")
+        .insert("id".to_owned());
+    let before = filesystem.metadata(first).expect("metadata before");
+
+    assert_eq!(filesystem.write(first, 0, b"z"), Ok(1));
+
+    for inode in [first, second] {
+        let after = filesystem.metadata(inode).expect("metadata after write");
+        assert!(
+            after.modified_ns > before.modified_ns,
+            "mtime did not advance for inode {inode}"
+        );
+    }
 }
 
 #[test]
