@@ -47,13 +47,17 @@ for version in "${versions[@]}"; do
         failed=1
     fi
 
-    if (
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        echo "exported application: SKIP (macOS-only gate)"
+    elif ! command -v defaults >/dev/null 2>&1 || [[ ! -x /usr/libexec/PlistBuddy ]]; then
+        echo "exported application: SKIP (macOS-only gate; defaults/PlistBuddy unavailable)"
+    elif (
         cd "$root"
         bash "$snippets/exported-application-current.sh"
     ); then
-        echo "exported application: PASS"
+        echo "exported application: PASS (codesign stubbed; entitlements fixture-only)"
     else
-        echo "exported application: FAIL"
+        echo "exported application: FAIL (codesign stubbed; entitlements fixture-only)"
         failed=1
     fi
 done
