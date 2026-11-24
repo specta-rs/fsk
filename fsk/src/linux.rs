@@ -1,8 +1,8 @@
 //! Linux `FUSE` adapter.
 
 use crate::{
-    DirectoryEntry, DirectorySink, Error, FileType, Filesystem, Metadata, NetworkFile,
-    NetworkFilesystem, SetMetadata,
+    DirectoryEntry, DirectorySink, Error, FileType, Filesystem, KernelCachePolicy, Metadata,
+    NetworkFile, NetworkFilesystem, SetMetadata,
     raw::{Caller, NativeRequest, Operation, Platform, RawEvent, RawEventMask, RawOutcome},
 };
 use fuser::{
@@ -209,6 +209,7 @@ struct OpenFile {
 struct FuseAdapter {
     backend: Backend,
     raw_mask: RawEventMask,
+    cache_policy: KernelCachePolicy,
     ttl: Duration,
     open_files: Mutex<HashMap<u64, OpenFile>>,
     next_handle: AtomicU64,
@@ -217,9 +218,15 @@ struct FuseAdapter {
 impl FuseAdapter {
     fn new(backend: Backend, ttl: Duration) -> Self {
         let raw_mask = backend.filesystem().raw_event_mask();
+        let cache_policy = backend
+            .network()
+            .map_or(KernelCachePolicy::MetadataOnly, |network| {
+                network.network_configuration().kernel_cache_policy
+            });
         Self {
             backend,
             raw_mask,
+            cache_policy,
             ttl,
             open_files: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
@@ -279,6 +286,55 @@ impl FuseAdapter {
 
     fn allocate_handle(&self) -> FileHandle {
         next_handle(&self.next_handle)
+    }
+
+    fn fopen_flags(&self) -> FopenFlags {
+        if self.backend.network().is_none() {
+            return FopenFlags::empty();
+        }
+        match self.cache_policy {
+            KernelCachePolicy::None | KernelCachePolicy::MetadataOnly => {
+                FopenFlags::FOPEN_DIRECT_IO
+            }
+            KernelCachePolicy::Read | KernelCachePolicy::ReadWrite => FopenFlags::FOPEN_KEEP_CACHE,
+        }
+    }
+
+    fn open_network_file(
+        &self,
+        inode: u64,
+        flags: OpenFlags,
+    ) -> Result<(FileHandle, OpenFile), Error> {
+        let network = self
+            .backend
+            .network()
+            .expect("network open without network backend");
+        let network_file = network.open_file(inode, flags.0 & libc::O_ACCMODE != libc::O_RDONLY)?;
+        let local = match &network_file {
+            NetworkFile::Remote => None,
+            NetworkFile::Local(file) => match File::open(file.path()) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    let _ = network.close_file(inode, network_file);
+                    return Err(Error(error.raw_os_error().unwrap_or(libc::EIO)));
+                }
+            },
+        };
+        let handle = self.allocate_handle();
+        Ok((
+            handle,
+            OpenFile {
+                inode,
+                network_file,
+                local,
+            },
+        ))
+    }
+
+    fn register_network_file(&self, inode: u64, flags: OpenFlags) -> Result<FileHandle, Error> {
+        let (handle, open) = self.open_network_file(inode, flags)?;
+        self.open_files.lock().insert(handle.0, open);
+        Ok(handle)
     }
 
     fn opened_local(&self, handle: u64) -> Option<File> {
@@ -405,6 +461,14 @@ impl fuser::Filesystem for FuseAdapter {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        if mode & libc::S_IFMT != libc::S_IFREG {
+            if let Err(error) = self.before(req, Operation::Create, 0, 0) {
+                reply.error(errno(error));
+            } else {
+                reply.error(Errno::ENOTSUP);
+            }
+            return;
+        }
         self.create_entry(req, parent, name, FileType::File, mode, reply);
     }
 
@@ -458,10 +522,14 @@ impl fuser::Filesystem for FuseAdapter {
             return;
         }
         let fs = self.backend.filesystem();
-        let replaced = fs
-            .lookup(newparent.0, newname.as_bytes())
-            .ok()
-            .map(|value| value.0);
+        let replaced = match fs.lookup(newparent.0, newname.as_bytes()) {
+            Ok((inode, _)) => Some(inode),
+            Err(Error::NOT_FOUND) => None,
+            Err(error) => {
+                reply.error(errno(error));
+                return;
+            }
+        };
         if let Some(error) = rename_constraint(flags, replaced.is_some()) {
             reply.error(error);
             return;
@@ -483,34 +551,12 @@ impl fuser::Filesystem for FuseAdapter {
             reply.error(errno(error));
             return;
         }
-        let Some(network) = self.backend.network() else {
+        if self.backend.network().is_none() {
             reply.opened(FileHandle(ino.0), FopenFlags::empty());
             return;
-        };
-        match network.open_file(ino.0, flags.0 & libc::O_ACCMODE != libc::O_RDONLY) {
-            Ok(network_file) => {
-                let local = match &network_file {
-                    NetworkFile::Remote => None,
-                    NetworkFile::Local(file) => match File::open(file.path()) {
-                        Ok(value) => Some(value),
-                        Err(error) => {
-                            let _ = network.close_file(ino.0, network_file);
-                            reply.error(Errno::from(error));
-                            return;
-                        }
-                    },
-                };
-                let handle = self.allocate_handle();
-                self.open_files.lock().insert(
-                    handle.0,
-                    OpenFile {
-                        inode: ino.0,
-                        network_file,
-                        local,
-                    },
-                );
-                reply.opened(handle, FopenFlags::empty());
-            }
+        }
+        match self.register_network_file(ino.0, flags) {
+            Ok(handle) => reply.opened(handle, self.fopen_flags()),
             Err(error) => reply.error(errno(error)),
         }
     }
@@ -711,10 +757,10 @@ impl fuser::Filesystem for FuseAdapter {
         name: &OsStr,
         mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
-        if let Err(error) = self.before(req, Operation::Create, 0, 0) {
+        if let Err(error) = self.before(req, Operation::Create, 0, raw_open_flags(flags)) {
             reply.error(errno(error));
             return;
         }
@@ -730,9 +776,17 @@ impl fuser::Filesystem for FuseAdapter {
                 // can never be mistaken for a different file's lease.
                 let handle = match &self.backend {
                     Backend::Local(_) => FileHandle(attr.ino.0),
-                    Backend::Network(_) => self.allocate_handle(),
+                    Backend::Network(_) => {
+                        match self.register_network_file(attr.ino.0, OpenFlags(flags)) {
+                            Ok(handle) => handle,
+                            Err(error) => {
+                                reply.error(errno(error));
+                                return;
+                            }
+                        }
+                    }
                 };
-                reply.created(&self.ttl, &attr, generation, handle, FopenFlags::empty());
+                reply.created(&self.ttl, &attr, generation, handle, self.fopen_flags());
             }
             Err(error) => reply.error(errno(error)),
         }
@@ -900,7 +954,11 @@ fn time_or_now_ns(value: TimeOrNow) -> u64 {
 }
 
 fn raw_flags(flags: OpenFlags) -> u32 {
-    u32::from_ne_bytes(flags.0.to_ne_bytes())
+    raw_open_flags(flags.0)
+}
+
+fn raw_open_flags(flags: i32) -> u32 {
+    u32::from_ne_bytes(flags.to_ne_bytes())
 }
 
 #[cfg(test)]
@@ -999,6 +1057,10 @@ mod tests {
             Some(libc::EINVAL)
         );
     }
+
+    #[cfg(test)]
+    #[path = "linux_audit.rs"]
+    mod audit;
 
     #[test]
     fn file_handles_are_unique_and_never_zero() {
