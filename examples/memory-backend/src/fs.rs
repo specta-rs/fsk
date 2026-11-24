@@ -12,6 +12,27 @@ use std::{
     },
 };
 
+#[cfg(test)]
+struct AuditLookupHook {
+    reached: std::sync::Barrier,
+    resume: std::sync::Barrier,
+}
+
+#[cfg(test)]
+static AUDIT_LOOKUP_HOOK: std::sync::Mutex<Option<(usize, Arc<AuditLookupHook>)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn audit_lookup_hook(node: &Arc<Node>) -> Option<Arc<AuditLookupHook>> {
+    let address = Arc::as_ptr(node) as usize;
+    AUDIT_LOOKUP_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .filter(|(candidate, _)| *candidate == address)
+        .map(|(_, hook)| Arc::clone(hook))
+}
+
 const BLOCK_SIZE: u64 = 4096;
 const BLOCK_SIZE_U32: u32 = 4096;
 const DEFAULT_CAPACITY: u64 = 1 << 40;
@@ -341,8 +362,17 @@ impl Filesystem for MemoryFileSystem {
 
     fn set_metadata(&self, inode: u64, update: SetMetadata) -> Result<Metadata> {
         let path = self.path_for(inode);
-        let node = self.node(inode)?;
-        let mut state = node.state.write();
+        let node;
+        let mut state = {
+            let _namespace = self.namespace.lock();
+            node = self.node(inode)?;
+            #[cfg(test)]
+            if let Some(hook) = audit_lookup_hook(&node) {
+                hook.reached.wait();
+                hook.resume.wait();
+            }
+            node.state.write()
+        };
         if let Some(size) = update.size {
             if size > self.capacity {
                 return Err(Error::NO_SPACE);
@@ -464,12 +494,24 @@ impl Filesystem for MemoryFileSystem {
 
     fn write(&self, inode: u64, offset: u64, input: &[u8]) -> Result<usize> {
         let path = self.path_for(inode);
-        let node = self.node(inode)?;
-        let mut state = node.state.write();
+        let node;
+        let mut state = {
+            let _namespace = self.namespace.lock();
+            node = self.node(inode)?;
+            #[cfg(test)]
+            if let Some(hook) = audit_lookup_hook(&node) {
+                hook.reached.wait();
+                hook.resume.wait();
+            }
+            node.state.write()
+        };
         let old_allocated = state.metadata.allocated_size;
         let NodeData::File(data) = &mut state.data else {
             return Err(Error::IS_A_DIRECTORY);
         };
+        if input.is_empty() {
+            return Ok(0);
+        }
         let start = usize::try_from(offset).map_err(|_| Error::FILE_TOO_LARGE)?;
         let end = start
             .checked_add(input.len())
