@@ -5,7 +5,7 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     os::unix::{
-        fs::PermissionsExt,
+        fs::{FileTypeExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
@@ -112,8 +112,9 @@ impl MountSession {
     ///
     /// # Errors
     ///
-    /// Returns an error if `diskutil` cannot unmount the path.
-    pub fn unmount(mut self) -> io::Result<()> {
+    /// Returns an error if `diskutil` cannot unmount the path. On failure, the
+    /// mount and its service remain available so the caller can retry.
+    pub fn unmount(&mut self) -> io::Result<()> {
         self.unmount_inner()
     }
 
@@ -129,7 +130,7 @@ impl MountSession {
             fs::create_dir_all(parent)?;
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
-        let listener = UnixListener::bind(&socket_path)?;
+        let listener = bind_listener(&socket_path)?;
         // Any early return below must not leave the bound socket behind.
         let mut socket_cleanup = SocketCleanup {
             path: socket_path.clone(),
@@ -158,8 +159,10 @@ impl MountSession {
                             thread::sleep(Duration::from_millis(5));
                         }
                         Err(error) if retryable_accept_error(&error) => {
-                            // A single aborted handshake must not stop a
-                            // mounted volume from accepting connections.
+                            // Aborted handshakes and temporary descriptor or
+                            // memory pressure must not stop the volume. Back
+                            // off so persistent EMFILE does not spin a CPU.
+                            thread::sleep(Duration::from_millis(10));
                         }
                         Err(_) => break,
                     }
@@ -205,32 +208,43 @@ impl MountSession {
 
     fn unmount_inner(&mut self) -> io::Result<()> {
         let result = if self.mounted {
-            let output = Command::new("/usr/sbin/diskutil")
+            match Command::new("/usr/sbin/diskutil")
                 .arg("unmount")
                 .arg(&self.mount_path)
-                .output()?;
-            self.mounted = false;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(io::Error::other(
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    self.mounted = false;
+                    Ok(())
+                }
+                Ok(output) => Err(io::Error::other(
                     String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-                ))
+                )),
+                Err(error) => Err(error),
             }
         } else {
             Ok(())
         };
+        if result.is_ok() {
+            self.stop_service();
+        }
+        result
+    }
+
+    fn stop_service(&mut self) {
         if let Some(thread) = self.accept_thread.take() {
             stop_accepting(&self.stop, &self.socket_path, thread);
         }
         let _ = fs::remove_file(&self.socket_path);
-        result
     }
 }
 
 impl Drop for MountSession {
     fn drop(&mut self) {
+        // An explicit unmount failure leaves the service usable for a retry.
+        // Drop cannot return that error, so always release local resources.
         let _ = self.unmount_inner();
+        self.stop_service();
     }
 }
 
@@ -263,6 +277,9 @@ fn retryable_accept_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+    ) || matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
     )
 }
 
@@ -293,15 +310,46 @@ fn random_token() -> io::Result<[u8; 32]> {
 
 fn socket_path() -> io::Result<PathBuf> {
     let id = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
-    let home = std::env::var_os("HOME").ok_or_else(|| {
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "could not locate the user home directory",
         )
-    })?;
-    Ok(PathBuf::from(home)
+    })?);
+    if !home.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HOME must be an absolute path",
+        ));
+    }
+    Ok(home
         .join("Library/Group Containers/group.dev.specta.fsk/Runtime")
         .join(format!("{}-{id}.sock", std::process::id())))
+}
+
+/// Binds the per-process socket, recovering a pathname left behind by a
+/// process that exited without unlinking its listener. A live listener or a
+/// non-socket file is never removed.
+fn bind_listener(path: &Path) -> io::Result<UnixListener> {
+    match UnixListener::bind(path) {
+        Err(error) if error.raw_os_error() == Some(libc::EADDRINUSE) => {
+            match UnixStream::connect(path) {
+                Err(connect_error) if connect_error.raw_os_error() == Some(libc::ECONNREFUSED) => {
+                    let metadata = fs::symlink_metadata(path)?;
+                    if !metadata.file_type().is_socket() {
+                        return Err(error);
+                    }
+                    fs::remove_file(path)?;
+                    UnixListener::bind(path)
+                }
+                Err(connect_error) if connect_error.kind() == io::ErrorKind::NotFound => {
+                    UnixListener::bind(path)
+                }
+                Ok(_) | Err(_) => Err(error),
+            }
+        }
+        result => result,
+    }
 }
 
 fn resource_url(socket: &Path, token: &[u8; 32]) -> String {
@@ -389,3 +437,7 @@ mod tests {
         assert!(socket.exists());
     }
 }
+
+#[cfg(test)]
+#[path = "mount_audit_tests.rs"]
+mod audit_tests;
