@@ -1028,7 +1028,8 @@ fn read_symlink_target(
                 target.push(0);
                 return Ok(Some(target));
             }
-            Err(Error::RANGE) if capacity < MAX_SYMLINK_TARGET_BYTES => {
+            // Portable backends may report either error for a short buffer.
+            Err(Error::RANGE | Error::INVALID) if capacity < MAX_SYMLINK_TARGET_BYTES => {
                 capacity = capacity.saturating_mul(2).min(MAX_SYMLINK_TARGET_BYTES);
             }
             Err(error) => return Err(error),
@@ -1641,7 +1642,7 @@ mod tests {
 
             for input in [ptr::null(), w!("*.bin")] {
                 let expression = session.begin_page(false, input).unwrap();
-                assert_eq!(expression, "*.txt".encode_utf16().collect::<Vec<_>>());
+                assert_eq!(expression, "*.txt\0".encode_utf16().collect::<Vec<_>>());
                 assert_eq!(session.index, 2);
             }
         }
@@ -1662,7 +1663,7 @@ mod tests {
             assert!(session.begin_page(true, w!("*.txt")).is_some());
             session.index = 1;
             let expression = session.begin_page(true, w!("*.bin")).unwrap();
-            assert_eq!(expression, "*.bin".encode_utf16().collect::<Vec<_>>());
+            assert_eq!(expression, "*.bin\0".encode_utf16().collect::<Vec<_>>());
             assert_eq!(session.index, 0);
 
             session.index = 1;

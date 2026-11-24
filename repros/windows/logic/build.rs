@@ -28,6 +28,7 @@ pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 pub const WINDOWS_EPOCH_OFFSET_100NS: u64 = 116_444_736_000_000_000;
+pub const MAX_SYMLINK_TARGET_BYTES: usize = 1024 * 1024;
 pub type HRESULT = i32;
 
 #[repr(C)]
@@ -76,6 +77,7 @@ pub mod core {
     for name in [
         "fn encode_wtf8",
         "fn decode_wtf8",
+        "fn read_symlink_target",
         "fn push_utf8",
         "fn hydrate",
         "fn basic_info",

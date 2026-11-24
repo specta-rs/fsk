@@ -1,6 +1,8 @@
 use fsk_windows_logic_audit::*;
 use fsk::{DirectoryEntry, DirectorySink, Error, FileType, Filesystem, Metadata, ReadDirectoryResult, Result, StatFs, ROOT_INODE};
-use std::sync::Arc;
+use std::{
+    sync::{Arc, Mutex},
+};
 
 struct CaseSensitiveBackend;
 
@@ -80,6 +82,49 @@ impl Filesystem for CaseSensitiveBackend {
     }
 }
 
+struct SymlinkBackend {
+    short_buffer_error: Error,
+    capacities: Mutex<Vec<usize>>,
+}
+
+impl Filesystem for SymlinkBackend {
+    fn statfs(&self) -> Result<StatFs> {
+        Ok(StatFs::default())
+    }
+
+    fn metadata(&self, _inode: u64) -> Result<Metadata> {
+        Err(Error::NOT_FOUND)
+    }
+
+    fn lookup(&self, _parent: u64, _name: &[u8]) -> Result<(u64, FileType)> {
+        Err(Error::NOT_FOUND)
+    }
+
+    fn read_directory(
+        &self,
+        _inode: u64,
+        _cookie: u64,
+        _verifier: u64,
+        _sink: &mut dyn DirectorySink,
+    ) -> Result<ReadDirectoryResult> {
+        Err(Error::INVALID)
+    }
+
+    fn read(&self, _inode: u64, _offset: u64, _output: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn read_symlink(&self, _inode: u64, output: &mut [u8]) -> Result<usize> {
+        self.capacities.lock().unwrap().push(output.len());
+        let target = b"../target";
+        if output.len() < target.len() {
+            return Err(self.short_buffer_error);
+        }
+        output[..target.len()].copy_from_slice(target);
+        Ok(target.len())
+    }
+}
+
 fn state() -> WindowsState {
     WindowsState {
         filesystem: Arc::new(CaseSensitiveBackend),
@@ -121,6 +166,23 @@ fn symlink_metadata_has_the_windows_reparse_attribute() {
     let info = basic_info(metadata);
     assert_ne!(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT, 0);
     assert_eq!(info.FileAttributes & FILE_ATTRIBUTE_NORMAL, 0);
+}
+
+#[test]
+fn symlink_target_retries_portable_short_buffer_errors() {
+    for short_buffer_error in [Error::RANGE, Error::INVALID] {
+        let backend = SymlinkBackend {
+            short_buffer_error,
+            capacities: Mutex::new(Vec::new()),
+        };
+        let mut metadata = Metadata::file(2, ROOT_INODE, 1, 0o777);
+        metadata.kind = FileType::Symlink;
+
+        let target = read_symlink_target(&backend, metadata).unwrap();
+        let expected: Vec<u16> = "../target\0".encode_utf16().collect();
+        assert_eq!(target, Some(expected));
+        assert_eq!(*backend.capacities.lock().unwrap(), vec![1, 2, 4, 8, 16]);
+    }
 }
 
 #[test]
