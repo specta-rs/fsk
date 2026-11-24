@@ -1,5 +1,7 @@
 //! Windows `ProjFS` adapter.
 
+#![allow(clippy::upper_case_acronyms, non_camel_case_types, non_snake_case)]
+
 use crate::{
     DirectoryEntry, DirectorySink, Error, FileType, Filesystem, Metadata, NetworkFilesystem,
     ROOT_INODE,
@@ -26,10 +28,13 @@ use windows_sys::{
             ERROR_FILE_SYSTEM_VIRTUALIZATION_INVALID_OPERATION, ERROR_HANDLE_EOF,
             ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
             ERROR_IO_DEVICE, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND,
-            ERROR_SHARING_VIOLATION, ERROR_WRITE_PROTECT,
+            ERROR_REPARSE_POINT_ENCOUNTERED, ERROR_SHARING_VIOLATION, ERROR_WRITE_PROTECT, FARPROC,
+            FreeLibrary, HMODULE,
         },
-        Storage::ProjectedFileSystem::*,
-        System::Com::CoCreateGuid,
+        System::{
+            Com::CoCreateGuid,
+            LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW},
+        },
     },
     core::{GUID, HRESULT, PCWSTR},
 };
@@ -38,7 +43,440 @@ const S_OK: HRESULT = 0;
 const FILE_ATTRIBUTE_READ_ONLY: u32 = 0x1;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 const WINDOWS_EPOCH_OFFSET_100NS: u64 = 116_444_736_000_000_000;
+const MAX_SYMLINK_TARGET_BYTES: usize = 1024 * 1024;
+
+const PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN: i32 = 1;
+const PRJ_CB_DATA_FLAG_ENUM_RETURN_SINGLE_ENTRY: i32 = 2;
+const PRJ_FLAG_NONE: i32 = 0;
+const PRJ_FLAG_USE_NEGATIVE_PATH_CACHE: i32 = 1;
+const PRJ_EXT_INFO_TYPE_SYMLINK: i32 = 1;
+const PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED: u32 = 2048;
+const PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED: u32 = 1024;
+const PRJ_NOTIFY_FILE_HANDLE_CLOSED_NO_MODIFICATION: u32 = 512;
+const PRJ_NOTIFY_FILE_OPENED: u32 = 2;
+const PRJ_NOTIFY_FILE_OVERWRITTEN: u32 = 8;
+const PRJ_NOTIFY_FILE_PRE_CONVERT_TO_FULL: u32 = 4096;
+const PRJ_NOTIFY_FILE_RENAMED: u32 = 128;
+const PRJ_NOTIFY_HARDLINK_CREATED: u32 = 256;
+const PRJ_NOTIFY_NEW_FILE_CREATED: u32 = 4;
+const PRJ_NOTIFY_PRE_DELETE: u32 = 16;
+const PRJ_NOTIFY_PRE_RENAME: u32 = 32;
+const PRJ_NOTIFY_PRE_SET_HARDLINK: u32 = 64;
+const PRJ_UPDATE_ALLOW_READ_ONLY: i32 = 32;
+const PRJ_UPDATE_FAILURE_CAUSE_NONE: i32 = 0;
+const PRJ_UPDATE_NONE: i32 = 0;
+
+type PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT = *mut c_void;
+type PRJ_DIR_ENTRY_BUFFER_HANDLE = *mut c_void;
+type PRJ_CALLBACK_DATA_FLAGS = i32;
+type PRJ_NOTIFICATION = i32;
+type PRJ_NOTIFY_TYPES = u32;
+type PRJ_STARTVIRTUALIZING_FLAGS = i32;
+type PRJ_UPDATE_TYPES = i32;
+type PRJ_UPDATE_FAILURE_CAUSES = i32;
+
+type PRJ_START_DIRECTORY_ENUMERATION_CB =
+    Option<unsafe extern "system" fn(*const PRJ_CALLBACK_DATA, *const GUID) -> HRESULT>;
+type PRJ_END_DIRECTORY_ENUMERATION_CB =
+    Option<unsafe extern "system" fn(*const PRJ_CALLBACK_DATA, *const GUID) -> HRESULT>;
+type PRJ_GET_DIRECTORY_ENUMERATION_CB = Option<
+    unsafe extern "system" fn(
+        *const PRJ_CALLBACK_DATA,
+        *const GUID,
+        PCWSTR,
+        PRJ_DIR_ENTRY_BUFFER_HANDLE,
+    ) -> HRESULT,
+>;
+type PRJ_GET_PLACEHOLDER_INFO_CB =
+    Option<unsafe extern "system" fn(*const PRJ_CALLBACK_DATA) -> HRESULT>;
+type PRJ_GET_FILE_DATA_CB =
+    Option<unsafe extern "system" fn(*const PRJ_CALLBACK_DATA, u64, u32) -> HRESULT>;
+type PRJ_QUERY_FILE_NAME_CB =
+    Option<unsafe extern "system" fn(*const PRJ_CALLBACK_DATA) -> HRESULT>;
+type PRJ_NOTIFICATION_CB = Option<
+    unsafe extern "system" fn(
+        *const PRJ_CALLBACK_DATA,
+        bool,
+        PRJ_NOTIFICATION,
+        PCWSTR,
+        *mut PRJ_NOTIFICATION_PARAMETERS,
+    ) -> HRESULT,
+>;
+type PRJ_CANCEL_COMMAND_CB = Option<unsafe extern "system" fn(*const PRJ_CALLBACK_DATA)>;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PRJ_CALLBACKS {
+    pub StartDirectoryEnumerationCallback: PRJ_START_DIRECTORY_ENUMERATION_CB,
+    pub EndDirectoryEnumerationCallback: PRJ_END_DIRECTORY_ENUMERATION_CB,
+    pub GetDirectoryEnumerationCallback: PRJ_GET_DIRECTORY_ENUMERATION_CB,
+    pub GetPlaceholderInfoCallback: PRJ_GET_PLACEHOLDER_INFO_CB,
+    pub GetFileDataCallback: PRJ_GET_FILE_DATA_CB,
+    pub QueryFileNameCallback: PRJ_QUERY_FILE_NAME_CB,
+    pub NotificationCallback: PRJ_NOTIFICATION_CB,
+    pub CancelCommandCallback: PRJ_CANCEL_COMMAND_CB,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PRJ_CALLBACK_DATA {
+    pub Size: u32,
+    pub Flags: PRJ_CALLBACK_DATA_FLAGS,
+    pub NamespaceVirtualizationContext: PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+    pub CommandId: i32,
+    pub FileId: GUID,
+    pub DataStreamId: GUID,
+    pub FilePathName: PCWSTR,
+    pub VersionInfo: *mut PRJ_PLACEHOLDER_VERSION_INFO,
+    pub TriggeringProcessId: u32,
+    pub TriggeringProcessImageFileName: PCWSTR,
+    pub InstanceContext: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PRJ_FILE_BASIC_INFO {
+    pub IsDirectory: bool,
+    pub FileSize: i64,
+    pub CreationTime: i64,
+    pub LastAccessTime: i64,
+    pub LastWriteTime: i64,
+    pub ChangeTime: i64,
+    pub FileAttributes: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PRJ_PLACEHOLDER_VERSION_INFO {
+    pub ProviderID: [u8; 128],
+    pub ContentID: [u8; 128],
+}
+
+impl Default for PRJ_PLACEHOLDER_VERSION_INFO {
+    fn default() -> Self {
+        Self {
+            ProviderID: [0; 128],
+            ContentID: [0; 128],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PRJ_PLACEHOLDER_INFO {
+    pub FileBasicInfo: PRJ_FILE_BASIC_INFO,
+    pub EaInformation: PRJ_PLACEHOLDER_EA_INFORMATION,
+    pub SecurityInformation: PRJ_PLACEHOLDER_SECURITY_INFORMATION,
+    pub StreamsInformation: PRJ_PLACEHOLDER_STREAMS_INFORMATION,
+    pub VersionInfo: PRJ_PLACEHOLDER_VERSION_INFO,
+    pub VariableData: [u8; 1],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PRJ_PLACEHOLDER_EA_INFORMATION {
+    pub EaBufferSize: u32,
+    pub OffsetToFirstEa: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PRJ_PLACEHOLDER_SECURITY_INFORMATION {
+    pub SecurityBufferSize: u32,
+    pub OffsetToSecurityDescriptor: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PRJ_PLACEHOLDER_STREAMS_INFORMATION {
+    pub StreamsInfoBufferSize: u32,
+    pub OffsetToFirstStreamInfo: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PRJ_EXTENDED_INFO {
+    pub InfoType: i32,
+    pub NextInfoOffset: u32,
+    pub Anonymous: PRJ_EXTENDED_INFO_0,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union PRJ_EXTENDED_INFO_0 {
+    pub Symlink: PRJ_EXTENDED_INFO_0_0,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PRJ_EXTENDED_INFO_0_0 {
+    pub TargetName: PCWSTR,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PRJ_NOTIFICATION_MAPPING {
+    pub NotificationBitMask: PRJ_NOTIFY_TYPES,
+    pub NotificationRoot: PCWSTR,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PRJ_NOTIFICATION_PARAMETERS_0 {
+    pub NotificationMask: PRJ_NOTIFY_TYPES,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PRJ_NOTIFICATION_PARAMETERS_1 {
+    pub NotificationMask: PRJ_NOTIFY_TYPES,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PRJ_NOTIFICATION_PARAMETERS_2 {
+    pub IsFileModified: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union PRJ_NOTIFICATION_PARAMETERS {
+    pub PostCreate: PRJ_NOTIFICATION_PARAMETERS_0,
+    pub FileRenamed: PRJ_NOTIFICATION_PARAMETERS_1,
+    pub FileDeletedOnHandleClose: PRJ_NOTIFICATION_PARAMETERS_2,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PRJ_STARTVIRTUALIZING_OPTIONS {
+    pub Flags: PRJ_STARTVIRTUALIZING_FLAGS,
+    pub PoolThreadCount: u32,
+    pub ConcurrentThreadCount: u32,
+    pub NotificationMappings: *mut PRJ_NOTIFICATION_MAPPING,
+    pub NotificationMappingsCount: u32,
+}
+
+type PrjAllocateAlignedBufferFn =
+    unsafe extern "system" fn(PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT, usize) -> *mut c_void;
+type PrjDeleteFileFn = unsafe extern "system" fn(
+    PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+    PCWSTR,
+    PRJ_UPDATE_TYPES,
+    *mut PRJ_UPDATE_FAILURE_CAUSES,
+) -> HRESULT;
+type PrjFileNameCompareFn = unsafe extern "system" fn(PCWSTR, PCWSTR) -> i32;
+type PrjFileNameMatchFn = unsafe extern "system" fn(PCWSTR, PCWSTR) -> bool;
+type PrjFillDirEntryBufferFn = unsafe extern "system" fn(
+    PCWSTR,
+    *const PRJ_FILE_BASIC_INFO,
+    PRJ_DIR_ENTRY_BUFFER_HANDLE,
+) -> HRESULT;
+type PrjFillDirEntryBuffer2Fn = unsafe extern "system" fn(
+    PRJ_DIR_ENTRY_BUFFER_HANDLE,
+    PCWSTR,
+    *const PRJ_FILE_BASIC_INFO,
+    *const PRJ_EXTENDED_INFO,
+) -> HRESULT;
+type PrjFreeAlignedBufferFn = unsafe extern "system" fn(*const c_void);
+type PrjMarkDirectoryAsPlaceholderFn = unsafe extern "system" fn(
+    PCWSTR,
+    PCWSTR,
+    *const PRJ_PLACEHOLDER_VERSION_INFO,
+    *const GUID,
+) -> HRESULT;
+type PrjStartVirtualizingFn = unsafe extern "system" fn(
+    PCWSTR,
+    *const PRJ_CALLBACKS,
+    *const c_void,
+    *const PRJ_STARTVIRTUALIZING_OPTIONS,
+    *mut PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+) -> HRESULT;
+type PrjStopVirtualizingFn = unsafe extern "system" fn(PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT);
+type PrjWriteFileDataFn = unsafe extern "system" fn(
+    PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+    *const GUID,
+    *const c_void,
+    u64,
+    u32,
+) -> HRESULT;
+type PrjWritePlaceholderInfoFn = unsafe extern "system" fn(
+    PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+    PCWSTR,
+    *const PRJ_PLACEHOLDER_INFO,
+    u32,
+) -> HRESULT;
+type PrjWritePlaceholderInfo2Fn = unsafe extern "system" fn(
+    PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+    PCWSTR,
+    *const PRJ_PLACEHOLDER_INFO,
+    u32,
+    *const PRJ_EXTENDED_INFO,
+) -> HRESULT;
+
+struct ModuleHandle(HMODULE);
+
+impl Drop for ModuleHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from LoadLibraryExW and has not been freed.
+        unsafe { FreeLibrary(self.0) };
+    }
+}
+
+struct ProjFS {
+    module: HMODULE,
+    allocate_aligned_buffer: PrjAllocateAlignedBufferFn,
+    delete_file: PrjDeleteFileFn,
+    file_name_compare: PrjFileNameCompareFn,
+    file_name_match: PrjFileNameMatchFn,
+    fill_dir_entry_buffer: PrjFillDirEntryBufferFn,
+    fill_dir_entry_buffer2: Option<PrjFillDirEntryBuffer2Fn>,
+    free_aligned_buffer: PrjFreeAlignedBufferFn,
+    mark_directory_as_placeholder: PrjMarkDirectoryAsPlaceholderFn,
+    start_virtualizing: PrjStartVirtualizingFn,
+    stop_virtualizing: PrjStopVirtualizingFn,
+    write_file_data: PrjWriteFileDataFn,
+    write_placeholder_info: PrjWritePlaceholderInfoFn,
+    write_placeholder_info2: Option<PrjWritePlaceholderInfo2Fn>,
+}
+
+// SAFETY: an HMODULE and its exported function pointers are immutable and may
+// be called concurrently. The handle stays loaded while any Arc<ProjFS> exists.
+unsafe impl Send for ProjFS {}
+unsafe impl Sync for ProjFS {}
+
+impl Drop for ProjFS {
+    fn drop(&mut self) {
+        // SAFETY: this is the last owner and no API call can still be running.
+        unsafe { FreeLibrary(self.module) };
+    }
+}
+
+impl ProjFS {
+    fn load() -> io::Result<Arc<Self>> {
+        let name: Vec<u16> = "ProjectedFSLib.dll\0".encode_utf16().collect();
+        // SAFETY: name is a terminated system DLL name.
+        let module =
+            unsafe { LoadLibraryExW(name.as_ptr(), ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
+        if module.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "ProjectedFSLib.dll is unavailable; enable the Client-ProjFS Windows feature",
+            ));
+        }
+        let module = ModuleHandle(module);
+        let api = Self {
+            module: module.0,
+            allocate_aligned_buffer: load_symbol(module.0, b"PrjAllocateAlignedBuffer\0")?,
+            delete_file: load_symbol(module.0, b"PrjDeleteFile\0")?,
+            file_name_compare: load_symbol(module.0, b"PrjFileNameCompare\0")?,
+            file_name_match: load_symbol(module.0, b"PrjFileNameMatch\0")?,
+            fill_dir_entry_buffer: load_symbol(module.0, b"PrjFillDirEntryBuffer\0")?,
+            fill_dir_entry_buffer2: load_optional_symbol(module.0, b"PrjFillDirEntryBuffer2\0"),
+            free_aligned_buffer: load_symbol(module.0, b"PrjFreeAlignedBuffer\0")?,
+            mark_directory_as_placeholder: load_symbol(
+                module.0,
+                b"PrjMarkDirectoryAsPlaceholder\0",
+            )?,
+            start_virtualizing: load_symbol(module.0, b"PrjStartVirtualizing\0")?,
+            stop_virtualizing: load_symbol(module.0, b"PrjStopVirtualizing\0")?,
+            write_file_data: load_symbol(module.0, b"PrjWriteFileData\0")?,
+            write_placeholder_info: load_symbol(module.0, b"PrjWritePlaceholderInfo\0")?,
+            write_placeholder_info2: load_optional_symbol(module.0, b"PrjWritePlaceholderInfo2\0"),
+        };
+        std::mem::forget(module);
+        Ok(Arc::new(api))
+    }
+
+    fn compare_names(&self, left: &[u16], right: &[u16]) -> i32 {
+        let mut left = left.to_vec();
+        let mut right = right.to_vec();
+        left.push(0);
+        right.push(0);
+        // SAFETY: both vectors are terminated and live for the synchronous call.
+        unsafe { (self.file_name_compare)(left.as_ptr(), right.as_ptr()) }
+    }
+
+    fn fill_directory_entry(
+        &self,
+        name: &[u16],
+        info: &PRJ_FILE_BASIC_INFO,
+        buffer: PRJ_DIR_ENTRY_BUFFER_HANDLE,
+        symlink_target: Option<&[u16]>,
+    ) -> HRESULT {
+        // SAFETY: all pointers are valid for this synchronous call.
+        unsafe {
+            if let Some(target) = symlink_target {
+                let Some(fill) = self.fill_dir_entry_buffer2 else {
+                    return hresult(ERROR_NOT_SUPPORTED);
+                };
+                let extended = symlink_extended_info(target);
+                fill(buffer, name.as_ptr(), info, &raw const extended)
+            } else {
+                (self.fill_dir_entry_buffer)(name.as_ptr(), info, buffer)
+            }
+        }
+    }
+
+    fn write_placeholder(
+        &self,
+        context: PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+        path: PCWSTR,
+        info: &PRJ_PLACEHOLDER_INFO,
+        symlink_target: Option<&[u16]>,
+    ) -> HRESULT {
+        let size = u32::try_from(size_of::<PRJ_PLACEHOLDER_INFO>()).unwrap_or(u32::MAX);
+        // SAFETY: all pointers are valid for this synchronous call.
+        unsafe {
+            if let Some(target) = symlink_target {
+                let Some(write) = self.write_placeholder_info2 else {
+                    return hresult(ERROR_NOT_SUPPORTED);
+                };
+                let extended = symlink_extended_info(target);
+                write(context, path, info, size, &raw const extended)
+            } else {
+                (self.write_placeholder_info)(context, path, info, size)
+            }
+        }
+    }
+}
+
+fn load_symbol<T: Copy>(module: HMODULE, name: &[u8]) -> io::Result<T> {
+    // SAFETY: module is loaded and name is a terminated export name.
+    let address: FARPROC = unsafe { GetProcAddress(module, name.as_ptr()) };
+    let Some(address) = address else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "ProjectedFSLib.dll is missing export {}",
+                String::from_utf8_lossy(name.strip_suffix(b"\0").unwrap_or(name))
+            ),
+        ));
+    };
+    // SAFETY: a non-null FARPROC has the representation of the function-pointer
+    // type requested for that export, and T is the matching function pointer.
+    let function: T = unsafe { std::mem::transmute_copy(&address) };
+    Ok(function)
+}
+
+fn load_optional_symbol<T: Copy>(module: HMODULE, name: &[u8]) -> Option<T> {
+    // SAFETY: module is loaded and name is a terminated export name.
+    let address: FARPROC = unsafe { GetProcAddress(module, name.as_ptr()) };
+    address.map(|address| {
+        // SAFETY: a non-null FARPROC has the requested function-pointer layout.
+        unsafe { std::mem::transmute_copy(&address) }
+    })
+}
+
+fn symlink_extended_info(target: &[u16]) -> PRJ_EXTENDED_INFO {
+    // SAFETY: every field is initialized below before the value is read.
+    let mut extended: PRJ_EXTENDED_INFO = unsafe { std::mem::zeroed() };
+    extended.InfoType = PRJ_EXT_INFO_TYPE_SYMLINK;
+    extended.NextInfoOffset = 0;
+    extended.Anonymous.Symlink.TargetName = target.as_ptr();
+    extended
+}
 
 /// Settings used when creating a `ProjFS` virtualization root on Windows.
 #[derive(Clone, Debug)]
@@ -100,6 +538,7 @@ pub enum EvictionOutcome {
 #[derive(Clone)]
 pub struct EvictionHandle {
     state: Arc<EvictionState>,
+    api: Arc<ProjFS>,
 }
 
 impl EvictionHandle {
@@ -116,7 +555,8 @@ impl EvictionHandle {
     /// Returns [`io::ErrorKind::NotConnected`] after the mount stops, or another
     /// error when the request fails for a reason unrelated to the item's state.
     pub fn evict(&self, relative_path: impl AsRef<Path>) -> io::Result<EvictionOutcome> {
-        self.state.evict(relative_path.as_ref())
+        self.state
+            .evict(relative_path.as_ref(), self.api.delete_file)
     }
 }
 
@@ -125,7 +565,11 @@ struct EvictionState {
 }
 
 impl EvictionState {
-    fn evict(&self, relative_path: &Path) -> io::Result<EvictionOutcome> {
+    fn evict(
+        &self,
+        relative_path: &Path,
+        delete_file: PrjDeleteFileFn,
+    ) -> io::Result<EvictionOutcome> {
         let path = wide_relative_path(relative_path)?;
         let context = self.context.read();
         let Some(context) = context.as_ref() else {
@@ -139,7 +583,7 @@ impl EvictionState {
         // context until this call returns, and `path` is a valid
         // null-terminated relative path.
         let result = unsafe {
-            PrjDeleteFile(
+            delete_file(
                 context.0,
                 path.as_ptr(),
                 PRJ_UPDATE_NONE | PRJ_UPDATE_ALLOW_READ_ONLY,
@@ -170,7 +614,7 @@ unsafe impl Sync for VirtualizationContext {}
 /// return idle files to virtual placeholders.
 pub struct MountSession {
     mount_path: PathBuf,
-    eviction: Arc<EvictionState>,
+    eviction: EvictionHandle,
     _state: Box<WindowsState>,
 }
 
@@ -239,9 +683,7 @@ impl MountSession {
     /// dropped return [`io::ErrorKind::NotConnected`].
     #[must_use]
     pub fn eviction_handle(&self) -> EvictionHandle {
-        EvictionHandle {
-            state: Arc::clone(&self.eviction),
-        }
+        self.eviction.clone()
     }
 
     /// Evicts a hydrated file from the `ProjFS` cache.
@@ -291,12 +733,13 @@ impl MountSession {
     ) -> io::Result<Self> {
         fs::create_dir_all(mount_path)?;
         let wide_path = wide_path(mount_path);
+        let api = ProjFS::load()?;
         let mut instance_id = GUID::default();
         // SAFETY: CoCreateGuid writes exactly one GUID.
         check_hresult(unsafe { CoCreateGuid(&raw mut instance_id) })?;
         // SAFETY: all pointers reference initialized values for this call.
-        check_hresult(unsafe {
-            PrjMarkDirectoryAsPlaceholder(
+        check_placeholder_mark_hresult(unsafe {
+            (api.mark_directory_as_placeholder)(
                 wide_path.as_ptr(),
                 ptr::null(),
                 ptr::null(),
@@ -304,7 +747,7 @@ impl MountSession {
             )
         })?;
 
-        let mut state = Box::new(WindowsState::new(filesystem));
+        let mut state = Box::new(WindowsState::new(filesystem, Arc::clone(&api)));
         let callbacks = PRJ_CALLBACKS {
             StartDirectoryEnumerationCallback: Some(start_directory),
             EndDirectoryEnumerationCallback: Some(end_directory),
@@ -346,7 +789,7 @@ impl MountSession {
         let mut context = ptr::null_mut();
         // SAFETY: state is boxed and remains stable until after StopVirtualizing.
         check_hresult(unsafe {
-            PrjStartVirtualizing(
+            (api.start_virtualizing)(
                 wide_path.as_ptr(),
                 &raw const callbacks,
                 (&raw mut *state).cast(),
@@ -356,9 +799,12 @@ impl MountSession {
         })?;
         Ok(Self {
             mount_path: mount_path.to_owned(),
-            eviction: Arc::new(EvictionState {
-                context: RwLock::new(Some(VirtualizationContext(context))),
-            }),
+            eviction: EvictionHandle {
+                state: Arc::new(EvictionState {
+                    context: RwLock::new(Some(VirtualizationContext(context))),
+                }),
+                api,
+            },
             _state: state,
         })
     }
@@ -366,27 +812,29 @@ impl MountSession {
 
 impl Drop for MountSession {
     fn drop(&mut self) {
-        let context = self.eviction.context.write().take();
+        let context = self.eviction.state.context.write().take();
         if let Some(context) = context {
             // SAFETY: taking the context under the write lock prevents new
             // eviction calls from using it, and existing calls hold the read
             // lock until they finish.
-            unsafe { PrjStopVirtualizing(context.0) };
+            unsafe { (self.eviction.api.stop_virtualizing)(context.0) };
         }
     }
 }
 
 struct WindowsState {
     filesystem: Arc<dyn Filesystem>,
+    api: Arc<ProjFS>,
     raw_mask: RawEventMask,
     enumerations: Mutex<HashMap<[u8; 16], Arc<Mutex<Enumeration>>>>,
 }
 
 impl WindowsState {
-    fn new(filesystem: Arc<dyn Filesystem>) -> Self {
+    fn new(filesystem: Arc<dyn Filesystem>, api: Arc<ProjFS>) -> Self {
         let raw_mask = filesystem.raw_event_mask();
         Self {
             filesystem,
+            api,
             raw_mask,
             enumerations: Mutex::new(HashMap::new()),
         }
@@ -438,15 +886,79 @@ impl WindowsState {
     }
 
     fn inode_for_path(&self, path: &[u16]) -> crate::Result<u64> {
+        self.inode_for_path_with(path, |left, right| self.api.compare_names(left, right) == 0)
+    }
+
+    fn inode_for_path_with(
+        &self,
+        path: &[u16],
+        mut name_equal: impl FnMut(&[u16], &[u16]) -> bool,
+    ) -> crate::Result<u64> {
         let mut inode = ROOT_INODE;
         for component in path.split(|unit| *unit == u16::from(b'\\') || *unit == u16::from(b'/')) {
             if component.is_empty() {
                 continue;
             }
             let name = encode_wtf8(component);
-            inode = self.filesystem.lookup(inode, &name)?.0;
+            inode = match self.filesystem.lookup(inode, &name) {
+                Ok((inode, _)) => inode,
+                Err(Error::NOT_FOUND) => {
+                    self.lookup_enumerated(inode, component, &mut name_equal)?
+                }
+                Err(error) => return Err(error),
+            };
         }
         Ok(inode)
+    }
+
+    fn lookup_enumerated(
+        &self,
+        inode: u64,
+        component: &[u16],
+        name_equal: &mut dyn FnMut(&[u16], &[u16]) -> bool,
+    ) -> crate::Result<u64> {
+        struct MatchSink<'a> {
+            component: &'a [u16],
+            name_equal: &'a mut dyn FnMut(&[u16], &[u16]) -> bool,
+            found: Option<u64>,
+        }
+
+        impl DirectorySink for MatchSink<'_> {
+            fn push(&mut self, entry: DirectoryEntry<'_>) -> bool {
+                if self.found.is_none()
+                    && (self.name_equal)(&decode_wtf8(entry.name), self.component)
+                {
+                    self.found = Some(entry.inode);
+                    false
+                } else {
+                    true
+                }
+            }
+        }
+
+        let mut sink = MatchSink {
+            component,
+            name_equal,
+            found: None,
+        };
+        let mut cookie = 0;
+        let mut verifier = 0;
+        loop {
+            let result = self
+                .filesystem
+                .read_directory(inode, cookie, verifier, &mut sink)?;
+            if let Some(found) = sink.found {
+                return Ok(found);
+            }
+            if result.eof {
+                return Err(Error::NOT_FOUND);
+            }
+            if result.next_cookie <= cookie {
+                return Err(Error::INVALID);
+            }
+            cookie = result.next_cookie;
+            verifier = result.verifier;
+        }
     }
 }
 
@@ -484,6 +996,7 @@ impl Enumeration {
 struct WindowsEntry {
     name: Vec<u16>,
     metadata: Metadata,
+    symlink_target: Option<Vec<u16>>,
 }
 
 struct CollectSink<'a> {
@@ -492,13 +1005,51 @@ struct CollectSink<'a> {
     error: Option<Error>,
 }
 
+fn read_symlink_target(
+    filesystem: &dyn Filesystem,
+    metadata: Metadata,
+) -> crate::Result<Option<Vec<u16>>> {
+    if metadata.kind != FileType::Symlink {
+        return Ok(None);
+    }
+    let mut capacity = usize::try_from(metadata.size)
+        .unwrap_or(MAX_SYMLINK_TARGET_BYTES)
+        .clamp(1, MAX_SYMLINK_TARGET_BYTES);
+    loop {
+        let mut bytes = vec![0; capacity];
+        match filesystem.read_symlink(metadata.inode, &mut bytes) {
+            Ok(count) => {
+                let count = crate::core::checked_io_count(count, bytes.len())?;
+                bytes.truncate(count);
+                let mut target = decode_wtf8(&bytes);
+                if target.contains(&0) {
+                    return Err(Error::INVALID);
+                }
+                target.push(0);
+                return Ok(Some(target));
+            }
+            Err(Error::RANGE) if capacity < MAX_SYMLINK_TARGET_BYTES => {
+                capacity = capacity.saturating_mul(2).min(MAX_SYMLINK_TARGET_BYTES);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl DirectorySink for CollectSink<'_> {
     fn push(&mut self, entry: DirectoryEntry<'_>) -> bool {
-        match self.filesystem.metadata(entry.inode) {
-            Ok(metadata) => {
+        match self.filesystem.metadata(entry.inode).and_then(|metadata| {
+            let symlink_target = read_symlink_target(self.filesystem, metadata)?;
+            Ok((metadata, symlink_target))
+        }) {
+            Ok((metadata, symlink_target)) => {
                 let mut name = decode_wtf8(entry.name);
                 name.push(0);
-                self.entries.push(WindowsEntry { name, metadata });
+                self.entries.push(WindowsEntry {
+                    name,
+                    metadata,
+                    symlink_target,
+                });
             }
             Err(error) => {
                 self.error = Some(error);
@@ -558,7 +1109,7 @@ unsafe extern "system" fn start_directory(
     }
     sink.entries.sort_unstable_by(|left, right| {
         // SAFETY: collected names are null-terminated UTF-16 strings.
-        unsafe { PrjFileNameCompare(left.name.as_ptr(), right.name.as_ptr()) }.cmp(&0)
+        unsafe { (state.api.file_name_compare)(left.name.as_ptr(), right.name.as_ptr()) }.cmp(&0)
     });
     // SAFETY: enumeration_id references one GUID.
     let key = unsafe { guid_bytes(enumeration_id) };
@@ -608,15 +1159,19 @@ unsafe extern "system" fn get_directory(
         if let Some(expression) = search_expression
             // SAFETY: both strings are terminated and the captured expression
             // stays alive in `session` throughout this loop.
-            && !unsafe { PrjFileNameMatch(entry.name.as_ptr(), expression) }
+            && !unsafe { (state.api.file_name_match)(entry.name.as_ptr(), expression) }
         {
             session.index += 1;
             continue;
         }
         let info = basic_info(entry.metadata);
         // SAFETY: name and info remain alive for this call.
-        let result =
-            unsafe { PrjFillDirEntryBuffer(entry.name.as_ptr(), &raw const info, buffer_handle) };
+        let result = state.api.fill_directory_entry(
+            entry.name.as_slice(),
+            &info,
+            buffer_handle,
+            entry.symlink_target.as_deref(),
+        );
         if result == hresult(ERROR_INSUFFICIENT_BUFFER) {
             // ProjFS requires this result when the buffer could not fit the
             // first entry it was offered, so the caller retries with a larger
@@ -651,20 +1206,26 @@ unsafe extern "system" fn get_placeholder(callback: *const PRJ_CALLBACK_DATA) ->
         Ok(value) => value,
         Err(error) => return error_hresult(error),
     };
+    let symlink_target = match read_symlink_target(state.filesystem.as_ref(), metadata) {
+        Ok(value) => value,
+        Err(error) => return error_hresult(error),
+    };
     let mut info = PRJ_PLACEHOLDER_INFO {
         FileBasicInfo: basic_info(metadata),
         ..PRJ_PLACEHOLDER_INFO::default()
     };
     info.VersionInfo.ContentID[..8].copy_from_slice(&metadata.generation.to_le_bytes());
-    // SAFETY: callback and info are valid for this synchronous call.
-    unsafe {
-        PrjWritePlaceholderInfo(
+    // SAFETY: callback is valid for this invocation and both fields are read
+    // only to pass them to the synchronous ProjFS call below.
+    let (context, path) = unsafe {
+        (
             (*callback).NamespaceVirtualizationContext,
             (*callback).FilePathName,
-            &raw const info,
-            u32::try_from(size_of::<PRJ_PLACEHOLDER_INFO>()).unwrap_or(u32::MAX),
         )
-    }
+    };
+    state
+        .api
+        .write_placeholder(context, path, &info, symlink_target.as_deref())
 }
 
 unsafe extern "system" fn get_file_data(
@@ -681,7 +1242,10 @@ unsafe extern "system" fn get_file_data(
     }
     // SAFETY: ProjFS returns a suitably aligned buffer or null.
     let buffer = unsafe {
-        PrjAllocateAlignedBuffer((*callback).NamespaceVirtualizationContext, length as usize)
+        (state.api.allocate_aligned_buffer)(
+            (*callback).NamespaceVirtualizationContext,
+            length as usize,
+        )
     };
     let Some(pointer) = NonNull::new(buffer.cast::<u8>()) else {
         // `PrjAllocateAlignedBuffer` returns null when it cannot satisfy the
@@ -693,14 +1257,14 @@ unsafe extern "system" fn get_file_data(
     let raw_buffer = unsafe { RawBuffer::new(pointer, length as usize, true) };
     if let Err(result) = unsafe { state.before(callback, Operation::Read, Some(raw_buffer), 0) } {
         // SAFETY: buffer came from PrjAllocateAlignedBuffer.
-        unsafe { PrjFreeAlignedBuffer(buffer) };
+        unsafe { (state.api.free_aligned_buffer)(buffer) };
         return result;
     }
     let inode = match unsafe { state.inode_for_callback(callback) } {
         Ok(value) => value,
         Err(error) => {
             // SAFETY: buffer came from PrjAllocateAlignedBuffer.
-            unsafe { PrjFreeAlignedBuffer(buffer) };
+            unsafe { (state.api.free_aligned_buffer)(buffer) };
             return error_hresult(error);
         }
     };
@@ -712,20 +1276,20 @@ unsafe extern "system" fn get_file_data(
         Ok(value) => value,
         Err(error) => {
             // SAFETY: buffer came from PrjAllocateAlignedBuffer.
-            unsafe { PrjFreeAlignedBuffer(buffer) };
+            unsafe { (state.api.free_aligned_buffer)(buffer) };
             return error_hresult(error);
         }
     };
     if count != length as usize {
         // SAFETY: buffer came from PrjAllocateAlignedBuffer.
-        unsafe { PrjFreeAlignedBuffer(buffer) };
+        unsafe { (state.api.free_aligned_buffer)(buffer) };
         // The callback must supply the whole requested range. A short read that
         // cannot be resumed means the backend is shorter than the placeholder.
         return hresult(ERROR_HANDLE_EOF);
     }
     // SAFETY: callback GUID and buffer remain valid for the call.
     let result = unsafe {
-        PrjWriteFileData(
+        (state.api.write_file_data)(
             (*callback).NamespaceVirtualizationContext,
             &raw const (*callback).DataStreamId,
             buffer,
@@ -734,7 +1298,7 @@ unsafe extern "system" fn get_file_data(
         )
     };
     // SAFETY: buffer came from PrjAllocateAlignedBuffer.
-    unsafe { PrjFreeAlignedBuffer(buffer) };
+    unsafe { (state.api.free_aligned_buffer)(buffer) };
     result
 }
 
@@ -801,10 +1365,10 @@ unsafe extern "system" fn cancel_command(callback: *const PRJ_CALLBACK_DATA) {
 }
 
 fn basic_info(metadata: Metadata) -> PRJ_FILE_BASIC_INFO {
-    let mut attributes = if metadata.kind == FileType::Directory {
-        FILE_ATTRIBUTE_DIRECTORY
-    } else {
-        FILE_ATTRIBUTE_NORMAL
+    let mut attributes = match metadata.kind {
+        FileType::Directory => FILE_ATTRIBUTE_DIRECTORY,
+        FileType::File => FILE_ATTRIBUTE_NORMAL,
+        FileType::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
     };
     if metadata.mode & 0o222 == 0 {
         attributes &= !FILE_ATTRIBUTE_NORMAL;
@@ -850,6 +1414,14 @@ fn error_hresult(error: Error) -> HRESULT {
 
 fn hresult(code: u32) -> HRESULT {
     i32::from_ne_bytes((0x8007_0000_u32 | (code & 0xffff)).to_ne_bytes())
+}
+
+fn check_placeholder_mark_hresult(value: HRESULT) -> io::Result<()> {
+    if value >= 0 || value == hresult(ERROR_REPARSE_POINT_ENCOUNTERED) {
+        Ok(())
+    } else {
+        check_hresult(value)
+    }
 }
 
 fn check_hresult(value: HRESULT) -> io::Result<()> {
@@ -1046,6 +1618,15 @@ mod tests {
         u32::from_ne_bytes(value.to_ne_bytes()) & 0xffff
     }
 
+    unsafe extern "system" fn unused_delete(
+        _context: PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+        _path: PCWSTR,
+        _flags: PRJ_UPDATE_TYPES,
+        _failure: *mut PRJ_UPDATE_FAILURE_CAUSES,
+    ) -> HRESULT {
+        panic!("a stopped mount must not call PrjDeleteFile");
+    }
+
     #[test]
     fn directory_search_expression_persists_across_pages() {
         use windows_sys::w;
@@ -1060,8 +1641,7 @@ mod tests {
 
             for input in [ptr::null(), w!("*.bin")] {
                 let expression = session.begin_page(false, input).unwrap();
-                assert!(PrjFileNameMatch(w!("next.txt"), expression.as_ptr()));
-                assert!(!PrjFileNameMatch(w!("next.bin"), expression.as_ptr()));
+                assert_eq!(expression, "*.txt".encode_utf16().collect::<Vec<_>>());
                 assert_eq!(session.index, 2);
             }
         }
@@ -1082,8 +1662,7 @@ mod tests {
             assert!(session.begin_page(true, w!("*.txt")).is_some());
             session.index = 1;
             let expression = session.begin_page(true, w!("*.bin")).unwrap();
-            assert!(PrjFileNameMatch(w!("next.bin"), expression.as_ptr()));
-            assert!(!PrjFileNameMatch(w!("next.txt"), expression.as_ptr()));
+            assert_eq!(expression, "*.bin".encode_utf16().collect::<Vec<_>>());
             assert_eq!(session.index, 0);
 
             session.index = 1;
@@ -1125,6 +1704,20 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_mark_accepts_an_existing_virtualization_root() {
+        assert!(check_placeholder_mark_hresult(hresult(ERROR_REPARSE_POINT_ENCOUNTERED)).is_ok());
+        assert!(check_hresult(hresult(ERROR_REPARSE_POINT_ENCOUNTERED)).is_err());
+    }
+
+    #[test]
+    fn symlink_metadata_is_a_reparse_point() {
+        let mut metadata = Metadata::file(2, ROOT_INODE, 4, 0o777);
+        metadata.kind = FileType::Symlink;
+        let info = basic_info(metadata);
+        assert_eq!(info.FileAttributes, FILE_ATTRIBUTE_REPARSE_POINT);
+    }
+
+    #[test]
     fn eviction_paths_stay_inside_the_mount() {
         for path in [
             "",
@@ -1159,7 +1752,9 @@ mod tests {
         let state = EvictionState {
             context: RwLock::new(None),
         };
-        let error = state.evict(Path::new("file.txt")).unwrap_err();
+        let error = state
+            .evict(Path::new("file.txt"), unused_delete)
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
     }
 
@@ -1172,6 +1767,7 @@ mod tests {
 
     #[test]
     fn eviction_classifies_items_that_must_be_retained() {
+        const PRJ_UPDATE_FAILURE_CAUSE_DIRTY_DATA: i32 = 2;
         let invalid = hresult(ERROR_FILE_SYSTEM_VIRTUALIZATION_INVALID_OPERATION);
         assert_eq!(
             classify_eviction(invalid, PRJ_UPDATE_FAILURE_CAUSE_DIRTY_DATA).unwrap(),
