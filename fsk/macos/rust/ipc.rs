@@ -79,9 +79,11 @@ pub(crate) struct Service {
     backend: ServiceBackend,
     token: [u8; 32],
     raw_mask: RawEventMask,
-    leases: Mutex<HashMap<u64, (u64, u64, NetworkFile)>>,
+    /// Leases belong to kernel opens, not IPC connections. Swift can keep
+    /// reading a local descriptor after reconnect and send `CLOSE` over any
+    /// pooled connection, so only `CLOSE` or service teardown releases them.
+    leases: Mutex<HashMap<u64, (u64, NetworkFile)>>,
     next_lease: AtomicU64,
-    next_connection: AtomicU64,
 }
 
 impl Service {
@@ -93,7 +95,6 @@ impl Service {
             raw_mask,
             leases: Mutex::new(HashMap::new()),
             next_lease: AtomicU64::new(1),
-            next_connection: AtomicU64::new(1),
         }
     }
 
@@ -105,17 +106,11 @@ impl Service {
             raw_mask,
             leases: Mutex::new(HashMap::new()),
             next_lease: AtomicU64::new(1),
-            next_connection: AtomicU64::new(1),
         }
     }
 
     pub(crate) fn serve_connection(&self, mut stream: UnixStream) -> io::Result<()> {
         stream.set_nonblocking(false)?;
-        let connection_id = self.next_connection.fetch_add(1, Ordering::Relaxed).max(1);
-        let _cleanup = ConnectionCleanup {
-            service: self,
-            connection_id,
-        };
         let request = Request::read(&mut stream)?;
         if request.major != PROTOCOL_MAJOR {
             write_response(&mut stream, request.id, PROTOCOL_MINOR, libc::EPROTO, &[])?;
@@ -155,17 +150,29 @@ impl Service {
                 return Err(protocol_mismatch(request.major, request.minor));
             }
             let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.dispatch_for_connection(
-                    connection_id,
-                    request.id,
-                    request.operation,
-                    &request.payload,
-                )
+                self.dispatch(request.id, request.operation, &request.payload)
             }))
             .unwrap_or(Err(Error::IO));
+            let mut pending_cleanup = if request.operation == opcode::OPEN {
+                response
+                    .as_ref()
+                    .ok()
+                    .and_then(|body| Decoder::new(body).u64().ok())
+                    .filter(|lease| *lease != 0)
+                    .map(|lease| PendingLeaseCleanup {
+                        service: self,
+                        lease,
+                        armed: true,
+                    })
+            } else {
+                None
+            };
             match response {
                 Ok(body) => {
                     write_response(&mut stream, request.id, negotiated_minor, 0, &body)?;
+                    if let Some(cleanup) = &mut pending_cleanup {
+                        cleanup.armed = false;
+                    }
                 }
                 Err(error) => write_response(
                     &mut stream,
@@ -179,19 +186,7 @@ impl Service {
     }
 
     #[allow(clippy::too_many_lines)]
-    #[cfg(test)]
     fn dispatch(&self, request_id: u64, operation: u16, payload: &[u8]) -> crate::Result<Vec<u8>> {
-        self.dispatch_for_connection(0, request_id, operation, payload)
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn dispatch_for_connection(
-        &self,
-        connection_id: u64,
-        request_id: u64,
-        operation: u16,
-        payload: &[u8],
-    ) -> crate::Result<Vec<u8>> {
         let fs = self.backend.filesystem();
         if let Some(raw_operation) = raw_operation(operation)
             && self.raw_mask.contains(raw_operation)
@@ -372,7 +367,7 @@ impl Service {
                 fs.synchronize()?;
                 Ok(Vec::new())
             }
-            opcode::OPEN => self.open(connection_id, input.u64()?, input.u8()? != 0),
+            opcode::OPEN => self.open(input.u64()?, input.u8()? != 0),
             opcode::CLOSE => {
                 self.close(input.u64()?)?;
                 Ok(Vec::new())
@@ -381,7 +376,7 @@ impl Service {
         }
     }
 
-    fn open(&self, connection_id: u64, inode: u64, writable: bool) -> crate::Result<Vec<u8>> {
+    fn open(&self, inode: u64, writable: bool) -> crate::Result<Vec<u8>> {
         let Some(network) = self.backend.network() else {
             return Ok(vec![0; 17]);
         };
@@ -400,9 +395,7 @@ impl Service {
                 output.bytes(local.path().as_os_str().as_encoded_bytes());
             }
         }
-        self.leases
-            .lock()
-            .insert(lease, (connection_id, inode, file));
+        self.leases.lock().insert(lease, (inode, file));
         Ok(output.finish())
     }
 
@@ -411,39 +404,24 @@ impl Service {
             return Ok(());
         }
         let network = self.backend.network().ok_or(Error::INVALID)?;
-        let (_, inode, file) = self.leases.lock().remove(&lease).ok_or(Error::INVALID)?;
+        let (inode, file) = self.leases.lock().remove(&lease).ok_or(Error::INVALID)?;
         network.close_file(inode, file)
     }
 }
 
-/// Releases only the leases created by one disconnected connection.
-/// The guard is installed before authentication so every return path, including
-/// a failed response write after OPEN, performs the same cleanup.
-struct ConnectionCleanup<'a> {
+/// Releases an OPEN lease unless its response was successfully written.
+/// Once disarmed, the lease belongs to the kernel open and survives later
+/// transport disconnects.
+struct PendingLeaseCleanup<'a> {
     service: &'a Service,
-    connection_id: u64,
+    lease: u64,
+    armed: bool,
 }
 
-impl Drop for ConnectionCleanup<'_> {
+impl Drop for PendingLeaseCleanup<'_> {
     fn drop(&mut self) {
-        let files = {
-            let mut leases = self.service.leases.lock();
-            let owned: Vec<u64> = leases
-                .iter()
-                .filter_map(|(lease, (connection_id, _, _))| {
-                    (*connection_id == self.connection_id).then_some(*lease)
-                })
-                .collect();
-            owned
-                .into_iter()
-                .filter_map(|lease| leases.remove(&lease))
-                .collect::<Vec<_>>()
-        };
-        let Some(network) = self.service.backend.network() else {
-            return;
-        };
-        for (_, inode, file) in files {
-            let _ = network.close_file(inode, file);
+        if self.armed {
+            let _ = self.service.close(self.lease);
         }
     }
 }
@@ -474,7 +452,7 @@ impl Drop for Service {
         let Some(network) = self.backend.network() else {
             return;
         };
-        for (_, (_, inode, file)) in self.leases.get_mut().drain() {
+        for (_, (inode, file)) in self.leases.get_mut().drain() {
             let _ = network.close_file(inode, file);
         }
     }

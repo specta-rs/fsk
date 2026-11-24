@@ -4,7 +4,7 @@ description: "Mount a backend, choose platform options, keep the session alive a
 ---
 
 `MountSession` turns a backend into a live volume. It owns the mount and the service that
-answers the kernel, so the mounted filesystem lasts exactly as long as the session value.
+answers the kernel. The mount stays active until the session is explicitly unmounted or dropped.
 
 ## Mount
 

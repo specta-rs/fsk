@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- macOS `MountSession::unmount` now borrows the session immutably. A failed
+  `diskutil` attempt leaves the mount and IPC service running so the same
+  session binding can retry; dropping the session still attempts unmount and
+  always releases local resources.
+
+### Fixed
+
+- macOS network-file leases now follow the kernel open rather than an IPC
+  connection. Transport disconnects preserve the local file until a later
+  `CLOSE`, including one sent over another pooled connection.
+- A failed macOS OPEN response now releases only its pending network-file
+  lease, without affecting leases whose responses were written successfully.
+
 ## 0.2.0 - 2026-11-12
 
 Everything here came out of building three filesystems outside the repository

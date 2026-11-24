@@ -5,7 +5,10 @@ use crate::{FileType, ReadDirectoryResult, Result, StatFs, test_support::TestFil
 use std::{
     os::unix::net::UnixStream,
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Barrier,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -13,6 +16,8 @@ struct LeaseTrackingFilesystem {
     inner: TestFilesystem,
     local_path: PathBuf,
     close_calls: Arc<AtomicU64>,
+    open_entered: Option<Arc<Barrier>>,
+    open_release: Option<Arc<Barrier>>,
 }
 
 impl Filesystem for LeaseTrackingFilesystem {
@@ -45,6 +50,12 @@ impl Filesystem for LeaseTrackingFilesystem {
 
 impl NetworkFilesystem for LeaseTrackingFilesystem {
     fn open_file(&self, _inode: u64, _writable: bool) -> Result<NetworkFile> {
+        if let Some(barrier) = &self.open_entered {
+            barrier.wait();
+        }
+        if let Some(barrier) = &self.open_release {
+            barrier.wait();
+        }
         Ok(NetworkFile::Local(crate::LocalFile::new(
             self.local_path.clone(),
             11,
@@ -63,7 +74,50 @@ impl NetworkFilesystem for LeaseTrackingFilesystem {
 }
 
 #[test]
-fn disconnect_releases_local_file_lease() {
+fn failed_open_response_releases_the_pending_lease() {
+    let directory = tempfile::tempdir().unwrap();
+    let local_path = directory.path().join("materialized.bin");
+    std::fs::write(&local_path, b"cached bytes").unwrap();
+    let close_calls = Arc::new(AtomicU64::new(0));
+    let open_entered = Arc::new(Barrier::new(2));
+    let open_release = Arc::new(Barrier::new(2));
+    let service = Arc::new(Service::network(
+        LeaseTrackingFilesystem {
+            inner: TestFilesystem::default(),
+            local_path,
+            close_calls: Arc::clone(&close_calls),
+            open_entered: Some(Arc::clone(&open_entered)),
+            open_release: Some(Arc::clone(&open_release)),
+        },
+        [7; 32],
+    ));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let worker_service = Arc::clone(&service);
+    let worker = std::thread::spawn(move || worker_service.serve_connection(server));
+
+    send(&mut client, 1, opcode::HELLO, &[7; 32]);
+    assert_eq!(response(&mut client).1, 0);
+
+    let mut open = Encoder::with_capacity(9);
+    open.u64(2);
+    open.u8(0);
+    send(&mut client, 2, opcode::OPEN, &open.finish());
+    open_entered.wait();
+    drop(client);
+    open_release.wait();
+    worker.join().unwrap().unwrap_err();
+
+    assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+    assert!(service.leases.lock().is_empty());
+    drop(service);
+    assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn disconnect_preserves_local_file_lease_until_kernel_close() {
     let directory = tempfile::tempdir().unwrap();
     let local_path = directory.path().join("materialized.bin");
     std::fs::write(&local_path, b"cached bytes").unwrap();
@@ -71,8 +125,10 @@ fn disconnect_releases_local_file_lease() {
     let service = Arc::new(Service::network(
         LeaseTrackingFilesystem {
             inner: TestFilesystem::default(),
-            local_path,
+            local_path: local_path.clone(),
             close_calls: Arc::clone(&close_calls),
+            open_entered: None,
+            open_release: None,
         },
         [7; 32],
     ));
@@ -96,8 +152,7 @@ fn disconnect_releases_local_file_lease() {
     let lease = u64::from_le_bytes(body[..8].try_into().unwrap());
     assert!(service.leases.lock().contains_key(&lease));
 
-    // A concurrent connection's lease must not be swept up by the first
-    // connection's disconnect cleanup.
+    // A second pooled connection can hold an independent lease at the same time.
     let (mut client2, server2) = UnixStream::pair().unwrap();
     client2
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -117,20 +172,38 @@ fn disconnect_releases_local_file_lease() {
 
     assert_eq!(
         close_calls.load(Ordering::SeqCst),
-        1,
-        "an authenticated disconnect must close the connection's local-file lease"
+        0,
+        "an IPC disconnect must not close a lease while the kernel open is alive"
     );
-    let remaining = service.leases.lock().keys().copied().collect::<Vec<_>>();
-    assert_eq!(
-        remaining,
-        vec![lease2],
-        "disconnect cleanup must be connection-scoped"
-    );
+    assert_eq!(std::fs::read(&local_path).unwrap(), b"cached bytes");
+    let mut remaining = service.leases.lock().keys().copied().collect::<Vec<_>>();
+    remaining.sort_unstable();
+    let mut expected = vec![lease, lease2];
+    expected.sort_unstable();
+    assert_eq!(remaining, expected);
+
+    // A reconnected pooled transport can close the original kernel lease.
+    let (mut client3, server3) = UnixStream::pair().unwrap();
+    client3
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let worker_service3 = Arc::clone(&service);
+    let worker3 = std::thread::spawn(move || worker_service3.serve_connection(server3));
+    send(&mut client3, 1, opcode::HELLO, &[7; 32]);
+    assert_eq!(response(&mut client3).1, 0);
+
+    send(&mut client3, 2, opcode::CLOSE, &lease.to_le_bytes());
+    assert_eq!(response(&mut client3).1, 0);
+    assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+    assert!(!service.leases.lock().contains_key(&lease));
+    assert!(service.leases.lock().contains_key(&lease2));
 
     send(&mut client2, 3, opcode::CLOSE, &lease2.to_le_bytes());
     assert_eq!(response(&mut client2).1, 0);
     drop(client2);
+    drop(client3);
     worker2.join().unwrap().unwrap();
+    worker3.join().unwrap().unwrap();
     assert_eq!(close_calls.load(Ordering::SeqCst), 2);
     assert!(service.leases.lock().is_empty());
 }

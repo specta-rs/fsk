@@ -1,6 +1,7 @@
 //! macOS mount-session lifecycle.
 
 use crate::{Filesystem, NetworkFilesystem, ipc::Service};
+use parking_lot::Mutex;
 use std::{
     fs::{self, File},
     io::{self, Read},
@@ -38,6 +39,10 @@ pub struct MountSession {
     mount_path: PathBuf,
     socket_path: PathBuf,
     stop: Arc<AtomicBool>,
+    state: Mutex<SessionState>,
+}
+
+struct SessionState {
     accept_thread: Option<JoinHandle<()>>,
     mounted: bool,
 }
@@ -110,12 +115,16 @@ impl MountSession {
 
     /// Explicitly unmount. Calling this is optional; [`Drop`] does the same.
     ///
+    /// A failed explicit unmount leaves the mount and its service alive so the
+    /// caller can retry through the same immutable session binding. In contrast,
+    /// [`Drop`] always performs best-effort local cleanup: it attempts unmount
+    /// again and releases the socket and accept thread even if `diskutil` fails.
+    ///
     /// # Errors
     ///
-    /// Returns an error if `diskutil` cannot unmount the path. On failure, the
-    /// mount and its service remain available so the caller can retry.
-    pub fn unmount(&mut self) -> io::Result<()> {
-        self.unmount_inner()
+    /// Returns an error if `diskutil` cannot unmount the path.
+    pub fn unmount(&self) -> io::Result<()> {
+        self.unmount_inner(&mut self.state.lock())
     }
 
     fn start(
@@ -201,20 +210,25 @@ impl MountSession {
             mount_path,
             socket_path,
             stop,
-            accept_thread: Some(accept_thread),
-            mounted: true,
+            state: Mutex::new(SessionState {
+                accept_thread: Some(accept_thread),
+                mounted: true,
+            }),
         })
     }
 
-    fn unmount_inner(&mut self) -> io::Result<()> {
-        let result = if self.mounted {
+    fn unmount_inner(&self, state: &mut SessionState) -> io::Result<()> {
+        // The state lock serializes unmount attempts and teardown. The accept
+        // worker only reads the stop flag, so joining it under this lock
+        // cannot deadlock on session state.
+        let result = if state.mounted {
             match Command::new("/usr/sbin/diskutil")
                 .arg("unmount")
                 .arg(&self.mount_path)
                 .output()
             {
                 Ok(output) if output.status.success() => {
-                    self.mounted = false;
+                    state.mounted = false;
                     Ok(())
                 }
                 Ok(output) => Err(io::Error::other(
@@ -226,13 +240,13 @@ impl MountSession {
             Ok(())
         };
         if result.is_ok() {
-            self.stop_service();
+            self.stop_service(state);
         }
         result
     }
 
-    fn stop_service(&mut self) {
-        if let Some(thread) = self.accept_thread.take() {
+    fn stop_service(&self, state: &mut SessionState) {
+        if let Some(thread) = state.accept_thread.take() {
             stop_accepting(&self.stop, &self.socket_path, thread);
         }
         let _ = fs::remove_file(&self.socket_path);
@@ -243,8 +257,9 @@ impl Drop for MountSession {
     fn drop(&mut self) {
         // An explicit unmount failure leaves the service usable for a retry.
         // Drop cannot return that error, so always release local resources.
-        let _ = self.unmount_inner();
-        self.stop_service();
+        let mut state = self.state.lock();
+        let _ = self.unmount_inner(&mut state);
+        self.stop_service(&mut state);
     }
 }
 
@@ -415,6 +430,33 @@ mod tests {
                       completed. Operation not permitted";
         assert!(mount_failure_hint(stderr).contains("privacy-protected"));
         assert_eq!(mount_failure_hint("no such file or directory"), "");
+    }
+
+    #[test]
+    fn unmount_accepts_an_immutable_binding_and_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("test.sock");
+        fs::write(&socket, b"").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let accept_thread = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let session = MountSession {
+            mount_path: directory.path().to_path_buf(),
+            socket_path: socket.clone(),
+            stop,
+            state: Mutex::new(SessionState {
+                accept_thread: Some(accept_thread),
+                mounted: false,
+            }),
+        };
+
+        session.unmount().unwrap();
+        session.unmount().unwrap();
+        assert!(!socket.exists());
     }
 
     #[test]
