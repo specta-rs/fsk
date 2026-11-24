@@ -127,6 +127,8 @@ jobs:
           app="$RUNNER_TEMP/export/FSK.app"
           extension="$app/Contents/Extensions/FSKExtension.appex"
           expected_version="${GITHUB_REF_NAME#v}"
+          # CFBundle versions do not include SemVer build metadata.
+          expected_version="${expected_version%%+*}"
           expected_build="${expected_version##*.}"
           test "$(defaults read "$app/Contents/Info" CFBundleShortVersionString)" = "$expected_version"
           test "$(defaults read "$app/Contents/Info" CFBundleVersion)" = "$expected_build"

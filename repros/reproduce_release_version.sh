@@ -9,6 +9,7 @@ fi
 python3 "$root/repros/extract_release_workflow_snippets.py"
 snippets="$root/target/repros/release-version"
 fixture="$root/repros/release-notes-fixture"
+export PATH="$snippets/bin:$PATH"
 failed=0
 
 for version in "${versions[@]}"; do
@@ -20,7 +21,7 @@ for version in "${versions[@]}"; do
 
     echo "version: $version"
     export GITHUB_REF_NAME="v$version"
-    export RUNNER_TEMP="$snippets/artifacts/release-notes"
+    export RUNNER_TEMP="$snippets/artifacts"
     mkdir -p "$RUNNER_TEMP"
 
     (
@@ -43,6 +44,16 @@ for version in "${versions[@]}"; do
         echo "publish heading check: PASS"
     else
         echo "publish heading check: FAIL"
+        failed=1
+    fi
+
+    if (
+        cd "$root"
+        bash "$snippets/exported-application-current.sh"
+    ); then
+        echo "exported application: PASS"
+    else
+        echo "exported application: FAIL"
         failed=1
     fi
 done
