@@ -136,6 +136,7 @@ match fsk::authorization_status()? {
     fsk::AuthorizationStatus::Authorized => {}
     fsk::AuthorizationStatus::NotInstalled => {
         // macOS only: install the matching FSK.app release.
+        #[cfg(target_os = "macos")]
         fsk::install()?;
     }
     fsk::AuthorizationStatus::NeedsApproval => {

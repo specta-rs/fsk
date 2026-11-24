@@ -218,9 +218,10 @@ jobs:
           # merged pull requests, so a release made of direct commits to main
           # would get an empty body.
           version="${GITHUB_REF_NAME#v}"
-          version_pattern="$(printf '%s' "$version" | sed 's/\./\\./g')"
+          version_pattern="$(printf '%s' "$version" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
           notes="$RUNNER_TEMP/release-notes.md"
-          awk -v heading="^## ${version_pattern}( |\$)" '
+          VERSION_PATTERN="$version_pattern" awk '
+            BEGIN { heading = "^## " ENVIRON["VERSION_PATTERN"] "( |$)" }
             $0 ~ heading { found = 1; next }
             found && /^## / { exit }
             found { print }
@@ -265,7 +266,7 @@ jobs:
           test "$GITHUB_REF_NAME" = "v$crate_version"
           # The release body comes from this section, so a missing heading would
           # silently produce empty notes.
-          version_pattern="$(printf '%s' "$crate_version" | sed 's/\./\\./g')"
+          version_pattern="$(printf '%s' "$crate_version" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
           grep -Eq "^## ${version_pattern}( |\$)" CHANGELOG.md
 
       - name: Authenticate with crates.io
