@@ -384,7 +384,7 @@ fn another_cache_instance_must_not_evict_a_leased_file() {
 fn capacity_cleanup_skips_an_aged_leased_blob() {
     let directory = tempfile::tempdir().expect("cache directory");
     let first =
-        Cache::new(directory.path().to_owned(), 4, Duration::from_secs(10)).expect("first cache");
+        Cache::new(directory.path().to_owned(), 4, Duration::from_secs(3600)).expect("first cache");
     let leased_file = FileNode {
         owner: "o".into(),
         repo: "r".into(),
@@ -408,7 +408,7 @@ fn capacity_cleanup_skips_an_aged_leased_blob() {
     let old = filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(60));
     filetime::set_file_mtime(&leased_path, old).expect("age leased blob");
 
-    let _second = Cache::new(directory.path().to_owned(), 4, Duration::from_secs(10))
+    let _second = Cache::new(directory.path().to_owned(), 4, Duration::from_secs(3600))
         .expect("capacity cleanup while another instance holds a lease");
 
     assert!(
