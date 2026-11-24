@@ -9,7 +9,7 @@ use reqwest::{Url, blocking::Client};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -22,6 +22,7 @@ const ENOENT: i32 = 2;
 const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
 const REPOSITORY_PAGE_SIZE: usize = 100;
+const MAX_CONTENTS_ENTRIES: usize = 1000;
 
 pub struct Options {
     pub api_url: String,
@@ -197,10 +198,23 @@ impl GitHubFilesystem {
             NodeKind::File(_) => return Err(Error(ENOTDIR)),
         };
         let contents = self.api.contents(&location.0, &location.1, &location.2)?;
+        // The contents endpoint silently caps a directory at 1,000 entries and
+        // offers no continuation token. Never mark a possibly truncated page
+        // as a complete directory; a Git Trees implementation can remove this
+        // fail-closed guard.
+        if contents.len() >= MAX_CONTENTS_ENTRIES {
+            return Err(Error::IO);
+        }
         let mut child_ids = Vec::with_capacity(contents.len());
         let mut files = Vec::new();
         let mut nodes = self.nodes.write();
         for content in contents {
+            if content.kind != "dir" && content.kind != "file" {
+                // Symlink blobs contain link text and submodule SHAs identify
+                // commits, not blobs in this repository. Neither is a regular
+                // file that `materialize` can read.
+                continue;
+            }
             let child = self.allocate_inode();
             let path = content.path;
             let kind = if content.kind == "dir" {
@@ -469,8 +483,9 @@ impl Api {
         for page in 1.. {
             let mut url = self.endpoint(&["user", "repos"])?;
             add_repository_page(&mut url, page);
-            let batch: Vec<Repository> = self.get(url)?.json().map_err(|_| Error::IO)?;
-            let done = batch.len() < REPOSITORY_PAGE_SIZE;
+            let response = self.get(url)?;
+            let done = !has_next_page(&response);
+            let batch: Vec<Repository> = response.json().map_err(|_| Error::IO)?;
             all.extend(batch);
             if done {
                 break;
@@ -484,8 +499,9 @@ impl Api {
         for page in 1.. {
             let mut url = self.endpoint(&["installation", "repositories"])?;
             add_repository_page(&mut url, page);
-            let batch: InstallationRepositories = self.get(url)?.json().map_err(|_| Error::IO)?;
-            let done = batch.repositories.len() < REPOSITORY_PAGE_SIZE;
+            let response = self.get(url)?;
+            let done = !has_next_page(&response);
+            let batch: InstallationRepositories = response.json().map_err(|_| Error::IO)?;
             all.extend(batch.repositories);
             if done {
                 break;
@@ -541,6 +557,22 @@ fn add_repository_page(url: &mut Url, page: u32) {
         .append_pair("sort", "full_name");
 }
 
+fn has_next_page(response: &reqwest::blocking::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::LINK)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|link| {
+                link.split(';').any(|parameter| {
+                    let parameter = parameter.trim();
+                    parameter.eq_ignore_ascii_case("rel=\"next\"")
+                        || parameter.eq_ignore_ascii_case("rel=next")
+                })
+            })
+        })
+}
+
 #[derive(Deserialize)]
 struct InstallationRepositories {
     repositories: Vec<Repository>,
@@ -582,8 +614,7 @@ struct Cache {
     root: PathBuf,
     max_bytes: u64,
     max_idle: Duration,
-    leases: Mutex<HashMap<PathBuf, usize>>,
-    mutation: Mutex<()>,
+    leases: Mutex<HashMap<PathBuf, Vec<Lease>>>,
 }
 
 impl Cache {
@@ -594,7 +625,6 @@ impl Cache {
             max_bytes,
             max_idle,
             leases: Mutex::new(HashMap::new()),
-            mutation: Mutex::new(()),
         };
         cache.cleanup()?;
         Ok(cache)
@@ -615,47 +645,85 @@ impl Cache {
         file: &FileNode,
         fetch: impl FnOnce() -> Result<Vec<u8>>,
     ) -> Result<PathBuf> {
-        let mutation_guard = self.mutation.lock();
         let path = self.path(file);
+        {
+            let _coordination = self.coordination_lock()?;
+            if path.is_file() {
+                touch(&path)?;
+                return Ok(path);
+            }
+        }
+        // Do not block unrelated cache operations during a network fetch. The
+        // recheck below resolves another instance populating this blob first.
+        let bytes = fetch()?;
+        // Serialize temporary creation, replacement, and cleanup across every
+        // cache instance, including other processes. A live temporary therefore
+        // cannot be mistaken for an abandoned download.
+        let _coordination = self.coordination_lock()?;
         if path.is_file() {
             touch(&path)?;
             return Ok(path);
         }
-        let bytes = fetch()?;
         let temporary = self
             .root
             .join(format!(".{}.{}.tmp", std::process::id(), now_ns()));
+        let _temporary = TemporaryPath::new(temporary.clone());
         let mut output = fs::File::create(&temporary).map_err(io_error)?;
         output
             .write_all(&bytes)
             .and_then(|()| output.sync_all())
             .map_err(io_error)?;
+        drop(output);
         fs::rename(&temporary, &path).map_err(io_error)?;
-        drop(mutation_guard);
-        self.cleanup_except(Some(&path))?;
+        self.cleanup_except_locked(Some(&path))?;
         Ok(path)
     }
 
     fn acquire(&self, file: &FileNode) -> Result<Option<PathBuf>> {
+        let _coordination = self.coordination_lock()?;
         let path = self.path(file);
-        if !path.is_file() {
-            return Ok(None);
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_error(error)),
+        };
+        if let Err(error) = fs2::FileExt::try_lock_shared(&file) {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(io_error(error));
         }
         touch(&path)?;
-        *self.leases.lock().entry(path.clone()).or_default() += 1;
+        self.leases
+            .lock()
+            .entry(path.clone())
+            .or_default()
+            .push(Lease { file });
         Ok(Some(path))
     }
 
     fn release(&self, path: &Path) -> Result<()> {
         let mut leases = self.leases.lock();
-        if let Some(count) = leases.get_mut(path) {
-            *count -= 1;
-            if *count == 0 {
+        if let Some(active) = leases.get_mut(path) {
+            drop(active.pop());
+            if active.is_empty() {
                 leases.remove(path);
             }
         }
         drop(leases);
         self.cleanup_except(None)
+    }
+
+    fn coordination_lock(&self) -> Result<CacheLock> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.root.join(".cache.lock"))
+            .map_err(io_error)?;
+        fs2::FileExt::lock_exclusive(&file).map_err(io_error)?;
+        Ok(CacheLock { file })
     }
 
     fn usage(&self) -> (u64, u64) {
@@ -671,16 +739,19 @@ impl Cache {
     }
 
     fn cleanup_except(&self, protected: Option<&Path>) -> Result<()> {
-        let _mutation = self.mutation.lock();
-        let leased: HashSet<PathBuf> = self.leases.lock().keys().cloned().collect();
+        let _coordination = self.coordination_lock()?;
+        self.cleanup_except_locked(protected)
+    }
+
+    fn cleanup_except_locked(&self, protected: Option<&Path>) -> Result<()> {
         let now = SystemTime::now();
+        self.remove_stale_temporaries(now);
         let mut entries = self.entries();
         for entry in &entries {
             if protected != Some(entry.path.as_path())
-                && !leased.contains(&entry.path)
                 && now.duration_since(entry.accessed).unwrap_or_default() > self.max_idle
             {
-                let _ = fs::remove_file(&entry.path);
+                let _ = Self::remove_if_unleased(&entry.path);
             }
         }
         entries = self.entries();
@@ -691,14 +762,57 @@ impl Cache {
             if used <= self.max_bytes || existing == 1 {
                 break;
             }
-            if protected == Some(entry.path.as_path()) || leased.contains(&entry.path) {
+            if protected == Some(entry.path.as_path()) {
                 continue;
             }
-            fs::remove_file(&entry.path).map_err(io_error)?;
+            if !Self::remove_if_unleased(&entry.path)? {
+                continue;
+            }
             used = used.saturating_sub(entry.size);
             existing -= 1;
         }
         Ok(())
+    }
+
+    fn remove_if_unleased(path: &Path) -> Result<bool> {
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(io_error(error)),
+        };
+        if let Err(error) = fs2::FileExt::try_lock_exclusive(&file) {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(false);
+            }
+            return Err(io_error(error));
+        }
+        // The coordination lock prevents another cache lease from starting
+        // between this check and unlinking the blob.
+        fs2::FileExt::unlock(&file).map_err(io_error)?;
+        match fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(io_error(error)),
+        }
+    }
+
+    fn remove_stale_temporaries(&self, now: SystemTime) {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("tmp") {
+                continue;
+            }
+            let accessed = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            if now.duration_since(accessed).unwrap_or_default() > self.max_idle {
+                let _ = fs::remove_file(path);
+            }
+        }
     }
 
     fn entries(&self) -> Vec<CacheEntry> {
@@ -720,6 +834,42 @@ impl Cache {
                 })
             })
             .collect()
+    }
+}
+
+struct CacheLock {
+    file: fs::File,
+}
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+struct Lease {
+    file: fs::File,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+struct TemporaryPath {
+    path: PathBuf,
+}
+
+impl TemporaryPath {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TemporaryPath {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
