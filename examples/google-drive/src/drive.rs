@@ -21,6 +21,8 @@ const OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const FOLDER: &str = "application/vnd.google-apps.folder";
 const SHORTCUT: &str = "application/vnd.google-apps.shortcut";
 const MAX_BUFFERED_FILE_SIZE: u64 = 256 * 1024 * 1024;
+// A continuously changing remote must not keep a read or write retrying forever.
+const MAX_DOWNLOAD_RETRIES: usize = 3;
 // Folder shortcuts and multi-parent folders turn the Drive listing into a DAG
 // whose aliases can multiply exponentially. Bound both the depth of a single
 // alias path and the total number of aliases one walk may create; realistic
@@ -777,7 +779,7 @@ impl GoogleDrive {
             return self.cached_download(&remote.id);
         }
 
-        loop {
+        for _ in 0..=MAX_DOWNLOAD_RETRIES {
             // Revalidation and invalidation must exclude writes. Otherwise a
             // clean read could remove a buffer that a concurrent write made
             // dirty. Content GETs stay outside this lock so downloads can run
@@ -794,11 +796,12 @@ impl GoogleDrive {
                 return Ok(data);
             }
         }
+        Err(Error::STALE)
     }
 
     // Mutations already hold `writes`; revalidate without taking it again.
     fn download_for_write(&self, remote: &RemoteFile) -> Result<Vec<u8>> {
-        loop {
+        for _ in 0..=MAX_DOWNLOAD_RETRIES {
             let plan = if self.is_dirty(&remote.id)? {
                 DownloadPlan::Cached(self.cached_download(&remote.id)?)
             } else {
@@ -808,6 +811,7 @@ impl GoogleDrive {
                 return Ok(data);
             }
         }
+        Err(Error::STALE)
     }
 
     fn is_dirty(&self, id: &str) -> Result<bool> {
