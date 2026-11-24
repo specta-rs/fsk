@@ -1,9 +1,18 @@
 use super::*;
+use std::{
+    io::{BufRead as _, BufReader, Write as _},
+    net::{TcpListener, TcpStream},
+    sync::{Arc, atomic::AtomicBool, mpsc},
+    thread,
+    time::Duration,
+};
 
 fn filesystem() -> GoogleDrive {
     GoogleDrive {
         client: Client::new(),
         token: String::new(),
+        api_url: API.to_owned(),
+        upload_url: UPLOAD_API.to_owned(),
         nodes: vec![Node {
             parent: ROOT_INODE,
             name: Vec::new(),
@@ -15,11 +24,10 @@ fn filesystem() -> GoogleDrive {
             modified_ns: AtomicU64::new(0),
         }],
         children: HashMap::new(),
-        cache: Mutex::new(HashMap::new()),
+        cache: Mutex::new(FileCache::default()),
         sizes: Mutex::new(HashMap::new()),
         writes: Mutex::new(()),
         dirty: Mutex::new(HashSet::new()),
-        versions: Mutex::new(HashMap::new()),
         total_bytes: 0,
         free_bytes: 0,
     }
@@ -91,6 +99,313 @@ fn offline_client() -> Client {
         .timeout(std::time::Duration::from_millis(100))
         .build()
         .expect("offline client")
+}
+
+fn seed_cache(filesystem: &GoogleDrive, id: &str, version: &str, data: &[u8]) {
+    let mut cache = filesystem.cache.lock().expect("cache");
+    cache.entries.insert(
+        id.to_owned(),
+        CachedFile {
+            version: version.to_owned(),
+            data: data.to_vec(),
+        },
+    );
+    cache.versions.insert(id.to_owned(), version.to_owned());
+}
+
+fn cached_bytes(cache: &FileCache, id: &str) -> Option<Vec<u8>> {
+    cache.entries.get(id).map(|entry| entry.data.clone())
+}
+
+fn cached_version<'a>(cache: &'a FileCache, id: &str) -> Option<&'a str> {
+    cache.entries.get(id).map(|entry| entry.version.as_str())
+}
+
+struct FakeRequest {
+    method: String,
+    target: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+impl FakeRequest {
+    fn path(&self) -> &str {
+        self.target.split('?').next().unwrap_or_default()
+    }
+
+    fn query(&self, name: &str) -> Option<String> {
+        self.target.split_once('?')?.1.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == name).then(|| value.to_owned())
+        })
+    }
+}
+
+struct FakeResponse {
+    status: &'static str,
+    headers: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+}
+
+impl FakeResponse {
+    fn json(body: String) -> Self {
+        Self {
+            status: "200 OK",
+            headers: vec![("Content-Type", "application/json".to_owned())],
+            body: body.into_bytes(),
+        }
+    }
+
+    fn bytes(body: &[u8]) -> Self {
+        Self {
+            status: "200 OK",
+            headers: vec![("Content-Type", "text/plain".to_owned())],
+            body: body.to_vec(),
+        }
+    }
+
+    fn with_header(mut self, name: &'static str, value: String) -> Self {
+        self.headers.push((name, value));
+        self
+    }
+}
+
+struct FakeServer {
+    base_url: String,
+    address: std::net::SocketAddr,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl FakeServer {
+    fn new<F>(handler: F) -> Self
+    where
+        F: Fn(FakeRequest) -> FakeResponse + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Drive server");
+        let address = listener.local_addr().expect("fake Drive server address");
+        listener
+            .set_nonblocking(true)
+            .expect("make fake Drive listener nonblocking");
+        let handler = Arc::new(handler);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let handler = Arc::clone(&handler);
+                        thread::spawn(move || {
+                            let mut stream = stream;
+                            stream
+                                .set_nonblocking(false)
+                                .expect("make fake Drive connection blocking");
+                            if let Ok(request) = read_fake_request(&mut stream) {
+                                let response = handler(request);
+                                let _ = write_fake_response(&mut stream, &response);
+                            }
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::park_timeout(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            address,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base_url
+    }
+}
+
+impl Drop for FakeServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.address);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn read_fake_request(stream: &mut TcpStream) -> io::Result<FakeRequest> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_owned();
+    let target = parts.next().unwrap_or_default().to_owned();
+    let mut headers = HashMap::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+        }
+    }
+    let length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0_u8; length];
+    reader.read_exact(&mut body)?;
+    Ok(FakeRequest {
+        method,
+        target,
+        headers,
+        body,
+    })
+}
+
+fn write_fake_response(stream: &mut TcpStream, response: &FakeResponse) -> io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        response.status,
+        response.body.len()
+    )?;
+    for (name, value) in &response.headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    write!(stream, "\r\n")?;
+    stream.write_all(&response.body)
+}
+
+struct FakeDriveState {
+    version: String,
+    metadata_gets: usize,
+    content_gets: HashMap<String, usize>,
+    upload_starts: usize,
+    uploads: Vec<Vec<u8>>,
+}
+
+struct FakeDriveServer {
+    server: FakeServer,
+    state: Arc<Mutex<FakeDriveState>>,
+    old_started: mpsc::Receiver<()>,
+    release_old: mpsc::Sender<()>,
+}
+
+impl FakeDriveServer {
+    fn new(block_old_response: bool) -> Self {
+        let state = Arc::new(Mutex::new(FakeDriveState {
+            version: "1".to_owned(),
+            metadata_gets: 0,
+            content_gets: HashMap::new(),
+            upload_starts: 0,
+            uploads: Vec::new(),
+        }));
+        let (old_started_tx, old_started_rx) = mpsc::channel();
+        let (release_old_tx, release_old_rx) = mpsc::channel();
+        let release_old = Arc::new(Mutex::new(release_old_rx));
+        let handler_state = Arc::clone(&state);
+        let handler = move |request: FakeRequest| {
+            if request.path() == "/drive/v3/files/id" && request.query("alt").is_none() {
+                let mut state = handler_state.lock().expect("fake Drive state");
+                state.metadata_gets += 1;
+                let version = state.version.clone();
+                return FakeResponse::json(serde_json::json!({ "version": version }).to_string())
+                    .with_header("ETag", format!("\"{version}\""));
+            }
+            if request.path() == "/drive/v3/files/id"
+                && request.query("alt").as_deref() == Some("media")
+            {
+                let (version, count) = {
+                    let mut state = handler_state.lock().expect("fake Drive state");
+                    let version = state.version.clone();
+                    let count = state.content_gets.entry(version.clone()).or_default();
+                    *count += 1;
+                    (version, *count)
+                };
+                if block_old_response && version == "1" && count == 1 {
+                    let _ = old_started_tx.send(());
+                    let _ = release_old
+                        .lock()
+                        .expect("old response release")
+                        .recv_timeout(Duration::from_secs(10));
+                }
+                let body = format!("v{version}");
+                return FakeResponse::bytes(body.as_bytes());
+            }
+            if request.method == "PATCH" && request.path() == "/upload/drive/v3/files/id" {
+                handler_state
+                    .lock()
+                    .expect("fake Drive state")
+                    .upload_starts += 1;
+                let host = request
+                    .headers
+                    .get("host")
+                    .cloned()
+                    .unwrap_or_else(|| "127.0.0.1".to_owned());
+                return FakeResponse {
+                    status: "200 OK",
+                    headers: vec![],
+                    body: Vec::new(),
+                }
+                .with_header("Location", format!("http://{host}/upload/drive/v3/session"));
+            }
+            if request.method == "PUT" && request.path() == "/upload/drive/v3/session" {
+                let mut state = handler_state.lock().expect("fake Drive state");
+                state.uploads.push(request.body);
+                state.version = "3".to_owned();
+                return FakeResponse::json(serde_json::json!({ "version": "3" }).to_string());
+            }
+            FakeResponse {
+                status: "404 Not Found",
+                headers: vec![],
+                body: b"not found".to_vec(),
+            }
+        };
+        let server = FakeServer::new(handler);
+        Self {
+            server,
+            state,
+            old_started: old_started_rx,
+            release_old: release_old_tx,
+        }
+    }
+
+    fn wait_for_old_request(&self) {
+        self.old_started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("old content request should start");
+    }
+
+    fn release_old_request(&self) {
+        self.release_old
+            .send(())
+            .expect("release old content request");
+    }
+}
+
+fn fake_filesystem(server: &FakeDriveServer) -> GoogleDrive {
+    let mut filesystem = filesystem();
+    filesystem.client = Client::builder()
+        .no_proxy()
+        .build()
+        .expect("fake Drive client");
+    filesystem.api_url = format!("{}/drive/v3", server.server.base_url());
+    filesystem.upload_url = format!("{}/upload/drive/v3", server.server.base_url());
+    filesystem
+}
+
+fn add_listed_file(filesystem: &mut GoogleDrive, writable: bool) -> u64 {
+    let mut listed = file("text/plain", writable);
+    listed.version = "1".to_owned();
+    filesystem.add_drive_file(ROOT_INODE, &listed)
 }
 
 #[test]
@@ -851,11 +1166,7 @@ fn writes_buffer_by_remote_id_until_close() {
         }),
         true,
     );
-    filesystem
-        .cache
-        .lock()
-        .expect("cache")
-        .insert("id".to_owned(), b"abc".to_vec());
+    seed_cache(&filesystem, "id", "1", b"abc");
     // Model the second write after the first write has already buffered data.
     filesystem
         .dirty
@@ -865,8 +1176,8 @@ fn writes_buffer_by_remote_id_until_close() {
 
     assert_eq!(filesystem.write(inode, 1, b"XY"), Ok(2));
     assert_eq!(
-        filesystem.cache.lock().expect("cache").get("id"),
-        Some(&b"aXY".to_vec())
+        cached_bytes(&filesystem.cache.lock().expect("cache"), "id"),
+        Some(b"aXY".to_vec())
     );
     assert!(filesystem.dirty.lock().expect("dirty").contains("id"));
 
@@ -904,44 +1215,149 @@ fn remote_reads_do_not_request_unsafe_kernel_read_caching() {
 
 #[test]
 fn changed_remote_version_does_not_reuse_old_cached_bytes() {
-    let mut filesystem = filesystem();
-    filesystem.client = offline_client();
-    let inode = filesystem.add_node(
-        ROOT_INODE,
-        "file",
-        FileType::File,
-        3,
-        Some(RemoteFile {
-            id: "id".to_owned(),
-            mime_type: "text/plain".to_owned(),
-        }),
-        false,
+    let server = FakeDriveServer::new(false);
+    server.state.lock().expect("fake Drive state").version = "2".to_owned();
+    let mut filesystem = fake_filesystem(&server);
+    let inode = add_listed_file(&mut filesystem, false);
+    assert_eq!(
+        filesystem
+            .cache
+            .lock()
+            .expect("cache")
+            .versions
+            .get("id")
+            .map(String::as_str),
+        Some("1"),
+        "the listing should start with version 1"
     );
-    filesystem
-        .cache
-        .lock()
-        .expect("cache")
-        .insert("id".to_owned(), b"old".to_vec());
-    filesystem
-        .versions
-        .lock()
-        .expect("versions")
-        .insert("id".to_owned(), "1".to_owned());
-    // Represent another client changing the file and this mount learning the
-    // new remote version. The old bytes must not be returned from the cache.
-    filesystem
-        .versions
-        .lock()
-        .expect("versions")
-        .insert("id".to_owned(), "2".to_owned());
 
-    let mut output = [0_u8; 3];
-    let result = filesystem.read(inode, 0, &mut output);
-
-    assert!(
-        result.is_err(),
-        "read served stale cached bytes after the remote version changed: {output:?}"
+    let mut first = [0_u8; 2];
+    assert_eq!(filesystem.read(inode, 0, &mut first), Ok(2));
+    assert_eq!(&first, b"v2");
+    let after_first = filesystem
+        .metadata(inode)
+        .expect("metadata after first read");
+    assert_eq!(
+        cached_version(&filesystem.cache.lock().expect("cache"), "id"),
+        Some("2")
     );
+
+    let mut second = [0_u8; 2];
+    assert_eq!(filesystem.read(inode, 0, &mut second), Ok(2));
+    assert_eq!(&second, b"v2");
+    let after_second = filesystem
+        .metadata(inode)
+        .expect("metadata after second read");
+    assert_eq!(after_second.modified_ns, after_first.modified_ns);
+
+    let state = server.state.lock().expect("fake Drive state");
+    assert_eq!(state.metadata_gets, 3);
+    assert_eq!(state.content_gets.get("2"), Some(&1));
+}
+
+#[test]
+fn clean_cached_write_revalidates_before_buffering() {
+    let server = FakeDriveServer::new(false);
+    server.state.lock().expect("fake Drive state").version = "2".to_owned();
+    let mut filesystem = fake_filesystem(&server);
+    let inode = add_listed_file(&mut filesystem, true);
+    let mut output = [0_u8; 2];
+    assert_eq!(filesystem.read(inode, 0, &mut output), Ok(2));
+    assert_eq!(&output, b"v2");
+    let before = filesystem.metadata(inode).expect("metadata before write");
+
+    server.state.lock().expect("fake Drive state").version = "3".to_owned();
+    assert_eq!(filesystem.write(inode, 0, b"X"), Ok(1));
+
+    let cache = filesystem.cache.lock().expect("cache");
+    assert_eq!(cached_bytes(&cache, "id"), Some(b"X3".to_vec()));
+    assert_eq!(cached_version(&cache, "id"), Some("3"));
+    drop(cache);
+    assert!(filesystem.dirty.lock().expect("dirty").contains("id"));
+    let after = filesystem.metadata(inode).expect("metadata after write");
+    assert!(after.modified_ns > before.modified_ns);
+
+    let state = server.state.lock().expect("fake Drive state");
+    assert_eq!(state.metadata_gets, 4);
+    assert_eq!(state.content_gets.get("2"), Some(&1));
+    assert_eq!(state.content_gets.get("3"), Some(&1));
+}
+
+#[test]
+fn stale_in_flight_download_cannot_replace_newer_bytes_or_upload_old_data() {
+    let server = FakeDriveServer::new(true);
+    let mut filesystem = fake_filesystem(&server);
+    let inode = add_listed_file(&mut filesystem, true);
+    let filesystem = Arc::new(filesystem);
+    let old_filesystem = Arc::clone(&filesystem);
+    let old_read = thread::spawn(move || {
+        let mut output = [0_u8; 2];
+        (old_filesystem.read(inode, 0, &mut output), output)
+    });
+    server.wait_for_old_request();
+
+    // Let a second v1 request finish so the old request is followed by a clean
+    // cache entry that can be invalidated when the server advances to v2.
+    let mut output = [0_u8; 2];
+    assert_eq!(filesystem.read(inode, 0, &mut output), Ok(2));
+    assert_eq!(&output, b"v1");
+    server.state.lock().expect("fake Drive state").version = "2".to_owned();
+
+    let mut newer = [0_u8; 2];
+    assert_eq!(filesystem.read(inode, 0, &mut newer), Ok(2));
+    assert_eq!(&newer, b"v2");
+    let modified_ns = filesystem
+        .metadata(inode)
+        .expect("metadata after v2")
+        .modified_ns;
+
+    server.release_old_request();
+    let (old_result, old_output) = old_read.join().expect("old read thread");
+    assert_eq!(old_result, Ok(2));
+    assert_eq!(
+        &old_output, b"v2",
+        "the old read must not return stale bytes"
+    );
+    assert_eq!(
+        filesystem
+            .metadata(inode)
+            .expect("metadata after old read")
+            .modified_ns,
+        modified_ns
+    );
+    {
+        let cache = filesystem.cache.lock().expect("cache");
+        assert_eq!(cached_bytes(&cache, "id"), Some(b"v2".to_vec()));
+        assert_eq!(cached_version(&cache, "id"), Some("2"));
+        assert_eq!(cache.versions.get("id").map(String::as_str), Some("2"));
+    }
+
+    let mut repeated = [0_u8; 2];
+    assert_eq!(filesystem.read(inode, 0, &mut repeated), Ok(2));
+    assert_eq!(&repeated, b"v2");
+    assert_eq!(
+        filesystem
+            .metadata(inode)
+            .expect("metadata after repeated read")
+            .modified_ns,
+        modified_ns
+    );
+    {
+        let state = server.state.lock().expect("fake Drive state");
+        assert_eq!(state.content_gets.get("1"), Some(&2));
+        assert_eq!(state.content_gets.get("2"), Some(&1));
+    }
+
+    assert_eq!(filesystem.write(inode, 0, b"X"), Ok(1));
+    assert_eq!(filesystem.synchronize(), Ok(()));
+    {
+        let state = server.state.lock().expect("fake Drive state");
+        assert_eq!(state.upload_starts, 1);
+        assert_eq!(state.uploads, vec![b"X2".to_vec()]);
+    }
+    let cache = filesystem.cache.lock().expect("cache");
+    assert_eq!(cached_bytes(&cache, "id"), Some(b"X2".to_vec()));
+    assert_eq!(cached_version(&cache, "id"), Some("3"));
 }
 
 #[test]
@@ -991,11 +1407,7 @@ fn zero_length_write_beyond_the_buffer_limit_is_a_no_op() {
         }),
         true,
     );
-    filesystem
-        .cache
-        .lock()
-        .expect("cache")
-        .insert("id".to_owned(), b"abc".to_vec());
+    seed_cache(&filesystem, "id", "1", b"abc");
     filesystem
         .dirty
         .lock()
@@ -1007,8 +1419,8 @@ fn zero_length_write_beyond_the_buffer_limit_is_a_no_op() {
         Ok(0)
     );
     assert_eq!(
-        filesystem.cache.lock().expect("cache").get("id"),
-        Some(&b"abc".to_vec())
+        cached_bytes(&filesystem.cache.lock().expect("cache"), "id"),
+        Some(b"abc".to_vec())
     );
 }
 
@@ -1028,11 +1440,7 @@ fn writes_update_mtime_for_every_remote_alias() {
         true,
     );
     let second = filesystem.add_node(ROOT_INODE, "second", FileType::File, 3, Some(remote), true);
-    filesystem
-        .cache
-        .lock()
-        .expect("cache")
-        .insert("id".to_owned(), b"abc".to_vec());
+    seed_cache(&filesystem, "id", "1", b"abc");
     filesystem
         .dirty
         .lock()
@@ -1053,17 +1461,59 @@ fn writes_update_mtime_for_every_remote_alias() {
 
 #[test]
 fn completed_download_does_not_replace_concurrent_cached_write() {
-    let cache = Mutex::new(HashMap::from([(
-        "id".to_owned(),
-        b"new dirty data".to_vec(),
-    )]));
-    let selected =
-        cache_download(&cache, "id", b"stale download".to_vec()).expect("select cached data");
-    assert_eq!(selected, b"new dirty data");
+    let cache = Mutex::new(FileCache {
+        entries: HashMap::from([(
+            "id".to_owned(),
+            CachedFile {
+                version: "1".to_owned(),
+                data: b"new dirty data".to_vec(),
+            },
+        )]),
+        ..FileCache::default()
+    });
+    let dirty = Mutex::new(HashSet::from(["id".to_owned()]));
+    let selected = cache_download(
+        &cache,
+        &dirty,
+        "id",
+        "2".to_owned(),
+        0,
+        b"stale download".to_vec(),
+    )
+    .expect("select cached data");
     assert_eq!(
-        cache.lock().expect("cache").get("id"),
-        Some(&b"new dirty data".to_vec())
+        selected,
+        CacheDownload::Existing(b"new dirty data".to_vec())
     );
+    assert_eq!(
+        cached_bytes(&cache.lock().expect("cache"), "id"),
+        Some(b"new dirty data".to_vec())
+    );
+}
+
+#[test]
+fn clean_old_version_download_cannot_replace_newer_cache() {
+    let cache = Mutex::new(FileCache {
+        entries: HashMap::from([(
+            "id".to_owned(),
+            CachedFile {
+                version: "2".to_owned(),
+                data: b"new".to_vec(),
+            },
+        )]),
+        versions: HashMap::from([("id".to_owned(), "2".to_owned())]),
+        ..FileCache::default()
+    });
+    let dirty = Mutex::new(HashSet::new());
+
+    let selected = cache_download(&cache, &dirty, "id", "1".to_owned(), 0, b"old".to_vec())
+        .expect("reject old clean download");
+
+    assert_eq!(selected, CacheDownload::Retry);
+    let cache = cache.lock().expect("cache");
+    assert_eq!(cached_bytes(&cache, "id"), Some(b"new".to_vec()));
+    assert_eq!(cached_version(&cache, "id"), Some("2"));
+    assert_eq!(cache.versions.get("id").map(String::as_str), Some("2"));
 }
 
 #[test]
