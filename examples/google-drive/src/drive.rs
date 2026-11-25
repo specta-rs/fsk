@@ -183,6 +183,7 @@ struct RemoteFile {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CachedFile {
     version: String,
+    etag: Option<String>,
     data: Vec<u8>,
 }
 
@@ -219,6 +220,7 @@ impl FileCache {
             id.to_owned(),
             CachedFile {
                 version: version.clone(),
+                etag: None,
                 data,
             },
         );
@@ -233,15 +235,49 @@ impl FileCache {
             .map(|entry| entry.version.clone())
             .or_else(|| self.versions.get(id).cloned())
             .unwrap_or_default();
-        self.entries
-            .insert(id.to_owned(), CachedFile { version, data });
+        self.entries.insert(
+            id.to_owned(),
+            CachedFile {
+                version,
+                etag: None,
+                data,
+            },
+        );
     }
 }
 
 enum DownloadPlan {
     Retry,
     Cached(Vec<u8>),
-    Fetch { version: String, epoch: u64 },
+    Fetch {
+        epoch: u64,
+        known_version: Option<String>,
+    },
+}
+
+struct DownloadedFile {
+    data: Vec<u8>,
+    etag: Option<String>,
+}
+
+struct RemoteMetadata {
+    version: String,
+    etag: Option<String>,
+}
+
+impl CachedFile {
+    fn matches(&self, current: &RemoteMetadata) -> bool {
+        if current.version == self.version || self.etag.as_deref() == Some(current.version.as_str())
+        {
+            return true;
+        }
+        match (&self.etag, &current.etag) {
+            (Some(cached), Some(current)) => etag_token(cached)
+                .zip(etag_token(current))
+                .is_some_and(|(cached, current)| cached == current),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -362,25 +398,45 @@ impl GoogleDrive {
     // documents. Materialize those during indexing so getattr can return the
     // exact size; ordinary files remain lazy.
     fn hydrate_exports(&mut self) {
-        let exports: Vec<_> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| {
-                let remote = node.remote.as_ref()?;
-                export_format(&remote.mime_type).1?;
-                Some((u64::try_from(index + 1).ok()?, remote.clone()))
-            })
-            .collect();
-        for (inode, remote) in exports {
-            if let Ok(data) = self.download(&remote) {
-                let index = inode_index(inode).expect("allocated inode fits usize");
-                self.nodes[index].size = u64::try_from(data.len()).unwrap_or(u64::MAX);
-            } else {
-                // Keep the entry so a transient export failure does not
-                // silently remove a document from the mounted namespace. A
-                // later read retries the export and refreshes its size.
-                eprintln!("drive: could not hydrate export for inode {inode}");
+        // Aliases share one remote id, so download each export once during
+        // indexing instead of multiplying requests across the mounted tree.
+        let mut exports: HashMap<String, (RemoteFile, Vec<u64>)> = HashMap::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            let Some(remote) = node.remote.as_ref() else {
+                continue;
+            };
+            if export_format(&remote.mime_type).1.is_none() {
+                continue;
+            }
+            let Ok(inode) = u64::try_from(index + 1) else {
+                continue;
+            };
+            exports
+                .entry(remote.id.clone())
+                .or_insert_with(|| (remote.clone(), Vec::new()))
+                .1
+                .push(inode);
+        }
+        let mut exports: Vec<_> = exports.into_values().collect();
+        exports.sort_by(|left, right| left.0.id.cmp(&right.0.id));
+        for (remote, inodes) in exports {
+            match self.download(&remote) {
+                Ok(data) => {
+                    let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                    for inode in inodes {
+                        let index = inode_index(inode).expect("allocated inode fits usize");
+                        self.nodes[index].size = size;
+                    }
+                }
+                Err(error) => {
+                    // Keep the entry so a transient export failure does not
+                    // silently remove a document from the mounted namespace. A
+                    // later read retries the export and refreshes its size.
+                    eprintln!(
+                        "drive: could not hydrate export {} for inodes {inodes:?}: {error:?}",
+                        remote.id
+                    );
+                }
             }
         }
     }
@@ -838,14 +894,32 @@ impl GoogleDrive {
         };
         let (cached, epoch) = cached;
         let Some(cached) = cached else {
-            let (version, _) = self.remote_version(&remote.id)?;
-            return Ok(DownloadPlan::Fetch { version, epoch });
+            return Ok(DownloadPlan::Fetch {
+                epoch,
+                known_version: None,
+            });
         };
 
         // A remote id is immutable, but its bytes are not. Compare the server
         // version with the version that produced the cached bytes.
-        let (current_version, _) = self.remote_version(&remote.id)?;
-        if current_version == cached.version {
+        let current = self.remote_metadata(&remote.id)?;
+        if cached.matches(&current) {
+            let mut cache = self.cache.lock().map_err(|_| Error::IO)?;
+            let unchanged = cache.epoch(&remote.id) == epoch
+                && cache.entries.get(&remote.id).is_some_and(|entry| {
+                    entry.version == cached.version && entry.etag == cached.etag
+                });
+            if !unchanged {
+                return Ok(DownloadPlan::Retry);
+            }
+            if cached.version != current.version {
+                if let Some(entry) = cache.entries.get_mut(&remote.id) {
+                    entry.version.clone_from(&current.version);
+                }
+                cache
+                    .versions
+                    .insert(remote.id.clone(), current.version.clone());
+            }
             return Ok(DownloadPlan::Cached(cached.data));
         }
 
@@ -862,8 +936,8 @@ impl GoogleDrive {
         drop(cache);
         self.sizes.lock().map_err(|_| Error::IO)?.remove(&remote.id);
         Ok(DownloadPlan::Fetch {
-            version: current_version,
             epoch,
+            known_version: Some(current.version),
         })
     }
 
@@ -871,22 +945,13 @@ impl GoogleDrive {
         match plan {
             DownloadPlan::Retry => Ok(None),
             DownloadPlan::Cached(data) => Ok(Some(data)),
-            DownloadPlan::Fetch { version, epoch } => {
+            DownloadPlan::Fetch {
+                epoch,
+                known_version,
+            } => {
                 let downloaded = self.download_content(remote)?;
-                // The remote can change between the metadata and content
-                // GETs. Publish bytes only after their version is confirmed.
-                let (verified_version, _) = self.remote_version(&remote.id)?;
-                if verified_version != version {
-                    return Ok(None);
-                }
-                match cache_download(
-                    &self.cache,
-                    &self.dirty,
-                    &remote.id,
-                    version,
-                    epoch,
-                    downloaded,
-                )? {
+                let cached = self.bind_download(remote, downloaded, known_version)?;
+                match cache_download(&self.cache, &self.dirty, &remote.id, cached, epoch)? {
                     CacheDownload::Retry => Ok(None),
                     CacheDownload::Existing(data) => Ok(Some(data)),
                     CacheDownload::Installed { data, changed } => {
@@ -900,7 +965,50 @@ impl GoogleDrive {
         }
     }
 
-    fn download_content(&self, remote: &RemoteFile) -> Result<Vec<u8>> {
+    fn bind_download(
+        &self,
+        remote: &RemoteFile,
+        downloaded: DownloadedFile,
+        known_version: Option<String>,
+    ) -> Result<CachedFile> {
+        let listed_version = self
+            .cache
+            .lock()
+            .map_err(|_| Error::IO)?
+            .versions
+            .get(&remote.id)
+            .filter(|version| !version.is_empty())
+            .cloned();
+        let etag = downloaded.etag.as_deref().and_then(etag_token);
+        if let Some(etag) = etag {
+            return Ok(CachedFile {
+                version: known_version
+                    .or(listed_version)
+                    .unwrap_or_else(|| etag.clone()),
+                etag: Some(etag),
+                data: downloaded.data,
+            });
+        }
+        if let Some(version) = known_version.or(listed_version) {
+            return Ok(CachedFile {
+                version,
+                etag: None,
+                data: downloaded.data,
+            });
+        }
+
+        // Neither the listing nor the content response identified the bytes.
+        // One metadata request is enough to bind them; reads do not need an
+        // ETag for this fallback.
+        let current = self.remote_metadata(&remote.id)?;
+        Ok(CachedFile {
+            version: current.version,
+            etag: current.etag.as_deref().and_then(etag_token),
+            data: downloaded.data,
+        })
+    }
+
+    fn download_content(&self, remote: &RemoteFile) -> Result<DownloadedFile> {
         let (_, export_mime) = export_format(&remote.mime_type);
         let mut request = if let Some(mime) = export_mime {
             self.request(&format!("{}/files/{}/export", self.api_url, remote.id))
@@ -910,10 +1018,20 @@ impl GoogleDrive {
                 .query(&[("alt", "media"), ("supportsAllDrives", "true")])
         };
         request = request.header(reqwest::header::ACCEPT, "*/*");
-        let response = request
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|_| Error::IO)?;
+        let response = request.send().map_err(|error| {
+            eprintln!("drive: content request for {} failed: {error}", remote.id);
+            Error::IO
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            eprintln!("drive: content request for {} returned {status}", remote.id);
+            return Err(Error::IO);
+        }
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         if response
             .content_length()
             .is_some_and(|length| length > MAX_BUFFERED_FILE_SIZE)
@@ -928,7 +1046,7 @@ impl GoogleDrive {
         if u64::try_from(data.len()).unwrap_or(u64::MAX) > MAX_BUFFERED_FILE_SIZE {
             return Err(Error(27));
         }
-        Ok(data)
+        Ok(DownloadedFile { data, etag })
     }
 
     fn note_content_change(&self, remote_id: &str) {
@@ -970,7 +1088,8 @@ impl GoogleDrive {
         if u64::try_from(data.len()).unwrap_or(u64::MAX) > MAX_BUFFERED_FILE_SIZE {
             return Err(Error(27));
         }
-        let (current_version, etag) = self.remote_version(&remote.id)?;
+        let current = self.remote_metadata(&remote.id)?;
+        let etag = current.etag.ok_or(Error::IO)?;
         let expected_version = {
             let cache = self.cache.lock().map_err(|_| Error::IO)?;
             cache
@@ -980,7 +1099,7 @@ impl GoogleDrive {
                 .or_else(|| cache.versions.get(&remote.id).cloned())
                 .unwrap_or_default()
         };
-        if !version_matches(&expected_version, &current_version) {
+        if !version_matches(&expected_version, &current.version) {
             return Err(Error::STALE);
         }
         let response = self
@@ -1021,21 +1140,33 @@ impl GoogleDrive {
         Ok(())
     }
 
-    fn remote_version(&self, id: &str) -> Result<(String, String)> {
+    fn remote_metadata(&self, id: &str) -> Result<RemoteMetadata> {
         let response = self
             .request(&format!("{}/files/{id}", self.api_url))
             .query(&[("fields", "version"), ("supportsAllDrives", "true")])
             .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|_| Error::IO)?;
+            .map_err(|error| {
+                eprintln!("drive: metadata request for {id} failed: {error}");
+                Error::IO
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            eprintln!("drive: metadata request for {id} returned {status}");
+            return Err(Error::IO);
+        }
         let etag = response
             .headers()
             .get(reqwest::header::ETAG)
             .and_then(|value| value.to_str().ok())
-            .ok_or(Error::IO)?
-            .to_owned();
-        let version: FileVersion = response.json().map_err(|_| Error::IO)?;
-        Ok((version.version, etag))
+            .map(str::to_owned);
+        let version: FileVersion = response.json().map_err(|error| {
+            eprintln!("drive: metadata response for {id} was invalid: {error}");
+            Error::IO
+        })?;
+        Ok(RemoteMetadata {
+            version: version.version,
+            etag,
+        })
     }
 
     fn flush(&self, inode: u64) -> Result<()> {
@@ -1223,9 +1354,8 @@ fn cache_download(
     cache: &Mutex<FileCache>,
     dirty: &Mutex<HashSet<String>>,
     id: &str,
-    version: String,
+    cached: CachedFile,
     epoch: u64,
-    downloaded: Vec<u8>,
 ) -> Result<CacheDownload> {
     let mut cache = cache.lock().map_err(|_| Error::IO)?;
     if dirty.lock().map_err(|_| Error::IO)?.contains(id) {
@@ -1241,30 +1371,37 @@ fn cache_download(
         return Ok(CacheDownload::Retry);
     }
     if let Some(current) = cache.entries.get(id) {
-        return if current.version == version {
+        return if current.version == cached.version
+            || current.etag.is_some() && current.etag == cached.etag
+        {
             Ok(CacheDownload::Existing(current.data.clone()))
         } else {
             Ok(CacheDownload::Retry)
         };
     }
-    cache.entries.insert(
-        id.to_owned(),
-        CachedFile {
-            version: version.clone(),
-            data: downloaded.clone(),
-        },
-    );
+    cache.entries.insert(id.to_owned(), cached.clone());
     // The version and bytes become visible under the same lock. An old
     // response can never publish bytes under a newer version.
-    cache.versions.insert(id.to_owned(), version);
+    cache.versions.insert(id.to_owned(), cached.version);
     let changed = cache.changed_epochs.get(id) == Some(&epoch);
     if changed {
         cache.changed_epochs.remove(id);
     }
     Ok(CacheDownload::Installed {
-        data: downloaded,
+        data: cached.data,
         changed,
     })
+}
+
+fn etag_token(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = value.strip_prefix("W/").unwrap_or(value).trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value)
+        .trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 fn version_matches(expected: &str, current: &str) -> bool {

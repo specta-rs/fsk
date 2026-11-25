@@ -107,6 +107,7 @@ fn seed_cache(filesystem: &GoogleDrive, id: &str, version: &str, data: &[u8]) {
         id.to_owned(),
         CachedFile {
             version: version.to_owned(),
+            etag: None,
             data: data.to_vec(),
         },
     );
@@ -119,6 +120,13 @@ fn cached_bytes(cache: &FileCache, id: &str) -> Option<Vec<u8>> {
 
 fn cached_version<'a>(cache: &'a FileCache, id: &str) -> Option<&'a str> {
     cache.entries.get(id).map(|entry| entry.version.as_str())
+}
+
+fn cached_etag<'a>(cache: &'a FileCache, id: &str) -> Option<&'a str> {
+    cache
+        .entries
+        .get(id)
+        .and_then(|entry| entry.etag.as_deref())
 }
 
 struct FakeRequest {
@@ -167,6 +175,15 @@ impl FakeResponse {
     fn with_header(mut self, name: &'static str, value: String) -> Self {
         self.headers.push((name, value));
         self
+    }
+}
+
+fn fake_content_response(version: &str, include_etag: bool) -> FakeResponse {
+    let response = FakeResponse::bytes(format!("v{version}").as_bytes());
+    if include_etag {
+        response.with_header("ETag", format!("\"{version}\""))
+    } else {
+        response
     }
 }
 
@@ -286,9 +303,11 @@ fn write_fake_response(stream: &mut TcpStream, response: &FakeResponse) -> io::R
 
 struct FakeDriveState {
     version: String,
-    advance_version_on_metadata: bool,
+    content_etag: bool,
+    metadata_etag: bool,
     metadata_gets: usize,
     content_gets: HashMap<String, usize>,
+    export_gets: usize,
     upload_starts: usize,
     uploads: Vec<Vec<u8>>,
 }
@@ -304,9 +323,11 @@ impl FakeDriveServer {
     fn new(block_old_response: bool) -> Self {
         let state = Arc::new(Mutex::new(FakeDriveState {
             version: "1".to_owned(),
-            advance_version_on_metadata: false,
+            content_etag: true,
+            metadata_etag: true,
             metadata_gets: 0,
             content_gets: HashMap::new(),
+            export_gets: 0,
             upload_starts: 0,
             uploads: Vec::new(),
         }));
@@ -318,27 +339,24 @@ impl FakeDriveServer {
             if request.path() == "/drive/v3/files/id" && request.query("alt").is_none() {
                 let mut state = handler_state.lock().expect("fake Drive state");
                 state.metadata_gets += 1;
-                if state.advance_version_on_metadata {
-                    let version = state
-                        .version
-                        .parse::<u64>()
-                        .expect("fake Drive version is numeric")
-                        + 1;
-                    state.version = version.to_string();
-                }
                 let version = state.version.clone();
-                return FakeResponse::json(serde_json::json!({ "version": version }).to_string())
-                    .with_header("ETag", format!("\"{version}\""));
+                let response =
+                    FakeResponse::json(serde_json::json!({ "version": version }).to_string());
+                return if state.metadata_etag {
+                    response.with_header("ETag", format!("\"{version}\""))
+                } else {
+                    response
+                };
             }
             if request.path() == "/drive/v3/files/id"
                 && request.query("alt").as_deref() == Some("media")
             {
-                let (version, count) = {
+                let (version, count, include_etag) = {
                     let mut state = handler_state.lock().expect("fake Drive state");
                     let version = state.version.clone();
                     let count = state.content_gets.entry(version.clone()).or_default();
                     *count += 1;
-                    (version, *count)
+                    (version, *count, state.content_etag)
                 };
                 if block_old_response && version == "1" && count == 1 {
                     let _ = old_started_tx.send(());
@@ -347,8 +365,12 @@ impl FakeDriveServer {
                         .expect("old response release")
                         .recv_timeout(Duration::from_secs(10));
                 }
-                let body = format!("v{version}");
-                return FakeResponse::bytes(body.as_bytes());
+                return fake_content_response(&version, include_etag);
+            }
+            if request.path() == "/drive/v3/files/id/export" {
+                let mut state = handler_state.lock().expect("fake Drive state");
+                state.export_gets += 1;
+                return fake_content_response(&state.version, state.content_etag);
             }
             if request.method == "PATCH" && request.path() == "/upload/drive/v3/files/id" {
                 handler_state
@@ -1249,6 +1271,10 @@ fn changed_remote_version_does_not_reuse_old_cached_bytes() {
         .expect("metadata after first read");
     assert_eq!(
         cached_version(&filesystem.cache.lock().expect("cache"), "id"),
+        Some("1")
+    );
+    assert_eq!(
+        cached_etag(&filesystem.cache.lock().expect("cache"), "id"),
         Some("2")
     );
 
@@ -1261,27 +1287,67 @@ fn changed_remote_version_does_not_reuse_old_cached_bytes() {
     assert_eq!(after_second.modified_ns, after_first.modified_ns);
 
     let state = server.state.lock().expect("fake Drive state");
-    assert_eq!(state.metadata_gets, 3);
+    assert_eq!(state.metadata_gets, 1);
     assert_eq!(state.content_gets.get("2"), Some(&1));
 }
 
 #[test]
-fn continuously_changing_remote_version_returns_stale() {
+fn cache_miss_fallback_and_read_revalidation_do_not_require_etag() {
     let server = FakeDriveServer::new(false);
+    server.state.lock().expect("fake Drive state").version = "2".to_owned();
     {
         let mut state = server.state.lock().expect("fake Drive state");
-        state.advance_version_on_metadata = true;
+        state.content_etag = false;
+        state.metadata_etag = false;
     }
     let mut filesystem = fake_filesystem(&server);
     let inode = add_listed_file(&mut filesystem, false);
+    filesystem
+        .cache
+        .lock()
+        .expect("cache")
+        .versions
+        .remove("id");
 
     let mut output = [0_u8; 2];
-    assert_eq!(filesystem.read(inode, 0, &mut output), Err(Error::STALE));
+    assert_eq!(filesystem.read(inode, 0, &mut output), Ok(2));
+    assert_eq!(&output, b"v2");
+    let after_first = filesystem
+        .metadata(inode)
+        .expect("metadata after first read");
+
+    assert_eq!(filesystem.read(inode, 0, &mut output), Ok(2));
+    let after_second = filesystem
+        .metadata(inode)
+        .expect("metadata after second read");
+    assert_eq!(after_second.modified_ns, after_first.modified_ns);
 
     let state = server.state.lock().expect("fake Drive state");
-    let attempts = MAX_DOWNLOAD_RETRIES + 1;
-    assert_eq!(state.metadata_gets, attempts * 2);
-    assert_eq!(state.content_gets.values().sum::<usize>(), attempts);
+    assert_eq!(state.metadata_gets, 2);
+    assert_eq!(state.content_gets.get("2"), Some(&1));
+}
+
+#[test]
+fn hydrate_exports_deduplicates_aliases_without_metadata() {
+    let server = FakeDriveServer::new(false);
+    server.state.lock().expect("fake Drive state").version = "2".to_owned();
+    let mut filesystem = fake_filesystem(&server);
+    let mut document = file("application/vnd.google-apps.document", false);
+    document.name = "Document".to_owned();
+    let first = filesystem.add_drive_file(ROOT_INODE, &document);
+    document.name = "Alias".to_owned();
+    let second = filesystem.add_drive_file(ROOT_INODE, &document);
+
+    filesystem.hydrate_exports();
+
+    assert_eq!(
+        filesystem.metadata(first).expect("document metadata").size,
+        2
+    );
+    assert_eq!(filesystem.metadata(second).expect("alias metadata").size, 2);
+    let state = server.state.lock().expect("fake Drive state");
+    assert_eq!(state.metadata_gets, 0);
+    assert_eq!(state.export_gets, 1);
 }
 
 #[test]
@@ -1307,9 +1373,52 @@ fn clean_cached_write_revalidates_before_buffering() {
     assert!(after.modified_ns > before.modified_ns);
 
     let state = server.state.lock().expect("fake Drive state");
-    assert_eq!(state.metadata_gets, 4);
+    assert_eq!(state.metadata_gets, 1);
     assert_eq!(state.content_gets.get("2"), Some(&1));
     assert_eq!(state.content_gets.get("3"), Some(&1));
+}
+
+#[test]
+fn matching_etag_updates_upload_version_without_another_content_get() {
+    let server = FakeDriveServer::new(false);
+    server.state.lock().expect("fake Drive state").version = "2".to_owned();
+    let mut filesystem = fake_filesystem(&server);
+    let inode = add_listed_file(&mut filesystem, true);
+    let mut output = [0_u8; 2];
+    assert_eq!(filesystem.read(inode, 0, &mut output), Ok(2));
+    assert_eq!(&output, b"v2");
+
+    assert_eq!(filesystem.write(inode, 0, b"X"), Ok(1));
+    assert_eq!(filesystem.synchronize(), Ok(()));
+
+    let cache = filesystem.cache.lock().expect("cache");
+    assert_eq!(cached_bytes(&cache, "id"), Some(b"X2".to_vec()));
+    assert_eq!(cached_version(&cache, "id"), Some("3"));
+    drop(cache);
+    let state = server.state.lock().expect("fake Drive state");
+    assert_eq!(state.metadata_gets, 2);
+    assert_eq!(state.content_gets.get("2"), Some(&1));
+    assert_eq!(state.uploads, vec![b"X2".to_vec()]);
+}
+
+#[test]
+fn upload_still_requires_an_etag() {
+    let server = FakeDriveServer::new(false);
+    server.state.lock().expect("fake Drive state").metadata_etag = false;
+    let mut filesystem = fake_filesystem(&server);
+    add_listed_file(&mut filesystem, true);
+    seed_cache(&filesystem, "id", "1", b"abc");
+    filesystem
+        .dirty
+        .lock()
+        .expect("dirty")
+        .insert("id".to_owned());
+
+    assert_eq!(filesystem.synchronize(), Err(Error::IO));
+    assert_eq!(
+        server.state.lock().expect("fake Drive state").upload_starts,
+        0
+    );
 }
 
 #[test]
@@ -1495,6 +1604,7 @@ fn completed_download_does_not_replace_concurrent_cached_write() {
             "id".to_owned(),
             CachedFile {
                 version: "1".to_owned(),
+                etag: None,
                 data: b"new dirty data".to_vec(),
             },
         )]),
@@ -1505,9 +1615,12 @@ fn completed_download_does_not_replace_concurrent_cached_write() {
         &cache,
         &dirty,
         "id",
-        "2".to_owned(),
+        CachedFile {
+            version: "2".to_owned(),
+            etag: Some("2".to_owned()),
+            data: b"stale download".to_vec(),
+        },
         0,
-        b"stale download".to_vec(),
     )
     .expect("select cached data");
     assert_eq!(
@@ -1527,6 +1640,7 @@ fn clean_old_version_download_cannot_replace_newer_cache() {
             "id".to_owned(),
             CachedFile {
                 version: "2".to_owned(),
+                etag: None,
                 data: b"new".to_vec(),
             },
         )]),
@@ -1535,8 +1649,18 @@ fn clean_old_version_download_cannot_replace_newer_cache() {
     });
     let dirty = Mutex::new(HashSet::new());
 
-    let selected = cache_download(&cache, &dirty, "id", "1".to_owned(), 0, b"old".to_vec())
-        .expect("reject old clean download");
+    let selected = cache_download(
+        &cache,
+        &dirty,
+        "id",
+        CachedFile {
+            version: "1".to_owned(),
+            etag: None,
+            data: b"old".to_vec(),
+        },
+        0,
+    )
+    .expect("reject old clean download");
 
     assert_eq!(selected, CacheDownload::Retry);
     let cache = cache.lock().expect("cache");
@@ -1554,8 +1678,18 @@ fn invalidated_epoch_rejects_completed_download() {
     });
     let dirty = Mutex::new(HashSet::new());
 
-    let selected = cache_download(&cache, &dirty, "id", "1".to_owned(), 0, b"old".to_vec())
-        .expect("reject download from an invalidated epoch");
+    let selected = cache_download(
+        &cache,
+        &dirty,
+        "id",
+        CachedFile {
+            version: "1".to_owned(),
+            etag: None,
+            data: b"old".to_vec(),
+        },
+        0,
+    )
+    .expect("reject download from an invalidated epoch");
 
     assert_eq!(selected, CacheDownload::Retry);
     let cache = cache.lock().expect("cache");
