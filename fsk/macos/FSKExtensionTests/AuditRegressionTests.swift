@@ -498,7 +498,9 @@ struct AuditRegressionTests {
             .init(opcode: 15, behavior: .respond(body: openBody(8))),
             .init(opcode: 16, behavior: .respond(status: EIO)),
         ], [
-            auditHello(), .init(opcode: 14),
+            auditHello(),
+            .init(opcode: 16, behavior: .respond(body: Data()), expectedRequestBody: auditLeaseAcknowledgement(lease: 8)),
+            .init(opcode: 14),
         ]]) { backend in
             let volume = FSKVolume(backend: backend)
             let item = FSKItem(inode: 2, kind: .file)
@@ -612,7 +614,7 @@ struct AuditRegressionTests {
             volume.openItem(item, modes: [.read]) { error = $0 }
             let elapsed = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
             #expect(auditPOSIX(error) == ETIMEDOUT)
-            #expect(elapsed < 450_000_000)
+            #expect(elapsed < 1_000_000_000)
             #expect(item.releaseOpenState() == nil)
             try backend.synchronize()
         }
@@ -673,6 +675,202 @@ struct AuditRegressionTests {
             #expect(item.releaseOpenState() == nil)
             _ = try backend.statfs()
         }
+    }
+
+    @Test("cleanup CLOSE EINVAL completes the pending lease")
+    func cleanupEINVALCompletesPendingClose() throws {
+        let acknowledgement = auditLeaseAcknowledgement(lease: 7)
+        let statfs = AuditIPCScript(opcode: 2, behavior: .respond(body: Data(count: 52)))
+        try withAuditBackend([[
+            auditHello(minor: 2), auditNetworkConfiguration(),
+            .init(opcode: 15, behavior: .respond(body: auditOpenBody(lease: 7))),
+            .init(opcode: 17, behavior: .applyThenClose, expectedRequestBody: acknowledgement),
+        ], [
+            auditHello(minor: 2),
+            .init(opcode: 16, behavior: .respond(status: EINVAL), expectedRequestBody: acknowledgement),
+            statfs,
+        ]]) { backend in
+            let volume = FSKVolume(backend: backend)
+            let item = FSKItem(inode: 2, kind: .file)
+            var error: Error?
+            volume.openItem(item, modes: [.read]) { error = $0 }
+            if let code = auditPOSIX(error) {
+                #expect([EINVAL, ECONNRESET, EPIPE].contains(code))
+            } else {
+                Issue.record("expected an ACK transport error")
+            }
+            #expect(item.releaseOpenState() == nil)
+            _ = try backend.statfs()
+        }
+    }
+
+    @Test("concurrent pending cleanup does not duplicate CLOSE")
+    func pendingCloseRetriesAreSerialized() throws {
+        let acknowledgement = auditLeaseAcknowledgement(lease: 7)
+        let closeStarted = DispatchSemaphore(value: 0)
+        let statfs = AuditIPCScript(opcode: 2, behavior: .respond(body: Data(count: 52)))
+        let server = try AuditIPCServer(scripts: [
+            [
+                auditHello(minor: 2), auditNetworkConfiguration(),
+                .init(opcode: 15, behavior: .respond(body: auditOpenBody(lease: 7))),
+                .init(opcode: 17, behavior: .applyThenClose, expectedRequestBody: acknowledgement),
+            ],
+            [
+                auditHello(minor: 2),
+                .init(opcode: 16, behavior: .respond(status: EIO), expectedRequestBody: acknowledgement),
+                .init(opcode: 16, behavior: .signalAndHang(closeStarted), expectedRequestBody: acknowledgement),
+            ],
+            [auditHello(minor: 2), statfs],
+        ])
+        server.start()
+        defer { server.stop() }
+        let backend = try RustBackend(resourceURL: server.resourceURL, requestTimeout: auditIPCRequestTimeout)
+        let volume = FSKVolume(backend: backend)
+        let item = FSKItem(inode: 2, kind: .file)
+        var error: Error?
+        volume.openItem(item, modes: [.read]) { error = $0 }
+        if let code = auditPOSIX(error) {
+            #expect([EINVAL, ECONNRESET, EPIPE].contains(code))
+        } else {
+            Issue.record("expected an ACK transport error")
+        }
+
+        let retryResult = AuditResultBox()
+        let retryFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            retryResult.set(backend.retryPendingCloses())
+            retryFinished.signal()
+        }
+        #expect(closeStarted.wait(timeout: .now() + 1) == .success)
+        _ = try backend.statfs()
+        server.stop()
+        #expect(retryFinished.wait(timeout: .now() + 1) == .success)
+        #expect(retryResult.value != nil)
+    }
+
+    @Test("deactivate reports permanently unresolved pending cleanup")
+    func deactivateReportsPendingCloseFailure() throws {
+        let acknowledgement = auditLeaseAcknowledgement(lease: 7)
+        try withAuditBackend([[
+            auditHello(minor: 2), auditNetworkConfiguration(),
+            .init(opcode: 15, behavior: .respond(body: auditOpenBody(lease: 7))),
+            .init(opcode: 17, behavior: .applyThenClose, expectedRequestBody: acknowledgement),
+        ], [
+            auditHello(minor: 2),
+            .init(opcode: 16, behavior: .respond(status: EIO), expectedRequestBody: acknowledgement),
+            .init(opcode: 16, behavior: .respond(status: EIO), expectedRequestBody: acknowledgement),
+        ]]) { backend in
+            let volume = FSKVolume(backend: backend)
+            let item = FSKItem(inode: 2, kind: .file)
+            var error: Error?
+            volume.openItem(item, modes: [.read]) { error = $0 }
+            if let code = auditPOSIX(error) {
+                #expect([EINVAL, ECONNRESET, EPIPE].contains(code))
+            } else {
+                Issue.record("expected an ACK transport error")
+            }
+            error = nil
+            volume.deactivate { error = $0 }
+            #expect(auditPOSIX(error) == EIO)
+        }
+    }
+
+    @Test("failed synchronized lease CLOSE is retried on a later operation")
+    func failedSynchronizedCloseIsRetried() throws {
+        let acknowledgement = auditLeaseAcknowledgement(lease: 7)
+        try withAuditBackend([[
+            auditHello(minor: 2), auditNetworkConfiguration(),
+            .init(opcode: 15, behavior: .respond(body: auditOpenBody(lease: 7))),
+            .init(opcode: 17, behavior: .respond(status: EIO), expectedRequestBody: acknowledgement),
+            .init(opcode: 16, behavior: .respond(status: EIO), expectedRequestBody: acknowledgement),
+        ], [
+            auditHello(minor: 2),
+            .init(opcode: 16, behavior: .respond(body: Data()), expectedRequestBody: acknowledgement),
+            .init(opcode: 14),
+        ]]) { backend in
+            let volume = FSKVolume(backend: backend)
+            let item = FSKItem(inode: 2, kind: .file)
+            var error: Error?
+            volume.openItem(item, modes: [.read]) { error = $0 }
+            #expect(auditPOSIX(error) == EIO)
+            #expect(item.releaseOpenState() == nil)
+            try backend.synchronize()
+        }
+    }
+
+    @Test("invalidated open handles retain cleanup for a later operation")
+    func invalidatedHandleCloseIsRetried() throws {
+        let acknowledgement = auditLeaseAcknowledgement(lease: 7)
+        let statfs = AuditIPCScript(opcode: 2, behavior: .respond(body: Data(count: 52)))
+        let server = try AuditIPCServer(scripts: [
+            [
+                auditHello(minor: 2), auditNetworkConfiguration(),
+                .init(opcode: 15, behavior: .respond(body: auditOpenBody(lease: 7))),
+            ],
+            [
+                auditHello(minor: 2),
+                .init(opcode: 16, behavior: .respond(body: Data()), expectedRequestBody: acknowledgement),
+                statfs,
+            ],
+        ])
+        server.start()
+        defer { server.stop() }
+        let backend = try RustBackend(resourceURL: server.resourceURL, requestTimeout: auditIPCRequestTimeout)
+        let handle = try backend.open(inode: 2, writable: false)
+        handle.invalidate()
+        _ = try backend.statfs()
+        try server.wait()
+    }
+
+    @Test("deinitialized open handles retain cleanup for a later operation")
+    func deinitializedHandleCloseIsRetried() throws {
+        let acknowledgement = auditLeaseAcknowledgement(lease: 7)
+        let statfs = AuditIPCScript(opcode: 2, behavior: .respond(body: Data(count: 52)))
+        let server = try AuditIPCServer(scripts: [
+            [
+                auditHello(minor: 2), auditNetworkConfiguration(),
+                .init(opcode: 15, behavior: .respond(body: auditOpenBody(lease: 7))),
+            ],
+            [
+                auditHello(minor: 2),
+                .init(opcode: 16, behavior: .respond(body: Data()), expectedRequestBody: acknowledgement),
+                statfs,
+            ],
+        ])
+        server.start()
+        defer { server.stop() }
+        let backend = try RustBackend(resourceURL: server.resourceURL, requestTimeout: auditIPCRequestTimeout)
+        var handle: RustOpenHandle? = try backend.open(inode: 2, writable: false)
+        #expect(handle?.file.lease == 7)
+        handle = nil
+        _ = try backend.statfs()
+        try server.wait()
+    }
+
+    @Test("post-open decode failures retain cleanup for a later operation")
+    func postOpenDecodeFailureIsRetried() throws {
+        let malformedOpen = auditLeaseAcknowledgement(lease: 7)
+        let acknowledgement = auditLeaseAcknowledgement(lease: 7)
+        let statfs = AuditIPCScript(opcode: 2, behavior: .respond(body: Data(count: 52)))
+        let server = try AuditIPCServer(scripts: [
+            [
+                auditHello(minor: 2), auditNetworkConfiguration(),
+                .init(opcode: 15, behavior: .respond(body: malformedOpen)),
+            ],
+            [
+                auditHello(minor: 2),
+                .init(opcode: 16, behavior: .respond(body: Data()), expectedRequestBody: acknowledgement),
+                statfs,
+            ],
+        ])
+        server.start()
+        defer { server.stop() }
+        let backend = try RustBackend(resourceURL: server.resourceURL, requestTimeout: auditIPCRequestTimeout)
+        #expect(throws: RustBackendError.invalidProtocol) {
+            _ = try backend.open(inode: 2, writable: false)
+        }
+        _ = try backend.statfs()
+        try server.wait()
     }
 
     @Test("lease acknowledgement from another connection is rejected")

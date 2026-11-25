@@ -92,13 +92,12 @@ final class FSKVolume: FSVolume,
         options: FSDeactivateOptions = [],
         replyHandler: @escaping ((any Error)?) -> Void
     ) {
-        backend.retryPendingCloses()
+        var firstError = backend.retryPendingCloses().map { posix($0) }
         let items = itemCache.withLock { cache -> [FSKItem] in
             let items = Array(cache.items.values)
             cache.items.removeAll(keepingCapacity: false)
             return items
         }
-        var firstError: Error?
         for item in items {
             do {
                 try closeOpenState(of: item)
@@ -106,6 +105,9 @@ final class FSKVolume: FSVolume,
                 if firstError == nil { firstError = posix(error) }
                 itemCache.withLock { $0.items[item.inode] = item }
             }
+        }
+        if firstError == nil, let pendingError = backend.retryPendingCloses() {
+            firstError = posix(pendingError)
         }
         replyHandler(firstError)
     }

@@ -237,7 +237,16 @@ final class RustOpenHandle: @unchecked Sendable {
         defer { pool.checkin(connection, reusable: false) }
         var request = IPCEncoder(capacity: 8)
         request.append(file.lease)
-        _ = try connection.request(.close, request.data).get()
+        do {
+            _ = try connection.request(.close, request.data).get()
+            pool.completeClose(lease: file.lease)
+        } catch let error as RustBackendError where error.posixCode == EINVAL {
+            pool.completeClose(lease: file.lease)
+            return
+        } catch {
+            pool.enqueueClose(lease: file.lease)
+            throw error
+        }
     }
 
     func finish() {
@@ -246,7 +255,12 @@ final class RustOpenHandle: @unchecked Sendable {
         let reusable = !failed
         lock.unlock()
         if let connection {
-            pool.checkin(connection, reusable: reusable)
+            if reusable {
+                pool.checkin(connection, reusable: true)
+            } else {
+                pool.checkin(connection, reusable: false)
+                pool.enqueueClose(lease: file.lease)
+            }
         }
     }
 
@@ -256,6 +270,7 @@ final class RustOpenHandle: @unchecked Sendable {
         lock.unlock()
         if let connection {
             pool.checkin(connection, reusable: false)
+            pool.enqueueClose(lease: file.lease)
         }
     }
 
@@ -515,8 +530,8 @@ final class RustBackend: @unchecked Sendable {
         _ = try pool.request(.close, request.data)
     }
 
-    func retryPendingCloses() {
-        pool.retryPendingCloses()
+    func retryPendingCloses() -> Error? {
+        return pool.retryPendingCloses()
     }
 }
 
@@ -548,7 +563,8 @@ private final class IPCConnectionPool: @unchecked Sendable {
     private var idle = [IPCConnection]()
     private var connectionCount = 0
     private let pendingCloseLock = NSLock()
-    private var pendingCloses: Set<UInt64> = []
+    private var pendingCloses: [UInt64: PendingCloseState] = [:]
+    private var nextCloseToken: UInt64 = 0
     private let maximumConnections = max(4, min(32, ProcessInfo.processInfo.activeProcessorCount))
 
     init(socketPath: String, token: Data, requestTimeout: TimeInterval) {
@@ -568,7 +584,7 @@ private final class IPCConnectionPool: @unchecked Sendable {
         timeout: TimeInterval? = nil,
         retryPending: Bool = true
     ) throws -> Data {
-        if retryPending { retryPendingCloses() }
+        if retryPending { _ = retryPendingCloses() }
         let connection = try checkout(timeout: timeout)
         var reusable = false
         defer { checkin(connection, reusable: reusable) }
@@ -632,31 +648,80 @@ private final class IPCConnectionPool: @unchecked Sendable {
         condition.unlock()
     }
 
-    func retryPendingCloses() {
+    func retryPendingCloses() -> Error? {
         pendingCloseLock.lock()
-        let leases = pendingCloses.sorted()
+        let leases = pendingCloses.keys.sorted()
         pendingCloseLock.unlock()
+        var firstError: Error?
         for lease in leases {
-            retryPendingClose(lease)
+            if let error = retryPendingClose(lease), firstError == nil {
+                firstError = error
+            }
         }
+        return firstError
     }
 
     func recoverAmbiguousClose(lease: UInt64) {
-        pendingCloseLock.lock()
-        pendingCloses.insert(lease)
-        pendingCloseLock.unlock()
-        retryPendingClose(lease)
+        enqueueClose(lease: lease)
+        _ = retryPendingClose(lease)
     }
 
-    private func retryPendingClose(_ lease: UInt64) {
+    func enqueueClose(lease: UInt64) {
+        pendingCloseLock.lock()
+        if pendingCloses[lease] == nil {
+            pendingCloses[lease] = PendingCloseState()
+        }
+        pendingCloseLock.unlock()
+    }
+
+    func completeClose(lease: UInt64) {
+        pendingCloseLock.lock()
+        pendingCloses.removeValue(forKey: lease)
+        pendingCloseLock.unlock()
+    }
+
+    private func retryPendingClose(_ lease: UInt64) -> Error? {
+        pendingCloseLock.lock()
+        guard var state = pendingCloses[lease] else {
+            pendingCloseLock.unlock()
+            return nil
+        }
+        guard !state.inFlight else {
+            let error = state.lastError ?? POSIXError(.EBUSY)
+            pendingCloseLock.unlock()
+            return error
+        }
+        nextCloseToken &+= 1
+        let token = nextCloseToken
+        state.inFlight = true
+        state.token = token
+        pendingCloses[lease] = state
+        pendingCloseLock.unlock()
+
+        var failure: Error?
         do {
             try closeLease(lease, timeout: leaseCleanupTimeout)
-            pendingCloseLock.lock()
-            pendingCloses.remove(lease)
-            pendingCloseLock.unlock()
+        } catch let error as RustBackendError where error.posixCode == EINVAL {
+            // An absent lease is already clean on legacy and idempotent peers.
+            failure = nil
         } catch {
-            // Keep the lease queued for the next healthy operation or deactivate.
+            failure = error
         }
+
+        pendingCloseLock.lock()
+        guard var current = pendingCloses[lease], current.token == token else {
+            pendingCloseLock.unlock()
+            return nil
+        }
+        if let failure {
+            current.inFlight = false
+            current.lastError = failure
+            pendingCloses[lease] = current
+        } else {
+            pendingCloses.removeValue(forKey: lease)
+        }
+        pendingCloseLock.unlock()
+        return failure
     }
 
     private func closeLease(_ lease: UInt64, timeout: TimeInterval) throws {
@@ -666,26 +731,35 @@ private final class IPCConnectionPool: @unchecked Sendable {
     }
 
     func open(inode: UInt64, writable: Bool) throws -> RustOpenHandle {
-        retryPendingCloses()
+        _ = retryPendingCloses()
         let connection = try checkout()
+        var lease: UInt64?
         do {
             var request = IPCEncoder(capacity: 9)
             request.append(inode)
             request.append(writable ? UInt8(1) : UInt8(0))
             var decoder = IPCDecoder(try connection.request(.open, request.data).get())
-            let lease = try decoder.uint64()
+            let decodedLease = try decoder.uint64()
+            lease = decodedLease
             let source = try decoder.uint8()
             let generation = try decoder.uint64()
             let localPath = source == 1 ? decoder.remainingData() : nil
             return RustOpenHandle(
-                file: RustOpenFile(lease: lease, generation: generation, localPath: localPath),
+                file: RustOpenFile(lease: decodedLease, generation: generation, localPath: localPath),
                 pool: self,
                 connection: connection
             )
         } catch {
+            if let lease { enqueueClose(lease: lease) }
             checkin(connection, reusable: false)
             throw error
         }
+    }
+
+    private struct PendingCloseState {
+        var inFlight = false
+        var lastError: Error?
+        var token: UInt64?
     }
 }
 

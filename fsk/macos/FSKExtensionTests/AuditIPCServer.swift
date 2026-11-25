@@ -11,6 +11,7 @@ enum AuditIPCBehavior: Sendable {
     case close
     case applyThenClose
     case hang
+    case signalAndHang(DispatchSemaphore)
 }
 
 struct AuditIPCScript: Sendable {
@@ -451,6 +452,13 @@ final class AuditIPCServer: @unchecked Sendable {
                 Darwin.close(peer)
                 return
             case .hang:
+                while true {
+                    lock.lock(); let stop = stopping; lock.unlock()
+                    if stop { return }
+                    usleep(10_000)
+                }
+            case let .signalAndHang(signal):
+                signal.signal()
                 while true {
                     lock.lock(); let stop = stopping; lock.unlock()
                     if stop { return }
