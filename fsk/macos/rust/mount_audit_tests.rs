@@ -60,8 +60,10 @@ fn unmount_spawn_error_still_stops_service_and_removes_socket() {
         mount_path: directory.path().to_path_buf(),
         socket_path: socket.clone(),
         stop,
-        accept_thread: Some(accept_thread),
-        mounted: true,
+        state: Mutex::new(SessionState {
+            accept_thread: Some(accept_thread),
+            mounted: true,
+        }),
     };
 
     drop(session);
@@ -99,13 +101,14 @@ fn failed_unmount_keeps_the_backend_available_for_a_retry() {
             thread::sleep(Duration::from_millis(1));
         }
     });
-    #[allow(unused_mut)] // Required by the snapshot fix's &mut self receiver.
-    let mut session = MountSession {
+    let session = MountSession {
         mount_path: directory.path().to_path_buf(),
         socket_path: socket.clone(),
         stop,
-        accept_thread: Some(accept_thread),
-        mounted: true,
+        state: Mutex::new(SessionState {
+            accept_thread: Some(accept_thread),
+            mounted: true,
+        }),
     };
 
     let error = session.unmount().unwrap_err();
@@ -122,6 +125,13 @@ fn failed_unmount_keeps_the_backend_available_for_a_retry() {
         socket.exists(),
         "a failed unmount removed the IPC socket needed for a retry"
     );
+
+    assert!(session.unmount().is_err());
+    assert!(
+        !stop_observer.load(Ordering::Acquire),
+        "a retry through the immutable session stopped the backend"
+    );
+    assert!(socket.exists());
 }
 
 #[test]
