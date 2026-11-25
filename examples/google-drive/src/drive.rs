@@ -260,6 +260,7 @@ struct DownloadedFile {
 #[derive(Clone)]
 struct RemoteMetadata {
     version: String,
+    // Keep the entity-tag exactly as received for upload If-Match.
     etag: Option<String>,
 }
 
@@ -986,6 +987,8 @@ impl GoogleDrive {
         // Probe the content response first. An ETag identifies these exact
         // bytes without another API call. If it is absent, discard the body and
         // fetch metadata before the content request whose bytes we will cache.
+        // This deliberately costs a second content request: caching the probe
+        // would require post-content metadata and could mislabel older bytes.
         if let Some(downloaded) = self.download_content(remote, true)? {
             return Ok(Some(CachedFile {
                 version: None,
@@ -1155,7 +1158,7 @@ impl GoogleDrive {
             .headers()
             .get(reqwest::header::ETAG)
             .and_then(|value| value.to_str().ok())
-            .and_then(etag_token);
+            .map(str::to_owned);
         let version: FileVersion = response.json().map_err(|error| {
             eprintln!("drive: metadata response for {id} was invalid: {error}");
             Error::IO
@@ -1403,16 +1406,16 @@ fn cache_download(
 }
 
 fn bind_pre_content(metadata: RemoteMetadata, downloaded: DownloadedFile) -> Option<CachedFile> {
-    let version = match (&metadata.etag, &downloaded.etag) {
-        (Some(pre_content), Some(content)) if etag_token(pre_content) != etag_token(content) => {
+    if let (Some(pre_content), Some(content)) = (&metadata.etag, &downloaded.etag) {
+        if etag_token(pre_content) != etag_token(content) {
             return None;
         }
-        (Some(_), Some(_)) | (_, None) => Some(metadata.version),
-        (None, Some(_)) => None,
-    };
+    }
     Some(CachedFile {
-        version,
-        etag: downloaded.etag.or(metadata.etag),
+        version: Some(metadata.version),
+        etag: downloaded
+            .etag
+            .or_else(|| metadata.etag.as_deref().and_then(etag_token)),
         data: downloaded.data,
     })
 }

@@ -314,6 +314,7 @@ struct FakeDriveState {
     content_version_overrides: HashMap<usize, String>,
     export_gets: usize,
     upload_starts: usize,
+    upload_if_match: Vec<Option<String>>,
     uploads: Vec<Vec<u8>>,
 }
 
@@ -336,6 +337,7 @@ impl FakeDriveServer {
             content_version_overrides: HashMap::new(),
             export_gets: 0,
             upload_starts: 0,
+            upload_if_match: Vec::new(),
             uploads: Vec::new(),
         }));
         let (old_started_tx, old_started_rx) = mpsc::channel();
@@ -388,10 +390,10 @@ impl FakeDriveServer {
                 return fake_content_response(&state.version, state.content_etag);
             }
             if request.method == "PATCH" && request.path() == "/upload/drive/v3/files/id" {
-                handler_state
-                    .lock()
-                    .expect("fake Drive state")
-                    .upload_starts += 1;
+                let if_match = request.headers.get("if-match").cloned();
+                let mut state = handler_state.lock().expect("fake Drive state");
+                state.upload_starts += 1;
+                state.upload_if_match.push(if_match);
                 let host = request
                     .headers
                     .get("host")
@@ -1420,10 +1422,11 @@ fn missing_metadata_etag_does_not_match_a_content_etag_to_a_version() {
     assert_eq!(filesystem.read(inode, 0, &mut output), Ok(2));
     assert_eq!(
         cached_version(&filesystem.cache.lock().expect("cache"), "id"),
-        None
+        Some("1")
     );
+    assert_eq!(filesystem.read(inode, 0, &mut output), Ok(2));
     let state = server.state.lock().expect("fake Drive state");
-    assert_eq!(state.metadata_gets, 1);
+    assert_eq!(state.metadata_gets, 2);
     assert_eq!(state.content_gets.get("1"), Some(&2));
 }
 
@@ -1448,6 +1451,39 @@ fn hydrate_exports_deduplicates_aliases_without_metadata() {
     let state = server.state.lock().expect("fake Drive state");
     assert_eq!(state.metadata_gets, 0);
     assert_eq!(state.export_gets, 1);
+}
+
+#[test]
+fn hydrate_exports_without_etag_uses_one_pre_content_metadata_request() {
+    let server = FakeDriveServer::new(false);
+    {
+        let mut state = server.state.lock().expect("fake Drive state");
+        state.version = "2".to_owned();
+        state.content_etag = false;
+        state.metadata_etag = false;
+    }
+    let mut filesystem = fake_filesystem(&server);
+    let mut document = file("application/vnd.google-apps.document", false);
+    document.name = "Document".to_owned();
+    let first = filesystem.add_drive_file(ROOT_INODE, &document);
+    document.name = "Alias".to_owned();
+    let second = filesystem.add_drive_file(ROOT_INODE, &document);
+
+    filesystem.hydrate_exports();
+
+    assert_eq!(
+        filesystem.metadata(first).expect("document metadata").size,
+        2
+    );
+    assert_eq!(filesystem.metadata(second).expect("alias metadata").size, 2);
+    assert_eq!(
+        cached_version(&filesystem.cache.lock().expect("cache"), "id"),
+        Some("2")
+    );
+    let state = server.state.lock().expect("fake Drive state");
+    assert_eq!(state.metadata_gets, 1);
+    assert_eq!(state.export_gets, 2);
+    assert_eq!(state.content_requests, 0);
 }
 
 #[test]
@@ -1499,6 +1535,7 @@ fn matching_etag_updates_upload_version_without_another_content_get() {
     assert_eq!(state.metadata_gets, 2);
     assert_eq!(state.content_gets.get("2"), Some(&1));
     assert_eq!(state.uploads, vec![b"X2".to_vec()]);
+    assert_eq!(state.upload_if_match, vec![Some("\"etag-2\"".to_owned())]);
 }
 
 #[test]
