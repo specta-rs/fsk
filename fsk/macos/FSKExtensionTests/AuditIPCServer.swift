@@ -9,6 +9,7 @@ enum AuditIPCBehavior: Sendable {
     case respond(status: Int32 = 0, body: Data = Data())
     case trickle(body: Data)
     case close
+    case applyThenClose
     case hang
 }
 
@@ -434,6 +435,17 @@ final class AuditIPCServer: @unchecked Sendable {
                 }
             case .close:
                 lock.lock()
+                peers.remove(peer)
+                lock.unlock()
+                Darwin.close(peer)
+                return
+            case .applyThenClose:
+                guard opcode == 17, requestBody.count == 8 else {
+                    throw AuditIPCPeerError(description: "applyThenClose requires an ACK request")
+                }
+                let lease = requestBody.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(fromByteOffset: 0, as: UInt64.self)) }
+                lock.lock()
+                leaseConnections.removeValue(forKey: lease)
                 peers.remove(peer)
                 lock.unlock()
                 Darwin.close(peer)

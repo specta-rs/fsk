@@ -92,6 +92,7 @@ final class FSKVolume: FSVolume,
         options: FSDeactivateOptions = [],
         replyHandler: @escaping ((any Error)?) -> Void
     ) {
+        backend.retryPendingCloses()
         let items = itemCache.withLock { cache -> [FSKItem] in
             let items = Array(cache.items.values)
             cache.items.removeAll(keepingCapacity: false)
@@ -535,6 +536,13 @@ final class FSKVolume: FSVolume,
         }
         do {
             try opened.acknowledgeLease()
+        } catch let error as RustOpenAcknowledgementError {
+            item.removeOpenState(lease: opened.file.lease)
+            if !error.isTransport {
+                try? opened.reject()
+            }
+            replyHandler(posix(error.underlying))
+            return
         } catch {
             item.removeOpenState(lease: opened.file.lease)
             try? opened.reject()

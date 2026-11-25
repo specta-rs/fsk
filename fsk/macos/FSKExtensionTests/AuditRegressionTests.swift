@@ -595,20 +595,83 @@ struct AuditRegressionTests {
 
     @Test("acknowledgement timeout discards the pending lease connection")
     func acknowledgementTimeoutDiscardsConnection() throws {
+        let acknowledgement = auditLeaseAcknowledgement(lease: 7)
         try withAuditBackend([[
             auditHello(minor: 2), auditNetworkConfiguration(),
             .init(opcode: 15, behavior: .respond(body: auditOpenBody(lease: 7))),
             .init(opcode: 17, behavior: .hang),
         ], [
-            auditHello(minor: 2), .init(opcode: 14),
+            auditHello(minor: 2),
+            .init(opcode: 16, behavior: .respond(body: Data()), expectedRequestBody: acknowledgement),
+            .init(opcode: 14),
         ]], requireComplete: false) { backend in
             let volume = FSKVolume(backend: backend)
             let item = FSKItem(inode: 2, kind: .file)
             var error: Error?
+            let start = DispatchTime.now()
             volume.openItem(item, modes: [.read]) { error = $0 }
+            let elapsed = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
             #expect(auditPOSIX(error) == ETIMEDOUT)
+            #expect(elapsed < 450_000_000)
             #expect(item.releaseOpenState() == nil)
             try backend.synchronize()
+        }
+    }
+
+    @Test("ambiguous acknowledgement closes the lease on a healthy connection")
+    func ambiguousAcknowledgementUsesHealthyConnection() throws {
+        let acknowledgement = auditLeaseAcknowledgement(lease: 7)
+        try withAuditBackend([[
+            auditHello(minor: 2), auditNetworkConfiguration(),
+            .init(opcode: 15, behavior: .respond(body: auditOpenBody(lease: 7))),
+            .init(opcode: 17, behavior: .applyThenClose, expectedRequestBody: acknowledgement),
+        ], [
+            auditHello(minor: 2),
+            .init(opcode: 16, behavior: .respond(body: Data()), expectedRequestBody: acknowledgement),
+            .init(opcode: 14),
+        ]]) { backend in
+            let volume = FSKVolume(backend: backend)
+            let item = FSKItem(inode: 2, kind: .file)
+            var error: Error?
+            let start = DispatchTime.now()
+            volume.openItem(item, modes: [.read]) { error = $0 }
+            let elapsed = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
+            if let code = auditPOSIX(error) {
+                #expect([EINVAL, ECONNRESET, EPIPE].contains(code))
+            } else {
+                Issue.record("expected an ACK transport error")
+            }
+            #expect(elapsed < 1_000_000_000)
+            #expect(item.releaseOpenState() == nil)
+            try backend.synchronize()
+        }
+    }
+
+    @Test("unconfirmed ambiguous cleanup remains retryable")
+    func unconfirmedAmbiguousCleanupIsRetried() throws {
+        let acknowledgement = auditLeaseAcknowledgement(lease: 7)
+        let statfs = AuditIPCScript(opcode: 2, behavior: .respond(body: Data(count: 52)))
+        try withAuditBackend([[
+            auditHello(minor: 2), auditNetworkConfiguration(),
+            .init(opcode: 15, behavior: .respond(body: auditOpenBody(lease: 7))),
+            .init(opcode: 17, behavior: .applyThenClose, expectedRequestBody: acknowledgement),
+        ], [
+            auditHello(minor: 2),
+            .init(opcode: 16, behavior: .respond(status: EIO), expectedRequestBody: acknowledgement),
+            .init(opcode: 16, behavior: .respond(body: Data()), expectedRequestBody: acknowledgement),
+            statfs,
+        ]]) { backend in
+            let volume = FSKVolume(backend: backend)
+            let item = FSKItem(inode: 2, kind: .file)
+            var error: Error?
+            volume.openItem(item, modes: [.read]) { error = $0 }
+            if let code = auditPOSIX(error) {
+                #expect([EINVAL, ECONNRESET, EPIPE].contains(code))
+            } else {
+                Issue.record("expected an ACK transport error")
+            }
+            #expect(item.releaseOpenState() == nil)
+            _ = try backend.statfs()
         }
     }
 

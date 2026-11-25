@@ -164,6 +164,22 @@ struct RustOpenFile: Sendable {
     let localPath: Data?
 }
 
+enum RustOpenAcknowledgementError: Error {
+    case transport(Error)
+    case synchronized(Error)
+
+    var underlying: Error {
+        switch self {
+        case let .transport(error), let .synchronized(error): error
+        }
+    }
+
+    var isTransport: Bool {
+        if case .transport = self { return true }
+        return false
+    }
+}
+
 final class RustOpenHandle: @unchecked Sendable {
     let file: RustOpenFile
     private let pool: IPCConnectionPool
@@ -179,18 +195,38 @@ final class RustOpenHandle: @unchecked Sendable {
 
     func acknowledgeLease() throws {
         lock.lock()
-        defer { lock.unlock() }
-        guard let connection else { throw RustBackendError.invalidProtocol }
-        guard connection.negotiatedMinor >= 2 else { return }
+        guard let connection else {
+            lock.unlock()
+            throw RustOpenAcknowledgementError.synchronized(RustBackendError.invalidProtocol)
+        }
+        guard connection.negotiatedMinor >= 2 else {
+            lock.unlock()
+            return
+        }
         var request = IPCEncoder(capacity: 8)
         request.append(file.lease)
+        let result: Result<Data, RustBackendError>
         do {
-            let response = try connection.request(.acknowledgeLease, request.data).get()
+            result = try connection.request(.acknowledgeLease, request.data)
+        } catch {
+            failed = true
+            let poisoned = takeConnectionLocked()
+            lock.unlock()
+            if let poisoned {
+                pool.checkin(poisoned, reusable: false)
+            }
+            pool.recoverAmbiguousClose(lease: file.lease)
+            throw RustOpenAcknowledgementError.transport(error)
+        }
+        do {
+            let response = try result.get()
             guard response.isEmpty else { throw RustBackendError.invalidProtocol }
         } catch {
             failed = true
-            throw error
+            lock.unlock()
+            throw RustOpenAcknowledgementError.synchronized(error)
         }
+        lock.unlock()
     }
 
     func reject() throws {
@@ -478,6 +514,10 @@ final class RustBackend: @unchecked Sendable {
         request.append(lease)
         _ = try pool.request(.close, request.data)
     }
+
+    func retryPendingCloses() {
+        pool.retryPendingCloses()
+    }
 }
 
 private func decodeAttributes(_ data: Data) throws -> FSKAttributes {
@@ -503,15 +543,19 @@ private final class IPCConnectionPool: @unchecked Sendable {
     private let socketPath: String
     private let token: Data
     private let requestTimeout: TimeInterval
+    private let leaseCleanupTimeout: TimeInterval
     private let condition = NSCondition()
     private var idle = [IPCConnection]()
     private var connectionCount = 0
+    private let pendingCloseLock = NSLock()
+    private var pendingCloses: Set<UInt64> = []
     private let maximumConnections = max(4, min(32, ProcessInfo.processInfo.activeProcessorCount))
 
     init(socketPath: String, token: Data, requestTimeout: TimeInterval) {
         self.socketPath = socketPath
         self.token = token
         self.requestTimeout = requestTimeout
+        self.leaseCleanupTimeout = min(requestTimeout, 1)
     }
 
     /// Send a request. `minimumMinor` is the protocol revision the operation
@@ -520,19 +564,28 @@ private final class IPCConnectionPool: @unchecked Sendable {
     func request(
         _ operation: IPCOperation,
         _ body: Data = Data(),
-        minimumMinor: UInt16 = 0
+        minimumMinor: UInt16 = 0,
+        timeout: TimeInterval? = nil,
+        retryPending: Bool = true
     ) throws -> Data {
-        let connection = try checkout()
+        if retryPending { retryPendingCloses() }
+        let connection = try checkout(timeout: timeout)
         var reusable = false
         defer { checkin(connection, reusable: reusable) }
         // A thrown exchange failure may leave the stream out of sync. Drop
         // the socket without replaying the request: the server may have run it.
-        let result = try connection.request(operation, body, minimumMinor: minimumMinor)
+        let result = try connection.request(
+            operation,
+            body,
+            minimumMinor: minimumMinor,
+            timeout: timeout
+        )
         reusable = true
         return try result.get()
     }
 
-    private func checkout() throws -> IPCConnection {
+    private func checkout(timeout: TimeInterval? = nil) throws -> IPCConnection {
+        let deadline = timeout.map { Date(timeIntervalSinceNow: $0) }
         condition.lock()
         while true {
             if let connection = idle.popLast() {
@@ -546,7 +599,8 @@ private final class IPCConnectionPool: @unchecked Sendable {
                     return try IPCConnection(
                         socketPath: socketPath,
                         token: token,
-                        requestTimeout: requestTimeout
+                        requestTimeout: requestTimeout,
+                        handshakeTimeout: timeout
                     )
                 } catch {
                     condition.lock()
@@ -556,7 +610,14 @@ private final class IPCConnectionPool: @unchecked Sendable {
                     throw error
                 }
             }
-            condition.wait()
+            if let deadline {
+                guard condition.wait(until: deadline) else {
+                    condition.unlock()
+                    throw RustBackendError.posix(ETIMEDOUT)
+                }
+            } else {
+                condition.wait()
+            }
         }
     }
 
@@ -571,7 +632,41 @@ private final class IPCConnectionPool: @unchecked Sendable {
         condition.unlock()
     }
 
+    func retryPendingCloses() {
+        pendingCloseLock.lock()
+        let leases = pendingCloses.sorted()
+        pendingCloseLock.unlock()
+        for lease in leases {
+            retryPendingClose(lease)
+        }
+    }
+
+    func recoverAmbiguousClose(lease: UInt64) {
+        pendingCloseLock.lock()
+        pendingCloses.insert(lease)
+        pendingCloseLock.unlock()
+        retryPendingClose(lease)
+    }
+
+    private func retryPendingClose(_ lease: UInt64) {
+        do {
+            try closeLease(lease, timeout: leaseCleanupTimeout)
+            pendingCloseLock.lock()
+            pendingCloses.remove(lease)
+            pendingCloseLock.unlock()
+        } catch {
+            // Keep the lease queued for the next healthy operation or deactivate.
+        }
+    }
+
+    private func closeLease(_ lease: UInt64, timeout: TimeInterval) throws {
+        var request = IPCEncoder(capacity: 8)
+        request.append(lease)
+        _ = try self.request(.close, request.data, timeout: timeout, retryPending: false)
+    }
+
     func open(inode: UInt64, writable: Bool) throws -> RustOpenHandle {
+        retryPendingCloses()
         let connection = try checkout()
         do {
             var request = IPCEncoder(capacity: 9)
@@ -601,7 +696,12 @@ private final class IPCConnection {
     /// Protocol revision agreed during `hello`: the lower of the two sides.
     private(set) var negotiatedMinor: UInt16 = 0
 
-    init(socketPath: String, token: Data, requestTimeout: TimeInterval) throws {
+    init(
+        socketPath: String,
+        token: Data,
+        requestTimeout: TimeInterval,
+        handshakeTimeout: TimeInterval? = nil
+    ) throws {
         self.requestTimeout = requestTimeout
         descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw RustBackendError.posix(errno) }
@@ -621,7 +721,7 @@ private final class IPCConnection {
                 }
             }
             try connect(path: socketPath)
-            let hello = try requestRaw(.hello, token, requestID: 1)
+            let hello = try requestRaw(.hello, token, requestID: 1, timeout: handshakeTimeout)
             _ = try hello.result.get()
             negotiatedMinor = hello.minor
         } catch {
@@ -642,7 +742,8 @@ private final class IPCConnection {
     func request(
         _ operation: IPCOperation,
         _ body: Data = Data(),
-        minimumMinor: UInt16 = 0
+        minimumMinor: UInt16 = 0,
+        timeout: TimeInterval? = nil
     ) throws -> Result<Data, RustBackendError> {
         guard negotiatedMinor >= minimumMinor else {
             return .failure(.protocolTooOld(
@@ -653,13 +754,19 @@ private final class IPCConnection {
         guard body.count <= ipcMaximumFrame else { return .failure(.posix(E2BIG)) }
         let requestID = nextRequestID
         nextRequestID &+= 1
-        return try requestRaw(operation, body, requestID: requestID).result
+        return try requestRaw(
+            operation,
+            body,
+            requestID: requestID,
+            timeout: timeout
+        ).result
     }
 
     private func requestRaw(
         _ operation: IPCOperation,
         _ body: Data,
-        requestID: UInt64
+        requestID: UInt64,
+        timeout: TimeInterval? = nil
     ) throws -> (result: Result<Data, RustBackendError>, minor: UInt16) {
         var header = IPCEncoder(capacity: ipcHeaderLength)
         header.append(ipcMagic)
@@ -669,7 +776,7 @@ private final class IPCConnection {
         header.append(UInt32(body.count))
         header.append(ipcProtocolMinor)
         header.append(UInt16(0))
-        let deadline = DispatchTime.now() + requestTimeout
+        let deadline = DispatchTime.now() + (timeout ?? requestTimeout)
         try writePair(header.data, body, deadline: deadline)
 
         let responseHeader = try readExactly(ipcHeaderLength, deadline: deadline)
