@@ -194,6 +194,83 @@ fn unacknowledged_disconnect_releases_only_pending_lease() {
 }
 
 #[test]
+fn close_succeeds_after_pending_cleanup_and_repeated_close() {
+    let directory = tempfile::tempdir().unwrap();
+    let local_path = directory.path().join("materialized.bin");
+    std::fs::write(&local_path, b"cached bytes").unwrap();
+    let close_calls = Arc::new(AtomicU64::new(0));
+    let service = Arc::new(Service::network(
+        LeaseTrackingFilesystem {
+            inner: TestFilesystem::default(),
+            local_path,
+            close_calls: Arc::clone(&close_calls),
+            open_entered: None,
+            open_release: None,
+        },
+        [7; 32],
+    ));
+    let (mut creator, creator_server) = UnixStream::pair().unwrap();
+    creator
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let worker_service = Arc::clone(&service);
+    let creator_worker =
+        std::thread::spawn(move || worker_service.serve_connection(creator_server));
+    send(&mut creator, 1, opcode::HELLO, &[7; 32]);
+    assert_eq!(response(&mut creator).1, 0);
+
+    let mut open = Encoder::with_capacity(9);
+    open.u64(2);
+    open.u8(0);
+    let open = open.finish();
+    send(&mut creator, 2, opcode::OPEN, &open);
+    let (_, status, body) = response(&mut creator);
+    assert_eq!(status, 0);
+    let pending = u64::from_le_bytes(body[..8].try_into().unwrap());
+
+    let (mut closer, closer_server) = UnixStream::pair().unwrap();
+    closer
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let worker_service = Arc::clone(&service);
+    let closer_worker = std::thread::spawn(move || worker_service.serve_connection(closer_server));
+    send(&mut closer, 1, opcode::HELLO, &[7; 32]);
+    assert_eq!(response(&mut closer).1, 0);
+
+    drop(creator);
+    creator_worker.join().unwrap().unwrap();
+    assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+    assert!(!service.leases.lock().contains_key(&pending));
+
+    send(&mut closer, 2, opcode::CLOSE, &pending.to_le_bytes());
+    assert_eq!(response(&mut closer).1, 0);
+    send(&mut closer, 3, opcode::CLOSE, &pending.to_le_bytes());
+    assert_eq!(response(&mut closer).1, 0);
+    assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+
+    send(&mut closer, 4, opcode::OPEN, &open);
+    let (_, status, body) = response(&mut closer);
+    assert_eq!(status, 0);
+    let acknowledged = u64::from_le_bytes(body[..8].try_into().unwrap());
+    send(
+        &mut closer,
+        5,
+        opcode::ACK_LEASE,
+        &acknowledged.to_le_bytes(),
+    );
+    assert_eq!(response(&mut closer).1, 0);
+    send(&mut closer, 6, opcode::CLOSE, &acknowledged.to_le_bytes());
+    assert_eq!(response(&mut closer).1, 0);
+    send(&mut closer, 7, opcode::CLOSE, &acknowledged.to_le_bytes());
+    assert_eq!(response(&mut closer).1, 0);
+    assert_eq!(close_calls.load(Ordering::SeqCst), 2);
+
+    drop(closer);
+    closer_worker.join().unwrap().unwrap();
+    assert!(service.leases.lock().is_empty());
+}
+
+#[test]
 fn legacy_peers_acknowledge_open_on_response_write() {
     for minor in [0, LEASE_ACK_MINOR - 1] {
         let directory = tempfile::tempdir().unwrap();

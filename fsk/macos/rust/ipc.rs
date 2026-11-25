@@ -476,12 +476,16 @@ impl Service {
         Ok(())
     }
 
+    /// Closing an absent lease succeeds so a lost ACK response or repeated
+    /// CLOSE cannot turn already-completed cleanup into a protocol error.
     fn close(&self, lease: u64) -> crate::Result<()> {
         if lease == 0 {
             return Ok(());
         }
+        let Some(lease) = self.leases.lock().remove(&lease) else {
+            return Ok(());
+        };
         let network = self.backend.network().ok_or(Error::INVALID)?;
-        let lease = self.leases.lock().remove(&lease).ok_or(Error::INVALID)?;
         network.close_file(lease.inode, lease.file)
     }
 }
