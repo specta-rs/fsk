@@ -533,28 +533,32 @@ fn install_from_release_inner(
     let staging = new_entry_path(parent, name, "install");
     progress(InstallPhase::Installing);
     create_staging_directory(&staging)?;
+    let staging_container_identity = path_identity(&staging)?;
+    let remove_staging = || {
+        let _ = remove_path_if_identity(&staging, staging_container_identity);
+    };
     let staged_app = staging.join(name);
     let stage_result = run(
         Command::new("/usr/bin/ditto").arg(&source).arg(&staged_app),
         "stage FSK.app installation",
     );
     if let Err(error) = stage_result {
-        let _ = remove_path(&staging);
+        remove_staging();
         return Err(error);
     }
 
     // The bytes that get swapped into place must be the bytes we validated.
     let stage_check = require_real_directory(&staged_app).and_then(|()| validate_app(&staged_app));
     if let Err(error) = stage_check {
-        let _ = remove_path(&staging);
+        remove_staging();
         return Err(error);
     }
 
     let backup = new_entry_path(parent, name, "backup");
-    let staged_identity = match path_identity(&staged_app) {
+    let staged_app_identity = match path_identity(&staged_app) {
         Ok(identity) => identity,
         Err(error) => {
-            let _ = remove_path(&staging);
+            remove_staging();
             return Err(error);
         }
     };
@@ -563,21 +567,40 @@ fn install_from_release_inner(
         destination,
         &backup,
         destination_identity,
-        staged_identity,
+        staged_app_identity,
         atomic_swap,
     );
     // replace_app consumes the staged app on success. On a failed race
     // rollback it may instead contain an unexpected directory; preserve that
     // directory rather than deleting it with our staging container.
-    let safe_to_remove = match path_identity(&staged_app) {
-        Ok(identity) => identity == staged_identity,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+    clean_staging_container(
+        &staging,
+        &staged_app,
+        staging_container_identity,
+        staged_app_identity,
+    );
+    result
+}
+
+fn clean_staging_container(
+    staging: &Path,
+    staged_app: &Path,
+    container_identity: PathIdentity,
+    staged_app_identity: PathIdentity,
+) {
+    if path_identity(staging).ok() != Some(container_identity) {
+        return;
+    }
+    let staged_app_matches = match path_identity(staged_app) {
+        Ok(identity) => identity == staged_app_identity,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::read_dir(staging).is_ok_and(|mut entries| entries.next().is_none())
+        }
         Err(_) => false,
     };
-    if safe_to_remove {
-        let _ = remove_path(&staging);
+    if staged_app_matches {
+        let _ = remove_path_if_identity(staging, container_identity);
     }
-    result
 }
 
 fn create_install_parent(parent: &Path) -> io::Result<()> {
@@ -986,6 +1009,26 @@ fn replace_app_with_expected(
     staging_identity: PathIdentity,
     swap: impl Fn(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
+    replace_app_with_expected_hooks(
+        staging,
+        destination,
+        backup,
+        destination_identity,
+        staging_identity,
+        swap,
+        |_, _| {},
+    )
+}
+
+fn replace_app_with_expected_hooks(
+    staging: &Path,
+    destination: &Path,
+    backup: &Path,
+    destination_identity: Option<PathIdentity>,
+    staging_identity: PathIdentity,
+    swap: impl Fn(&Path, &Path) -> io::Result<()>,
+    after_fallback_move: impl Fn(&Path, &Path),
+) -> io::Result<()> {
     let remove_staging = || {
         remove_owned_path(staging, staging_identity);
     };
@@ -1047,6 +1090,26 @@ fn replace_app_with_expected(
             return Err(destination_race_error(destination));
         }
     }
+    finish_fallback_install(
+        staging,
+        destination,
+        backup,
+        destination_present,
+        destination_identity,
+        staging_identity,
+        &after_fallback_move,
+    )
+}
+
+fn finish_fallback_install(
+    staging: &Path,
+    destination: &Path,
+    backup: &Path,
+    destination_present: bool,
+    destination_identity: Option<PathIdentity>,
+    staging_identity: PathIdentity,
+    after_fallback_move: &impl Fn(&Path, &Path),
+) -> io::Result<()> {
     if path_identity(staging).ok().as_ref() != Some(&staging_identity) {
         if destination_present {
             let _ = restore_backup(backup, destination, destination_identity);
@@ -1054,7 +1117,7 @@ fn replace_app_with_expected(
         return Err(destination_race_error(staging));
     }
     if let Err(error) = rename_exclusive(staging, destination) {
-        remove_staging();
+        remove_owned_path(staging, staging_identity);
         if destination_present {
             let restored = if path_identity(backup).ok().as_ref() == destination_identity.as_ref() {
                 rename_exclusive(backup, destination)
@@ -1081,7 +1144,22 @@ fn replace_app_with_expected(
         }
         return Err(fs_error("install FSK.app at", destination, &error));
     }
+    after_fallback_move(staging, destination);
     if path_identity(destination).ok().as_ref() != Some(&staging_identity) {
+        if destination_present {
+            if let Err(recovery_error) =
+                recover_fallback_destination(destination, backup, destination_identity)
+            {
+                return Err(io::Error::new(
+                    recovery_error.kind(),
+                    format!(
+                        "could not restore {} after its destination changed ({recovery_error}); the backup remains at {} for recovery or inspection",
+                        destination.display(),
+                        backup.display()
+                    ),
+                ));
+            }
+        }
         return Err(destination_race_error(destination));
     }
     // The new app is in place, so a stale backup is not an installation
@@ -1112,7 +1190,35 @@ fn restore_backup(
             ),
         ));
     }
+    if path_present(destination)? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} reappeared during rollback", destination.display()),
+        ));
+    }
     rename_exclusive(backup, destination)
+}
+
+fn recover_fallback_destination(
+    destination: &Path,
+    backup: &Path,
+    destination_identity: Option<PathIdentity>,
+) -> io::Result<()> {
+    if path_present(destination)? {
+        let parent = destination_parent(destination)?;
+        let name = app_name(destination)?;
+        let preserved = new_entry_path(parent, name, "race");
+        rename_exclusive(destination, &preserved).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "could not preserve the unexpected destination at {} ({error})",
+                    preserved.display()
+                ),
+            )
+        })?;
+    }
+    restore_backup(backup, destination, destination_identity)
 }
 
 fn swap_existing_app(
@@ -1256,7 +1362,7 @@ fn recover_interrupted_install_with(
         // Invalid backups remain available for manual inspection while young.
         for (_, backup) in newest_entries(parent, name, "backup")? {
             if validate(&backup).is_ok() {
-                fs::rename(&backup, destination).map_err(|error| {
+                rename_exclusive(&backup, destination).map_err(|error| {
                     fs_error("restore the interrupted FSK.app from", &backup, &error)
                 })?;
                 break;

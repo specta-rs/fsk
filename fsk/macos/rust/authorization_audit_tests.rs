@@ -55,7 +55,7 @@ fn audit_reporting_app(directory: &Path, script: &str) -> PathBuf {
 
 fn audit_run_self(name: &str, envs: &[(&str, &std::ffi::OsStr)]) -> std::process::Output {
     let mut command = Command::new(env::current_exe().unwrap());
-    command.args(["--exact", name, "--nocapture"]);
+    command.args(["--exact", "--include-ignored", name, "--nocapture"]);
     // Never let an ambient developer override or credential redirect a child
     // fixture outside its temporary bundle/home or to a real release service.
     for key in [
@@ -77,11 +77,16 @@ fn audit_run_self(name: &str, envs: &[(&str, &std::ffi::OsStr)]) -> std::process
 }
 
 fn audit_assert_child_success(name: &str, output: &std::process::Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
         "child {name} failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
+        stdout,
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "child {name} did not execute exactly one test\nstdout:\n{stdout}"
     );
 }
 
@@ -135,6 +140,34 @@ fn audit_replacement_refuses_an_unrelated_destination_before_mutation() {
     assert!(
         !staging.exists(),
         "the rejected staged app should be cleaned up"
+    );
+}
+
+#[test]
+fn audit_staging_cleanup_preserves_a_replaced_container() {
+    let directory = tempfile::tempdir().unwrap();
+    let staging = directory.path().join("staging");
+    let staged_app = staging.join("FSK.app");
+    fs::create_dir_all(&staged_app).unwrap();
+    fs::write(staged_app.join("marker"), b"new app").unwrap();
+    let container_identity = path_identity(&staging).unwrap();
+    let staged_app_identity = path_identity(&staged_app).unwrap();
+
+    fs::remove_dir_all(&staging).unwrap();
+    fs::create_dir(&staging).unwrap();
+    fs::write(staging.join("important"), b"keep me").unwrap();
+
+    clean_staging_container(
+        &staging,
+        &staged_app,
+        container_identity,
+        staged_app_identity,
+    );
+
+    assert_eq!(
+        fs::read(staging.join("important")).unwrap(),
+        b"keep me",
+        "staging cleanup deleted a replacement container"
     );
 }
 
@@ -235,6 +268,55 @@ fn audit_swap_verifies_both_sides_when_destination_changes_after_exchange() {
     assert!(result.is_err(), "a destination-side race must be reported");
     assert_eq!(fs::read(destination.join("marker")).unwrap(), b"old app");
     assert_eq!(fs::read(staging.join("important")).unwrap(), b"keep me");
+}
+
+#[test]
+fn audit_fallback_final_race_preserves_the_destination_and_restores_the_backup() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = audit_app(directory.path());
+    fs::write(destination.join("marker"), b"old app").unwrap();
+    let staging = directory.path().join("staged.app");
+    fs::create_dir(&staging).unwrap();
+    fs::write(staging.join("marker"), b"new app").unwrap();
+    let backup = directory.path().join("backup");
+    let destination_identity = path_identity(&destination).unwrap();
+    let staging_identity = path_identity(&staging).unwrap();
+
+    let result = replace_app_with_expected_hooks(
+        &staging,
+        &destination,
+        &backup,
+        Some(destination_identity),
+        staging_identity,
+        |_, _| Err(io::Error::from_raw_os_error(libc::ENOTSUP)),
+        |_, destination| {
+            assert_eq!(fs::read(destination.join("marker")).unwrap(), b"new app");
+            fs::remove_dir_all(destination).unwrap();
+            fs::create_dir(destination).unwrap();
+            fs::write(destination.join("important"), b"keep me").unwrap();
+        },
+    );
+
+    assert!(
+        result.is_err(),
+        "the final destination race must be reported"
+    );
+    assert_eq!(
+        fs::read(destination.join("marker")).unwrap(),
+        b"old app",
+        "the previous app was not restored from the backup"
+    );
+    assert!(!backup.exists(), "the restored backup should be consumed");
+    let preserved = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".FSK.app.race-"))
+        })
+        .expect("the unexpected destination should be preserved");
+    assert_eq!(fs::read(preserved.join("important")).unwrap(), b"keep me");
 }
 
 #[test]
