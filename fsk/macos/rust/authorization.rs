@@ -5,6 +5,7 @@ use std::{
     ffi::{CString, OsStr},
     fs,
     io::{self, Read},
+    os::fd::FromRawFd,
     os::unix::{
         ffi::OsStrExt,
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -533,12 +534,12 @@ fn install_from_release_inner(
     let name = app_name(destination)?;
     let staging = new_entry_path(parent, name, "install");
     progress(InstallPhase::Installing);
-    create_staging_directory(&staging)?;
-    // macOS cannot return a descriptor from mkdir. Open the new directory
-    // immediately with no-follow semantics and use that descriptor's identity.
-    // A same-principal racer can still win this create/open window; every later
-    // cleanup and mutation treats an identity mismatch as preserve-and-fail.
-    let staging_container_identity = directory_identity(&staging)?;
+    // mkdirat/openat pins the parent descriptor and avoids a second full-path
+    // lookup. The private, unpredictable staging name reduces exposure, but a
+    // same-principal racer can still replace the name between these calls. If
+    // openat fails, the empty directory is left for stale cleanup rather than
+    // recursively deleting a path that may have been replaced.
+    let staging_container_identity = create_staging_directory(&staging)?;
     let remove_staging = || {
         let _ = remove_path_if_identity(&staging, staging_container_identity);
     };
@@ -648,18 +649,65 @@ fn canonical_directory(path: &Path) -> io::Result<PathBuf> {
     Ok(canonical)
 }
 
-fn create_staging_directory(staging: &Path) -> io::Result<()> {
-    match fs::DirBuilder::new().mode(0o700).create(staging) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
+fn create_staging_directory(staging: &Path) -> io::Result<PathIdentity> {
+    let parent_path = destination_parent(staging)?;
+    let parent = fs::File::open(parent_path)
+        .map_err(|error| fs_error("open staging parent", parent_path, &error))?;
+    let parent_metadata = parent
+        .metadata()
+        .map_err(|error| fs_error("inspect staging parent", parent_path, &error))?;
+    if parent_metadata.permissions().mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
             format!(
-                "refusing to reuse the existing staging path {}; it may be a stale install, file, or symlink",
+                "refusing to stage FSK.app in group- or world-writable directory {}",
+                parent_path.display()
+            ),
+        ));
+    }
+    let name = staging
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "staging path has no name"))?;
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "staging path contains an interior NUL byte: {}",
                 staging.display()
             ),
-        )),
-        Err(error) => Err(fs_error("create staging directory", staging, &error)),
+        )
+    })?;
+    // SAFETY: parent owns a valid directory descriptor and name is a
+    // NUL-terminated path component for the duration of both calls.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "refusing to reuse the existing staging path {}; it may be a stale install, file, or symlink",
+                    staging.display()
+                ),
+            ));
+        }
+        return Err(fs_error("create staging directory", staging, &error));
     }
+    // SAFETY: the same parent descriptor and name remain valid. O_NOFOLLOW and
+    // O_DIRECTORY prevent a replaced symlink or non-directory from being used.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new descriptor owned by this File.
+    let directory = unsafe { fs::File::from_raw_fd(descriptor) };
+    let metadata = directory.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 fn validate_archive_limits(archive: &Path) -> io::Result<()> {
@@ -1017,6 +1065,7 @@ impl StagingExpectation {
 struct ReplacementHooks<'a> {
     before_mutation: &'a dyn Fn(&Path, &Path),
     after_fallback_move: &'a dyn Fn(&Path, &Path),
+    after_swap: &'a dyn Fn(&Path, &Path),
 }
 
 fn capture_destination_expectation(destination: &Path) -> io::Result<Option<PathIdentity>> {
@@ -1099,6 +1148,7 @@ fn replace_app_with_expected(
         ReplacementHooks {
             before_mutation: &noop,
             after_fallback_move: &noop,
+            after_swap: &noop,
         },
     )
 }
@@ -1147,6 +1197,7 @@ fn replace_app_with_expected_hooks(
             &swap,
         ) {
             Ok(AppSwap::Completed) => {
+                (hooks.after_swap)(staging, destination);
                 return accept_swapped_app(
                     staging,
                     destination,
@@ -1200,14 +1251,39 @@ fn finish_fallback_install(
     hooks: &ReplacementHooks<'_>,
 ) -> io::Result<()> {
     if let Err(error) = staging_expectation.verify_identity(staging) {
-        if destination_present {
-            let _ = restore_backup(backup, destination, destination_identity);
-        }
-        return Err(error);
+        return Err(rollback_fallback_validation(
+            staging,
+            destination,
+            backup,
+            destination_present,
+            destination_identity,
+            staging_expectation,
+            error,
+        ));
     }
-    staging_expectation.verify_validated(staging)?;
+    if let Err(error) = staging_expectation.verify_validated(staging) {
+        return Err(rollback_fallback_validation(
+            staging,
+            destination,
+            backup,
+            destination_present,
+            destination_identity,
+            staging_expectation,
+            error,
+        ));
+    }
     (hooks.before_mutation)(staging, destination);
-    staging_expectation.verify_validated(staging)?;
+    if let Err(error) = staging_expectation.verify_validated(staging) {
+        return Err(rollback_fallback_validation(
+            staging,
+            destination,
+            backup,
+            destination_present,
+            destination_identity,
+            staging_expectation,
+            error,
+        ));
+    }
     if let Err(error) = rename_exclusive(staging, destination) {
         remove_owned_path(staging, staging_expectation.identity);
         if destination_present {
@@ -1270,6 +1346,30 @@ fn finish_fallback_install(
     Ok(())
 }
 
+fn rollback_fallback_validation(
+    staging: &Path,
+    destination: &Path,
+    backup: &Path,
+    destination_present: bool,
+    destination_identity: Option<PathIdentity>,
+    staging_expectation: StagingExpectation,
+    error: io::Error,
+) -> io::Error {
+    if destination_present {
+        if let Err(restore_error) = restore_backup(backup, destination, destination_identity) {
+            return io::Error::new(
+                restore_error.kind(),
+                format!(
+                    "staging validation failed ({error}) and the previous app could not be restored from {} ({restore_error})",
+                    backup.display()
+                ),
+            );
+        }
+    }
+    remove_owned_path(staging, staging_expectation.identity);
+    error
+}
+
 fn accept_swapped_app(
     staging: &Path,
     destination: &Path,
@@ -1280,14 +1380,81 @@ fn accept_swapped_app(
     if let Err(error) = staging_expectation.verify_accepted_destination(staging, destination) {
         if path_identity(staging).ok() == Some(previous_identity)
             && path_identity(destination).ok() == Some(staging_expectation.identity)
-            && swap(staging, destination).is_ok()
         {
-            remove_owned_path(staging, staging_expectation.identity);
+            if swap(staging, destination).is_ok() {
+                remove_owned_path(staging, staging_expectation.identity);
+                return Err(error);
+            }
+            if let Err(preserve_error) = preserve_previous_in_backup(staging, destination) {
+                return Err(io::Error::new(
+                    preserve_error.kind(),
+                    format!(
+                        "could not restore {} ({error}) or preserve the previous app outside install staging ({preserve_error})",
+                        destination.display()
+                    ),
+                ));
+            }
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "could not restore {} ({error}); the previous app was preserved in a recovery backup",
+                    destination.display()
+                ),
+            ));
+        } else if path_identity(staging).ok() == Some(previous_identity) {
+            match restore_previous_from_staging(staging, destination, previous_identity) {
+                Ok(()) => return Err(error),
+                Err(restore_error) => {
+                    if let Err(preserve_error) = preserve_previous_in_backup(staging, destination) {
+                        return Err(io::Error::new(
+                            preserve_error.kind(),
+                            format!(
+                                "could not restore {} ({restore_error}) or preserve the previous app outside install staging ({preserve_error})",
+                                destination.display()
+                            ),
+                        ));
+                    }
+                    return Err(io::Error::new(
+                        restore_error.kind(),
+                        format!(
+                            "could not restore {} ({restore_error}); the previous app was preserved in a recovery backup",
+                            destination.display()
+                        ),
+                    ));
+                }
+            }
         }
         return Err(error);
     }
     let _ = remove_path_if_identity(staging, previous_identity);
     Ok(())
+}
+
+fn restore_previous_from_staging(
+    staging: &Path,
+    destination: &Path,
+    previous_identity: PathIdentity,
+) -> io::Result<()> {
+    preserve_unexpected_destination(destination)?;
+    rename_exclusive(staging, destination)?;
+    if path_identity(destination)? != previous_identity {
+        preserve_unexpected_destination(destination)?;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "restored previous app at {} changed during rollback",
+                destination.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn preserve_previous_in_backup(staging: &Path, destination: &Path) -> io::Result<()> {
+    let parent = destination_parent(destination)?;
+    let name = app_name(destination)?;
+    let backup = new_entry_path(parent, name, "backup");
+    rename_exclusive(staging, &backup)
 }
 
 fn restore_backup(
@@ -2992,6 +3159,19 @@ TeamIdentifier=68994Z5PT3
         create_staging_directory(&staging).unwrap();
 
         assert_eq!(fs::metadata(&staging).unwrap().mode() & 0o777, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_directory_refuses_a_writable_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let staging = directory.path().join("staging");
+
+        let error = create_staging_directory(&staging).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!staging.exists());
     }
 
     #[test]

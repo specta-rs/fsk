@@ -1,6 +1,7 @@
 //! Snapshot-only adversarial regression tests for the macOS authorization module.
 use super::*;
 use std::{
+    cell::Cell,
     os::unix::fs::{PermissionsExt, symlink},
     process::{Command, Stdio},
     sync::{Mutex as StdMutex, mpsc},
@@ -218,6 +219,7 @@ fn audit_install_replacement_revalidates_the_staging_container() {
                 }
             },
             after_fallback_move: &noop,
+            after_swap: &noop,
         },
     );
 
@@ -337,6 +339,118 @@ fn audit_swap_verifies_both_sides_when_destination_changes_after_exchange() {
 }
 
 #[test]
+fn audit_after_swap_destination_replacement_restores_the_previous_app() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = audit_app(directory.path());
+    fs::write(destination.join("marker"), b"old app").unwrap();
+    let container = directory.path().join("staging");
+    let staging = container.join("FSK.app");
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("marker"), b"new app").unwrap();
+    let backup = directory.path().join("backup");
+    let destination_identity = path_identity(&destination).unwrap();
+    let staging_identity = path_identity(&staging).unwrap();
+    let container_identity = directory_identity(&container).unwrap();
+    let noop = |_: &Path, _: &Path| {};
+
+    let result = replace_app_with_expected_hooks(
+        &staging,
+        &destination,
+        &backup,
+        Some(destination_identity),
+        StagingExpectation {
+            identity: staging_identity,
+            container_identity: Some(container_identity),
+            validate: audit_validate_staging_marker,
+        },
+        atomic_swap,
+        ReplacementHooks {
+            before_mutation: &noop,
+            after_fallback_move: &noop,
+            after_swap: &|_, destination| {
+                fs::remove_dir_all(destination).unwrap();
+                fs::create_dir(destination).unwrap();
+                fs::write(destination.join("important"), b"keep me").unwrap();
+            },
+        },
+    );
+
+    assert!(
+        result.is_err(),
+        "the replaced destination must fail acceptance"
+    );
+    assert_eq!(
+        fs::read(destination.join("marker")).unwrap(),
+        b"old app",
+        "the previous app must be restored out of the install container"
+    );
+    assert!(
+        !staging.exists(),
+        "the old app must no longer live in staging"
+    );
+    let preserved = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".FSK.app.race-"))
+        })
+        .expect("the unexpected destination should be preserved");
+    assert_eq!(fs::read(preserved.join("important")).unwrap(), b"keep me");
+}
+
+#[test]
+fn audit_fallback_validation_failure_after_backup_move_restores_the_previous_app() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = audit_app(directory.path());
+    fs::write(destination.join("marker"), b"old app").unwrap();
+    let staging = directory.path().join("staged.app");
+    fs::create_dir(&staging).unwrap();
+    fs::write(staging.join("marker"), b"new app").unwrap();
+    let backup = directory.path().join("backup");
+    let destination_identity = path_identity(&destination).unwrap();
+    let staging_identity = path_identity(&staging).unwrap();
+    let calls = Cell::new(0_usize);
+    let noop = |_: &Path, _: &Path| {};
+
+    let result = replace_app_with_expected_hooks(
+        &staging,
+        &destination,
+        &backup,
+        Some(destination_identity),
+        StagingExpectation {
+            identity: staging_identity,
+            container_identity: None,
+            validate: audit_validate_staging_marker,
+        },
+        |_, _| Err(io::Error::from_raw_os_error(libc::ENOTSUP)),
+        ReplacementHooks {
+            before_mutation: &|staging, _| {
+                if calls.get() == 2 {
+                    fs::write(staging.join("marker"), b"invalid").unwrap();
+                }
+                calls.set(calls.get() + 1);
+            },
+            after_fallback_move: &noop,
+            after_swap: &noop,
+        },
+    );
+
+    let error = result.unwrap_err();
+    assert!(
+        error.to_string().contains("staging marker changed"),
+        "expected the original validation error, got {error}"
+    );
+    assert_eq!(fs::read(destination.join("marker")).unwrap(), b"old app");
+    assert!(!backup.exists(), "the restored backup should be consumed");
+    assert!(
+        !staging.exists(),
+        "the owned invalid staged app should be removed"
+    );
+}
+
+#[test]
 fn audit_fallback_final_race_preserves_the_destination_and_restores_the_backup() {
     let directory = tempfile::tempdir().unwrap();
     let destination = audit_app(directory.path());
@@ -364,6 +478,7 @@ fn audit_fallback_final_race_preserves_the_destination_and_restores_the_backup()
                 fs::create_dir(destination).unwrap();
                 fs::write(destination.join("important"), b"keep me").unwrap();
             },
+            after_swap: &noop,
         },
     );
 
@@ -414,6 +529,7 @@ fn audit_fallback_final_race_without_a_previous_app_leaves_destination_absent() 
                 fs::create_dir(destination).unwrap();
                 fs::write(destination.join("important"), b"keep me").unwrap();
             },
+            after_swap: &noop,
         },
     );
 
