@@ -401,6 +401,106 @@ fn audit_after_swap_destination_replacement_restores_the_previous_app() {
 }
 
 #[test]
+fn audit_failed_swap_back_preserves_a_non_expiring_recovery_path() {
+    use std::fs::FileTimes;
+
+    let directory = tempfile::tempdir().unwrap();
+    let destination = audit_app(directory.path());
+    fs::write(destination.join("marker"), b"old app").unwrap();
+    let staging = directory.path().join("staged.app");
+    fs::create_dir(&staging).unwrap();
+    fs::write(staging.join("marker"), b"new app").unwrap();
+    let backup = directory.path().join("backup");
+    let destination_identity = path_identity(&destination).unwrap();
+    let staging_identity = path_identity(&staging).unwrap();
+    let swaps = Cell::new(0_usize);
+    let noop = |_: &Path, _: &Path| {};
+
+    let result = replace_app_with_expected_hooks(
+        &staging,
+        &destination,
+        &backup,
+        Some(destination_identity),
+        StagingExpectation {
+            identity: staging_identity,
+            container_identity: None,
+            validate: audit_validate_staging_marker,
+        },
+        |staging, destination| {
+            if swaps.get() == 0 {
+                swaps.set(1);
+                atomic_swap(staging, destination)
+            } else {
+                Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+            }
+        },
+        ReplacementHooks {
+            before_mutation: &noop,
+            after_fallback_move: &noop,
+            after_swap: &|_, destination| {
+                fs::write(destination.join("marker"), b"invalid").unwrap();
+            },
+        },
+    );
+
+    let error = result.unwrap_err();
+    let recovery = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".FSK.app.recovery-"))
+        })
+        .expect("the previous app should be preserved in a dedicated recovery entry");
+    assert!(
+        error
+            .to_string()
+            .contains(recovery.to_string_lossy().as_ref()),
+        "the exact recovery path must be reported: {error}"
+    );
+    assert_eq!(fs::read(recovery.join("marker")).unwrap(), b"old app");
+    assert_eq!(fs::read(destination.join("marker")).unwrap(), b"invalid");
+
+    fs::File::open(&recovery)
+        .unwrap()
+        .set_times(
+            FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(48 * 60 * 60)),
+        )
+        .unwrap();
+    for kind in ["install", "backup", "race"] {
+        cleanup_stale_entries(directory.path(), "FSK.app", kind).unwrap();
+    }
+    assert!(
+        recovery.exists(),
+        "normal stale cleanup must not expire recovery"
+    );
+
+    recover_interrupted_install_with(&destination, |_| {
+        Err(io::Error::new(io::ErrorKind::InvalidData, "occupied"))
+    })
+    .unwrap();
+    assert!(
+        recovery.exists(),
+        "an occupied destination must retain recovery"
+    );
+    assert_eq!(fs::read(destination.join("marker")).unwrap(), b"invalid");
+
+    fs::remove_dir_all(&destination).unwrap();
+    let recovery_to_restore = recovery.clone();
+    recover_interrupted_install_with(&destination, |candidate| {
+        if candidate == recovery_to_restore {
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "unrelated"))
+        }
+    })
+    .unwrap();
+    assert_eq!(fs::read(destination.join("marker")).unwrap(), b"old app");
+    assert!(!recovery.exists(), "restored recovery should be consumed");
+}
+
+#[test]
 fn audit_fallback_validation_failure_after_backup_move_restores_the_previous_app() {
     let directory = tempfile::tempdir().unwrap();
     let destination = audit_app(directory.path());

@@ -120,6 +120,10 @@ pub enum InstallPhase {
 /// `.app`; it is not a directory that contains the bundle. The value is
 /// normalized before use, and relative paths or paths containing `..` are
 /// rejected. With an override, no legacy `/Applications` copy is touched.
+/// The destination parent must not be group- or world-writable. A bundle
+/// directly in `/tmp` is rejected because `/tmp` is world-writable; use a
+/// private subdirectory instead. Mode checks do not enumerate POSIX ACLs, so
+/// the parent must also have restrictive ACLs.
 /// A symlinked default install parent is resolved to its target directory; that
 /// target is validated and made private. A symlink at the final `FSK.app` path
 /// is still treated as a link and is never followed by destructive operations.
@@ -146,6 +150,8 @@ pub enum InstallPhase {
 ///
 /// Returns an error if the release cannot be downloaded, unpacked, validated,
 /// or installed. Installing in the chosen destination may require permission.
+/// Returns [`io::ErrorKind::PermissionDenied`] if the destination parent is
+/// group- or world-writable.
 /// Returns [`io::ErrorKind::InvalidInput`] if `FSK_APP_PATH` is relative,
 /// contains `..`, or does not name a folder ending in `.app`.
 pub fn install() -> io::Result<AppInstallOutcome> {
@@ -277,6 +283,9 @@ pub fn uninstall() -> io::Result<bool> {
         // the uninstall non-durable. The parent lock means no cooperating
         // process can own one right now.
         let _ = remove_matching_entries(parent, name, "backup");
+        // Explicit uninstall is durable, so dedicated rollback recoveries are
+        // removed only after the destination itself was removed successfully.
+        let _ = remove_matching_entries(parent, name, "recovery");
     }
     if configured.is_none() {
         removed |= remove_legacy_install();
@@ -535,10 +544,9 @@ fn install_from_release_inner(
     let staging = new_entry_path(parent, name, "install");
     progress(InstallPhase::Installing);
     // mkdirat/openat pins the parent descriptor and avoids a second full-path
-    // lookup. The private, unpredictable staging name reduces exposure, but a
-    // same-principal racer can still replace the name between these calls. If
-    // openat fails, the empty directory is left for stale cleanup rather than
-    // recursively deleting a path that may have been replaced.
+    // lookup. The staging name is predictable; isolation comes from the private
+    // parent and descriptor-relative no-follow operations. A same-principal
+    // racer can still replace the name between these calls.
     let staging_container_identity = create_staging_directory(&staging)?;
     let remove_staging = || {
         let _ = remove_path_if_identity(&staging, staging_container_identity);
@@ -702,7 +710,16 @@ fn create_staging_directory(staging: &Path) -> io::Result<PathIdentity> {
         )
     };
     if descriptor < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        // Best effort: remove only an empty directory through the pinned parent
+        // descriptor. A replaced non-empty directory or symlink is preserved
+        // and becomes bounded residue for the normal stale cleanup.
+        // SAFETY: parent and name remain valid; AT_REMOVEDIR never recursively
+        // deletes the replaced entry.
+        unsafe {
+            libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+        }
+        return Err(error);
     }
     // SAFETY: openat returned a new descriptor owned by this File.
     let directory = unsafe { fs::File::from_raw_fd(descriptor) };
@@ -1385,40 +1402,47 @@ fn accept_swapped_app(
                 remove_owned_path(staging, staging_expectation.identity);
                 return Err(error);
             }
-            if let Err(preserve_error) = preserve_previous_in_backup(staging, destination) {
-                return Err(io::Error::new(
-                    preserve_error.kind(),
-                    format!(
-                        "could not restore {} ({error}) or preserve the previous app outside install staging ({preserve_error})",
-                        destination.display()
-                    ),
-                ));
-            }
+            let recovery_path = preserve_previous_in_backup(staging, destination).map_err(
+                |preserve_error| {
+                    io::Error::new(
+                        preserve_error.kind(),
+                        format!(
+                            "could not restore {} ({error}) or preserve the previous app outside install staging ({preserve_error})",
+                            destination.display()
+                        ),
+                    )
+                },
+            )?;
             return Err(io::Error::new(
                 error.kind(),
                 format!(
-                    "could not restore {} ({error}); the previous app was preserved in a recovery backup",
-                    destination.display()
+                    "could not restore {} ({error}); the previous app was preserved at {}",
+                    destination.display(),
+                    recovery_path.display()
                 ),
             ));
         } else if path_identity(staging).ok() == Some(previous_identity) {
             match restore_previous_from_staging(staging, destination, previous_identity) {
                 Ok(()) => return Err(error),
                 Err(restore_error) => {
-                    if let Err(preserve_error) = preserve_previous_in_backup(staging, destination) {
-                        return Err(io::Error::new(
-                            preserve_error.kind(),
-                            format!(
-                                "could not restore {} ({restore_error}) or preserve the previous app outside install staging ({preserve_error})",
-                                destination.display()
-                            ),
-                        ));
-                    }
+                    let recovery_path =
+                        preserve_previous_in_backup(staging, destination).map_err(
+                            |preserve_error| {
+                                io::Error::new(
+                                    preserve_error.kind(),
+                                    format!(
+                                        "could not restore {} ({restore_error}) or preserve the previous app outside install staging ({preserve_error})",
+                                        destination.display()
+                                    ),
+                                )
+                            },
+                        )?;
                     return Err(io::Error::new(
                         restore_error.kind(),
                         format!(
-                            "could not restore {} ({restore_error}); the previous app was preserved in a recovery backup",
-                            destination.display()
+                            "could not restore {} ({restore_error}); the previous app was preserved at {}",
+                            destination.display(),
+                            recovery_path.display()
                         ),
                     ));
                 }
@@ -1450,11 +1474,20 @@ fn restore_previous_from_staging(
     Ok(())
 }
 
-fn preserve_previous_in_backup(staging: &Path, destination: &Path) -> io::Result<()> {
+fn preserve_previous_in_backup(staging: &Path, destination: &Path) -> io::Result<PathBuf> {
     let parent = destination_parent(destination)?;
     let name = app_name(destination)?;
-    let backup = new_entry_path(parent, name, "backup");
-    rename_exclusive(staging, &backup)
+    let recovery = new_entry_path(parent, name, "recovery");
+    rename_exclusive(staging, &recovery).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "could not preserve the previous app at {} ({error})",
+                recovery.display()
+            ),
+        )
+    })?;
+    Ok(recovery)
 }
 
 fn restore_backup(
@@ -1650,7 +1683,11 @@ fn recover_interrupted_install_with(
     if !path_present(destination)? {
         // A corrupt newest backup must not hide an older recoverable app.
         // Invalid backups remain available for manual inspection while young.
-        for (_, backup) in newest_entries(parent, name, "backup")? {
+        // Dedicated rollback recoveries never expire and take priority. They
+        // remain untouched while the destination is occupied.
+        let recoveries = newest_entries(parent, name, "recovery")?;
+        let backups = newest_entries(parent, name, "backup")?;
+        for (_, backup) in recoveries.into_iter().chain(backups) {
             let backup_identity = match path_identity(&backup) {
                 Ok(identity) => identity,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -1806,7 +1843,10 @@ fn entry_prefix(name: &str, kind: &str) -> String {
     format!(".{name}.{kind}-")
 }
 
-/// Build a unique staging or backup name that records its creation time.
+/// Build a unique install-entry name that records its creation time.
+///
+/// Names are predictable timestamps and counters, not a security boundary.
+/// Isolation comes from the private parent and descriptor-relative operations.
 ///
 /// The timestamp is part of the name because renaming a directory does not
 /// update its mtime: a backup of an app installed months ago would otherwise
@@ -2035,6 +2075,9 @@ fn remove_legacy_install() -> bool {
         let _ = cleanup_stale_entries(parent, name, "install");
         let _ = cleanup_stale_entries(parent, name, "race");
         let _ = remove_matching_entries(parent, name, "backup");
+        if removed {
+            let _ = remove_matching_entries(parent, name, "recovery");
+        }
     }
     removed
 }
@@ -2920,13 +2963,17 @@ TeamIdentifier=68994Z5PT3
         fs::create_dir(&young).unwrap();
         let legacy = parent.join(".FSK.app.backup-legacy");
         fs::create_dir(&legacy).unwrap();
+        let recovery = new_entry_path(parent, "FSK.app", "recovery");
+        fs::create_dir(&recovery).unwrap();
         let unrelated = parent.join("Safari.app");
         fs::create_dir(&unrelated).unwrap();
 
         remove_matching_entries(parent, "FSK.app", "backup").unwrap();
+        remove_matching_entries(parent, "FSK.app", "recovery").unwrap();
 
         assert!(!young.exists());
         assert!(!legacy.exists());
+        assert!(!recovery.exists());
         assert!(unrelated.exists());
     }
 
