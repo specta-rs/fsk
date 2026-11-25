@@ -43,7 +43,9 @@ const RELEASE_BASE_URL: &str = "https://github.com/specta-rs/fsk/releases/downlo
 const RELEASE_API_URL: &str = "https://api.github.com/repos/specta-rs/fsk/releases/tags";
 const STALE_ENTRY_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const AUTHORIZATION_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_AUTHORIZATION_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_RELEASE_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_RELEASE_METADATA_BYTES: u64 = 1024 * 1024;
 const MAX_RELEASE_EXPANDED_BYTES: u64 = 256 * 1024 * 1024;
@@ -117,6 +119,9 @@ pub enum InstallPhase {
 /// `.app`; it is not a directory that contains the bundle. The value is
 /// normalized before use, and relative paths or paths containing `..` are
 /// rejected. With an override, no legacy `/Applications` copy is touched.
+/// A symlinked default install parent is resolved to its target directory; that
+/// target is validated and made private. A symlink at the final `FSK.app` path
+/// is still treated as a link and is never followed by destructive operations.
 ///
 /// If `GITHUB_TOKEN` or `GH_TOKEN` is set, the release asset is resolved through
 /// the GitHub API so a private release can be downloaded. Set
@@ -295,6 +300,9 @@ pub fn uninstall() -> io::Result<bool> {
 /// At the default location, an app that fails signature or Gatekeeper
 /// validation is treated as absent and is never executed. An explicit
 /// `FSK_APP_PATH` override may select an unsigned development build.
+/// A symlinked default install parent is resolved to its target directory and
+/// that target must not be group- or world-writable. The final app symlink is
+/// not followed by uninstall or replacement cleanup.
 ///
 /// # Errors
 ///
@@ -327,6 +335,8 @@ fn authorization_status_at(app: &Path) -> io::Result<AuthorizationStatus> {
     let output = output_with_timeout(
         Command::new(app.join(APP_EXECUTABLE)).arg("--fsk-authorization-status"),
         AUTHORIZATION_STATUS_TIMEOUT,
+        MAX_AUTHORIZATION_OUTPUT_BYTES,
+        "FSK.app authorization status",
     )?;
     if !output.status.success() {
         return Err(io::Error::other(
@@ -452,24 +462,63 @@ fn install_from_release(
     destination: &Path,
     progress: &mut dyn FnMut(InstallPhase),
 ) -> io::Result<()> {
+    install_from_release_with_download(temporary, destination, download_release, progress)
+}
+
+fn install_from_release_with_download(
+    temporary: &Path,
+    destination: &Path,
+    download: impl Fn(&Path, &Path, &str) -> io::Result<()>,
+    progress: &mut dyn FnMut(InstallPhase),
+) -> io::Result<()> {
     let archive = temporary.join("FSK.zip");
     let extracted = temporary.join("extracted");
-    fs::DirBuilder::new()
+    let created = fs::DirBuilder::new()
         .mode(0o700)
         .create(&extracted)
-        .map_err(|error| fs_error("create", &extracted, &error))?;
+        .map_err(|error| fs_error("create", &extracted, &error));
+    let result = match created {
+        Ok(()) => install_from_release_inner(
+            temporary,
+            &archive,
+            &extracted,
+            destination,
+            &download,
+            progress,
+        ),
+        Err(error) => Err(error),
+    };
+    if result.is_err() {
+        let _ = remove_path(&extracted);
+    }
+    result
+}
+
+fn install_from_release_inner(
+    temporary: &Path,
+    archive: &Path,
+    extracted: &Path,
+    destination: &Path,
+    download: &impl Fn(&Path, &Path, &str) -> io::Result<()>,
+    progress: &mut dyn FnMut(InstallPhase),
+) -> io::Result<()> {
+    let destination_identity = capture_destination_expectation(destination)?;
+    verify_destination_expectation(destination, destination_identity)?;
     let tag = format!("v{APP_VERSION}");
     progress(InstallPhase::Downloading);
-    download_release(temporary, &archive, &tag)?;
-    validate_archive_limits(&archive)?;
+    download(temporary, archive, &tag)?;
+    // The download may take long enough for another process to replace the
+    // destination. Refuse before extracting or staging anything.
+    verify_destination_expectation(destination, destination_identity)?;
+    validate_archive_limits(archive)?;
     run(
         Command::new("/usr/bin/ditto")
             .args(["-x", "-k"])
-            .arg(&archive)
-            .arg(&extracted),
+            .arg(archive)
+            .arg(extracted),
         "unpack FSK.app",
     )?;
-    validate_extracted_limits(&extracted)?;
+    validate_extracted_limits(extracted)?;
 
     let source = extracted.join("FSK.app");
     require_real_directory(&source)?;
@@ -502,8 +551,21 @@ fn install_from_release(
     }
 
     let backup = new_entry_path(parent, name, "backup");
-    let staged_identity = path_identity(&staged_app)?;
-    let result = replace_app(&staged_app, destination, &backup);
+    let staged_identity = match path_identity(&staged_app) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = remove_path(&staging);
+            return Err(error);
+        }
+    };
+    let result = replace_app_with_expected(
+        &staged_app,
+        destination,
+        &backup,
+        destination_identity,
+        staged_identity,
+        atomic_swap,
+    );
     // replace_app consumes the staged app on success. On a failed race
     // rollback it may instead contain an unexpected directory; preserve that
     // directory rather than deleting it with our staging container.
@@ -527,23 +589,31 @@ fn create_install_parent(parent: &Path) -> io::Result<()> {
 }
 
 fn make_default_install_parent_private(parent: &Path) -> io::Result<()> {
-    let metadata =
-        fs::symlink_metadata(parent).map_err(|error| fs_error("inspect", parent, &error))?;
-    if !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not a real install directory", parent.display()),
-        ));
-    }
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-        .map_err(|error| fs_error("make the install directory private", parent, &error))
+    let parent = canonical_directory(parent)?;
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
+        .map_err(|error| fs_error("make the install directory private", &parent, &error))
 }
 
 fn default_install_parent_is_private(app: &Path) -> bool {
     destination_parent(app)
         .ok()
-        .and_then(|parent| fs::symlink_metadata(parent).ok())
+        .and_then(|parent| canonical_directory(parent).ok())
+        .and_then(|parent| fs::metadata(parent).ok())
         .is_some_and(|metadata| metadata.is_dir() && metadata.permissions().mode() & 0o022 == 0)
+}
+
+fn canonical_directory(path: &Path) -> io::Result<PathBuf> {
+    let canonical =
+        fs::canonicalize(path).map_err(|error| fs_error("canonicalize directory", path, &error))?;
+    let metadata = fs::metadata(&canonical)
+        .map_err(|error| fs_error("inspect canonical directory", &canonical, &error))?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a directory", canonical.display()),
+        ));
+    }
+    Ok(canonical)
 }
 
 fn create_staging_directory(staging: &Path) -> io::Result<()> {
@@ -561,11 +631,14 @@ fn create_staging_directory(staging: &Path) -> io::Result<()> {
 }
 
 fn validate_archive_limits(archive: &Path) -> io::Result<()> {
-    let output = Command::new("/usr/bin/zipinfo")
-        .env("LC_ALL", "C")
-        .arg("-t")
-        .arg(archive)
-        .output()?;
+    let mut command = Command::new("/usr/bin/zipinfo");
+    command.env("LC_ALL", "C").arg("-t").arg(archive);
+    let output = output_with_timeout(
+        &mut command,
+        COMMAND_TIMEOUT,
+        MAX_COMMAND_OUTPUT_BYTES,
+        "inspect FSK.app archive limits",
+    )?;
     if !output.status.success() {
         return Err(command_error(
             "inspect FSK.app archive limits",
@@ -823,13 +896,52 @@ fn curl_token_config(temporary: &Path, token: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+#[cfg(test)]
 fn replace_app(staging: &Path, destination: &Path, backup: &Path) -> io::Result<()> {
-    replace_app_with(staging, destination, backup, atomic_swap)
+    let destination_identity = capture_destination_expectation(destination)?;
+    let staging_identity = path_identity(staging)?;
+    replace_app_with_expected(
+        staging,
+        destination,
+        backup,
+        destination_identity,
+        staging_identity,
+        atomic_swap,
+    )
 }
 
-fn path_identity(path: &Path) -> io::Result<(u64, u64)> {
+type PathIdentity = (u64, u64);
+
+fn path_identity(path: &Path) -> io::Result<PathIdentity> {
     let metadata = fs::symlink_metadata(path)?;
     Ok((metadata.dev(), metadata.ino()))
+}
+
+fn capture_destination_expectation(destination: &Path) -> io::Result<Option<PathIdentity>> {
+    if path_present(destination)? {
+        Ok(Some(path_identity(destination)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn verify_destination_expectation(
+    destination: &Path,
+    expected: Option<PathIdentity>,
+) -> io::Result<()> {
+    if capture_destination_expectation(destination)? != expected {
+        return Err(destination_race_error(destination));
+    }
+    if expected.is_some() && !is_fsk_app(destination)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to replace {} because it is not an FSK.app bundle",
+                destination.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn destination_race_error(destination: &Path) -> io::Error {
@@ -847,50 +959,60 @@ enum AppSwap {
     Unsupported,
 }
 
+#[cfg(test)]
 fn replace_app_with(
     staging: &Path,
     destination: &Path,
     backup: &Path,
     swap: impl Fn(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    let staging_identity = path_identity(staging).ok();
+    let destination_identity = capture_destination_expectation(destination)?;
+    let staging_identity = path_identity(staging)?;
+    replace_app_with_expected(
+        staging,
+        destination,
+        backup,
+        destination_identity,
+        staging_identity,
+        swap,
+    )
+}
+
+fn replace_app_with_expected(
+    staging: &Path,
+    destination: &Path,
+    backup: &Path,
+    destination_identity: Option<PathIdentity>,
+    staging_identity: PathIdentity,
+    swap: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
     let remove_staging = || {
         remove_owned_path(staging, staging_identity);
     };
-    let destination_present = match path_present(destination) {
-        Ok(present) => present,
-        Err(error) => {
+    if let Err(error) = verify_destination_expectation(destination, destination_identity) {
+        remove_staging();
+        return Err(error);
+    }
+    if path_identity(staging).ok().as_ref() != Some(&staging_identity) {
+        return Err(destination_race_error(staging));
+    }
+    let destination_present = destination_identity.is_some();
+    if destination_present {
+        let Some(identity) = destination_identity else {
+            return Err(destination_race_error(destination));
+        };
+        if let Err(error) = terminate_app_at(destination) {
             remove_staging();
             return Err(error);
         }
-    };
-    let destination_identity = if destination_present {
-        match path_identity(destination) {
-            Ok(identity) => Some(identity),
-            Err(error) => {
-                remove_staging();
-                return Err(error);
-            }
-        }
-    } else {
-        None
-    };
-    if destination_present {
-        let Some(identity) = destination_identity else {
+        // Process termination can take time. Revalidate both paths after it,
+        // immediately before the first mutation.
+        if let Err(error) = verify_destination_expectation(destination, destination_identity) {
             remove_staging();
-            return Err(destination_race_error(destination));
-        };
-        // Re-check immediately before mutation. The download and verification
-        // happened after install() first accepted this destination.
-        if path_identity(destination).ok().as_ref() != Some(&identity) {
-            remove_staging();
-            return Err(destination_race_error(destination));
+            return Err(error);
         }
-        if is_fsk_app(destination)? {
-            if let Err(error) = terminate_app_at(destination) {
-                remove_staging();
-                return Err(error);
-            }
+        if path_identity(staging).ok().as_ref() != Some(&staging_identity) {
+            return Err(destination_race_error(staging));
         }
         match swap_existing_app(
             staging,
@@ -901,7 +1023,17 @@ fn replace_app_with(
             swap,
         ) {
             Ok(AppSwap::Completed) => return Ok(()),
-            Ok(AppSwap::Unsupported) => {}
+            Ok(AppSwap::Unsupported) => {
+                if let Err(error) =
+                    verify_destination_expectation(destination, destination_identity)
+                {
+                    remove_staging();
+                    return Err(error);
+                }
+                if path_identity(staging).ok().as_ref() != Some(&staging_identity) {
+                    return Err(destination_race_error(staging));
+                }
+            }
             Err(error) => return Err(error),
         }
         if let Err(error) = rename_exclusive(destination, backup) {
@@ -914,6 +1046,12 @@ fn replace_app_with(
             remove_staging();
             return Err(destination_race_error(destination));
         }
+    }
+    if path_identity(staging).ok().as_ref() != Some(&staging_identity) {
+        if destination_present {
+            let _ = restore_backup(backup, destination, destination_identity);
+        }
+        return Err(destination_race_error(staging));
     }
     if let Err(error) = rename_exclusive(staging, destination) {
         remove_staging();
@@ -943,6 +1081,9 @@ fn replace_app_with(
         }
         return Err(fs_error("install FSK.app at", destination, &error));
     }
+    if path_identity(destination).ok().as_ref() != Some(&staging_identity) {
+        return Err(destination_race_error(destination));
+    }
     // The new app is in place, so a stale backup is not an installation
     // failure. Leave it behind rather than reporting a false error. Do not
     // remove a pre-existing backup when there was no destination to replace.
@@ -954,20 +1095,43 @@ fn replace_app_with(
     Ok(())
 }
 
+fn restore_backup(
+    backup: &Path,
+    destination: &Path,
+    destination_identity: Option<PathIdentity>,
+) -> io::Result<()> {
+    let Some(identity) = destination_identity else {
+        return Ok(());
+    };
+    if path_identity(backup).ok().as_ref() != Some(&identity) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the previous FSK.app at {} changed during installation",
+                backup.display()
+            ),
+        ));
+    }
+    rename_exclusive(backup, destination)
+}
+
 fn swap_existing_app(
     staging: &Path,
     destination: &Path,
     backup: &Path,
-    destination_identity: (u64, u64),
-    staging_identity: Option<(u64, u64)>,
+    destination_identity: PathIdentity,
+    staging_identity: PathIdentity,
     swap: impl Fn(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<AppSwap> {
     match swap(staging, destination) {
         Ok(()) => {
-            // A successful exchange must put the exact directory we inspected
-            // at staging. Otherwise a non-cooperating process raced us; swap
-            // back rather than recursively deleting it.
-            if path_identity(staging).ok().as_ref() != Some(&destination_identity) {
+            // A successful exchange must put the old destination at staging
+            // and the exact staged app at destination. Otherwise a
+            // non-cooperating process raced us; swap back rather than
+            // recursively deleting either unexpected path.
+            if path_identity(staging).ok().as_ref() != Some(&destination_identity)
+                || path_identity(destination).ok().as_ref() != Some(&staging_identity)
+            {
                 return match swap(staging, destination) {
                     Ok(()) => {
                         // The second exchange should restore our original
@@ -1010,10 +1174,8 @@ fn swap_existing_app(
     }
 }
 
-fn remove_owned_path(path: &Path, identity: Option<(u64, u64)>) {
-    if let Some(identity) = identity {
-        let _ = remove_path_if_identity(path, identity);
-    }
+fn remove_owned_path(path: &Path, identity: PathIdentity) {
+    let _ = remove_path_if_identity(path, identity);
 }
 
 fn remove_path_if_identity(path: &Path, expected: (u64, u64)) -> bool {
@@ -1111,14 +1273,14 @@ fn recover_interrupted_install_with(
 /// The version is deliberately not checked: an older but valid release may be
 /// the best thing to restore after an interrupted upgrade.
 fn validate_restored_app(app: &Path) -> io::Result<()> {
-    run(
+    run_with_timeout(
         Command::new("/usr/bin/codesign")
             .args(["--verify", "--deep", "--strict"])
             .arg(app),
         "verify restored FSK.app signature",
     )?;
     check_signing_identity(app)?;
-    run(
+    run_with_timeout(
         Command::new("/usr/sbin/spctl")
             .args(["--assess", "--type", "execute"])
             .arg(app),
@@ -1294,14 +1456,14 @@ fn validate_app(app: &Path) -> io::Result<()> {
             "FSK.app bundle identifier does not match the Rust SDK",
         ));
     }
-    run(
+    run_with_timeout(
         Command::new("/usr/bin/codesign")
             .args(["--verify", "--deep", "--strict"])
             .arg(app),
         "verify FSK.app signature",
     )?;
     check_signing_identity(app)?;
-    run(
+    run_with_timeout(
         Command::new("/usr/sbin/spctl")
             .args(["--assess", "--type", "execute"])
             .arg(app),
@@ -1310,11 +1472,15 @@ fn validate_app(app: &Path) -> io::Result<()> {
 }
 
 fn check_signing_identity(app: &Path) -> io::Result<()> {
-    let output = Command::new("/usr/bin/codesign")
-        .args(["--display", "--verbose=4"])
-        .arg(app)
-        .output()
-        .map_err(|error| fs_error("read FSK.app signing identity from", app, &error))?;
+    let mut command = Command::new("/usr/bin/codesign");
+    command.args(["--display", "--verbose=4"]).arg(app);
+    let output = output_with_timeout(
+        &mut command,
+        COMMAND_TIMEOUT,
+        MAX_COMMAND_OUTPUT_BYTES,
+        "read FSK.app signing identity",
+    )
+    .map_err(|error| fs_error("read FSK.app signing identity from", app, &error))?;
     if !output.status.success() {
         return Err(command_error(
             "read FSK.app signing identity",
@@ -1454,16 +1620,17 @@ fn remove_legacy_install() -> bool {
 /// removing it. macOS otherwise leaves an unlinked executable running, and
 /// `open` may reactivate that stale process after an upgrade.
 fn terminate_app_at(app: &Path) -> io::Result<()> {
-    signal_bundle_processes(app, libc::SIGTERM)?;
+    let app_root = canonical_app_root(app)?;
+    signal_bundle_processes(&app_root, libc::SIGTERM)?;
     for _ in 0..20 {
-        if processes_executing_in(app)?.is_empty() {
+        if processes_executing_in(&app_root)?.is_empty() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(25));
     }
-    signal_bundle_processes(app, libc::SIGKILL)?;
+    signal_bundle_processes(&app_root, libc::SIGKILL)?;
     for _ in 0..20 {
-        if processes_executing_in(app)?.is_empty() {
+        if processes_executing_in(&app_root)?.is_empty() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(25));
@@ -1519,7 +1686,13 @@ fn processes_executing_in(app: &Path) -> io::Result<Vec<i32>> {
         // that many bytes and returns the number of process IDs written.
         let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
         if count < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(0) {
+                return Err(io::Error::other(
+                    "could not enumerate processes: proc_listallpids failed",
+                ));
+            }
+            return Err(error);
         }
         let count = usize::try_from(count).map_err(|_| {
             io::Error::new(
@@ -1528,7 +1701,9 @@ fn processes_executing_in(app: &Path) -> io::Result<Vec<i32>> {
             )
         })?;
         if count == 0 {
-            return Ok(Vec::new());
+            return Err(io::Error::other(
+                "could not enumerate processes: proc_listallpids returned no processes",
+            ));
         }
         if count >= capacity {
             capacity = capacity.checked_mul(2).ok_or_else(|| {
@@ -1549,6 +1724,17 @@ fn processes_executing_in(app: &Path) -> io::Result<Vec<i32>> {
 
 fn process_executes_in(pid: i32, app: &Path) -> bool {
     process_executable_path(pid).is_some_and(|path| path.starts_with(app))
+}
+
+/// Build the path reported by `proc_pidpath` without following a final app
+/// symlink. Destructive operations may remove that link, never its target.
+fn canonical_app_root(app: &Path) -> io::Result<PathBuf> {
+    let app = normalize_app_path(app)?;
+    let parent = canonical_directory(destination_parent(&app)?)?;
+    let name = app
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "FSK.app has no name"))?;
+    Ok(parent.join(name))
 }
 
 fn process_executable_path(pid: i32) -> Option<PathBuf> {
@@ -1599,10 +1785,16 @@ fn app_bundle_identifier(app: &Path) -> io::Result<Option<String>> {
 }
 
 fn plist_string(app: &Path, key: &str) -> io::Result<Option<String>> {
-    let output = Command::new("/usr/bin/plutil")
+    let mut command = Command::new("/usr/bin/plutil");
+    command
         .args(["-extract", key, "raw", "-o", "-"])
-        .arg(app.join("Contents/Info.plist"))
-        .output()?;
+        .arg(app.join("Contents/Info.plist"));
+    let output = output_with_timeout(
+        &mut command,
+        COMMAND_TIMEOUT,
+        MAX_COMMAND_OUTPUT_BYTES,
+        "read FSK.app Info.plist",
+    )?;
     if !output.status.success() {
         return Err(command_error("read FSK.app Info.plist", &output.stderr));
     }
@@ -1614,10 +1806,14 @@ fn plist_string(app: &Path, key: &str) -> io::Result<Option<String>> {
 /// Parse a plist through `plutil`'s JSON conversion so a missing optional key
 /// can be distinguished from an unreadable or malformed bundle.
 fn plist_json(path: &Path) -> io::Result<serde_json::Value> {
-    let output = Command::new("/usr/bin/plutil")
-        .args(["-convert", "json", "-o", "-"])
-        .arg(path)
-        .output()?;
+    let mut command = Command::new("/usr/bin/plutil");
+    command.args(["-convert", "json", "-o", "-"]).arg(path);
+    let output = output_with_timeout(
+        &mut command,
+        COMMAND_TIMEOUT,
+        MAX_COMMAND_OUTPUT_BYTES,
+        "read FSK.app Info.plist",
+    )?;
     if !output.status.success() {
         return Err(command_error("read FSK.app Info.plist", &output.stderr));
     }
@@ -1709,6 +1905,8 @@ impl Drop for AppLock {
 fn output_with_timeout(
     command: &mut Command,
     timeout: Duration,
+    max_output_bytes: usize,
+    operation: &str,
 ) -> io::Result<std::process::Output> {
     command.process_group(0);
     let mut child = command
@@ -1733,10 +1931,12 @@ fn output_with_timeout(
                 status = child.try_wait()?;
             }
             if !stdout_eof {
-                stdout_eof = read_available(&mut stdout, &mut stdout_bytes)?;
+                stdout_eof =
+                    read_available(&mut stdout, &mut stdout_bytes, max_output_bytes, operation)?;
             }
             if !stderr_eof {
-                stderr_eof = read_available(&mut stderr, &mut stderr_bytes)?;
+                stderr_eof =
+                    read_available(&mut stderr, &mut stderr_bytes, max_output_bytes, operation)?;
             }
             if stdout_eof && stderr_eof {
                 if let Some(status) = status {
@@ -1750,7 +1950,7 @@ fn output_with_timeout(
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "FSK.app did not return an authorization status in time",
+                    format!("{operation} did not finish within {timeout:?}"),
                 ));
             }
             thread::sleep(Duration::from_millis(25));
@@ -1776,16 +1976,21 @@ fn set_nonblocking(file: &impl AsRawFd) -> io::Result<()> {
     Ok(())
 }
 
-fn read_available(file: &mut impl Read, output: &mut Vec<u8>) -> io::Result<bool> {
+fn read_available(
+    file: &mut impl Read,
+    output: &mut Vec<u8>,
+    max_output_bytes: usize,
+    operation: &str,
+) -> io::Result<bool> {
     let mut buffer = [0_u8; 4096];
     loop {
         match file.read(&mut buffer) {
             Ok(0) => return Ok(true),
             Ok(count) => {
-                if output.len().saturating_add(count) > MAX_AUTHORIZATION_OUTPUT_BYTES {
+                if output.len().saturating_add(count) > max_output_bytes {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "FSK.app authorization status output is too large",
+                        format!("{operation} output is too large"),
                     ));
                 }
                 output.extend_from_slice(&buffer[..count]);
@@ -1817,6 +2022,20 @@ fn stop_process_group(child: &mut std::process::Child) {
 
 fn run(command: &mut Command, operation: &str) -> io::Result<()> {
     let output = command.output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_error(operation, &output.stderr))
+    }
+}
+
+fn run_with_timeout(command: &mut Command, operation: &str) -> io::Result<()> {
+    let output = output_with_timeout(
+        command,
+        COMMAND_TIMEOUT,
+        MAX_COMMAND_OUTPUT_BYTES,
+        operation,
+    )?;
     if output.status.success() {
         Ok(())
     } else {
@@ -2236,6 +2455,29 @@ TeamIdentifier=68994Z5PT3
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_default_install_parent_uses_its_canonical_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("linked");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).unwrap();
+        symlink(&target, &link).unwrap();
+        let app = app_fixture(&link);
+
+        assert!(!default_install_parent_is_private(&app));
+        make_default_install_parent_private(&link).unwrap();
+
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(default_install_parent_is_private(&app));
+    }
+
     #[test]
     fn uninstall_is_idempotent() {
         let directory = tempfile::tempdir().unwrap();
@@ -2345,10 +2587,9 @@ TeamIdentifier=68994Z5PT3
     #[test]
     fn replacement_swaps_in_new_content_and_removes_staging() {
         let directory = tempfile::tempdir().unwrap();
-        let destination = directory.path().join("FSK.app");
+        let destination = app_fixture(directory.path());
         let staging = directory.path().join(".FSK.app.install-test");
         let backup = directory.path().join(".FSK.app.backup-test");
-        fs::create_dir(&destination).unwrap();
         fs::write(destination.join("marker"), b"old app").unwrap();
         fs::create_dir(&staging).unwrap();
         fs::write(staging.join("marker"), b"new app").unwrap();
@@ -2379,10 +2620,9 @@ TeamIdentifier=68994Z5PT3
     #[test]
     fn replacement_falls_back_when_swap_is_unsupported() {
         let directory = tempfile::tempdir().unwrap();
-        let destination = directory.path().join("FSK.app");
+        let destination = app_fixture(directory.path());
         let staging = directory.path().join(".FSK.app.install-test");
         let backup = directory.path().join(".FSK.app.backup-test");
-        fs::create_dir(&destination).unwrap();
         fs::write(destination.join("marker"), b"old app").unwrap();
         fs::create_dir(&staging).unwrap();
         fs::write(staging.join("marker"), b"new app").unwrap();
@@ -2400,10 +2640,9 @@ TeamIdentifier=68994Z5PT3
     #[test]
     fn fallback_replacement_never_overwrites_an_existing_backup() {
         let directory = tempfile::tempdir().unwrap();
-        let destination = directory.path().join("FSK.app");
+        let destination = app_fixture(directory.path());
         let staging = directory.path().join("staged.app");
         let backup = directory.path().join("backup");
-        fs::create_dir(&destination).unwrap();
         fs::write(destination.join("marker"), b"old app").unwrap();
         fs::create_dir(&staging).unwrap();
         fs::write(staging.join("marker"), b"new app").unwrap();
@@ -2443,10 +2682,9 @@ TeamIdentifier=68994Z5PT3
     #[test]
     fn failed_fallback_rename_restores_the_previous_app() {
         let directory = tempfile::tempdir().unwrap();
-        let destination = directory.path().join("FSK.app");
+        let destination = app_fixture(directory.path());
         let staging = directory.path().join("missing-staging");
         let backup = directory.path().join(".FSK.app.backup-test");
-        fs::create_dir(&destination).unwrap();
         fs::write(destination.join("marker"), b"previous app").unwrap();
 
         assert!(

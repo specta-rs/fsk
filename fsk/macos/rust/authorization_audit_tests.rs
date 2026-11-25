@@ -1,7 +1,7 @@
 //! Snapshot-only adversarial regression tests for the macOS authorization module.
 use super::*;
 use std::{
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{PermissionsExt, symlink},
     process::{Command, Stdio},
     sync::{Mutex as StdMutex, mpsc},
     thread,
@@ -91,7 +91,7 @@ fn audit_replacement_preserves_an_unrelated_directory_that_races_the_swap() {
     let destination = directory.path().join("FSK.app");
     let staging = directory.path().join("staged.app");
     let backup = directory.path().join("backup");
-    fs::create_dir(&destination).unwrap();
+    audit_app(directory.path());
     fs::write(destination.join("marker"), b"old app").unwrap();
     fs::create_dir(&staging).unwrap();
     fs::write(staging.join("marker"), b"new app").unwrap();
@@ -116,6 +116,125 @@ fn audit_replacement_preserves_an_unrelated_directory_that_races_the_swap() {
         result.is_err(),
         "replacement should report the destination race"
     );
+}
+
+#[test]
+fn audit_replacement_refuses_an_unrelated_destination_before_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("FSK.app");
+    let staging = directory.path().join("staged.app");
+    let backup = directory.path().join("backup");
+    fs::create_dir(&destination).unwrap();
+    fs::write(destination.join("important"), b"keep me").unwrap();
+    fs::create_dir(&staging).unwrap();
+    fs::write(staging.join("marker"), b"new app").unwrap();
+
+    assert!(replace_app_with(&staging, &destination, &backup, atomic_swap).is_err());
+
+    assert_eq!(fs::read(destination.join("important")).unwrap(), b"keep me");
+    assert!(
+        !staging.exists(),
+        "the rejected staged app should be cleaned up"
+    );
+}
+
+#[test]
+fn audit_slow_download_refuses_a_destination_replaced_during_download() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = audit_app(directory.path());
+    fs::write(destination.join("marker"), b"old app").unwrap();
+
+    let error = install_from_release_with_download(
+        directory.path(),
+        &destination,
+        |_, _, _| {
+            thread::sleep(Duration::from_millis(50));
+            fs::remove_dir_all(&destination)?;
+            fs::create_dir(&destination)?;
+            fs::write(destination.join("important"), b"keep me").unwrap();
+            Ok(())
+        },
+        &mut |_| {},
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("changed during installation"),
+        "expected a destination race, got {error}"
+    );
+    assert_eq!(fs::read(destination.join("important")).unwrap(), b"keep me");
+    assert!(!directory.path().join("extracted").exists());
+}
+
+#[test]
+fn audit_swap_verifies_the_destination_contains_the_exact_staged_app() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = audit_app(directory.path());
+    fs::write(destination.join("marker"), b"old app").unwrap();
+    let staging = directory.path().join("staged.app");
+    fs::create_dir(&staging).unwrap();
+    fs::write(staging.join("marker"), b"new app").unwrap();
+    let backup = directory.path().join("backup");
+    let destination_identity = path_identity(&destination).unwrap();
+    let staging_identity = path_identity(&staging).unwrap();
+
+    let result = replace_app_with_expected(
+        &staging,
+        &destination,
+        &backup,
+        Some(destination_identity),
+        staging_identity,
+        |staging, destination| {
+            if fs::read(staging.join("marker")).ok().as_deref() == Some(b"new app") {
+                fs::remove_dir_all(staging)?;
+                fs::create_dir(staging)?;
+                fs::write(staging.join("important"), b"keep me").unwrap();
+            }
+            atomic_swap(staging, destination)
+        },
+    );
+
+    assert!(result.is_err(), "a staged-app race must be reported");
+    assert_eq!(fs::read(destination.join("marker")).unwrap(), b"old app");
+    assert_eq!(
+        fs::read(staging.join("important")).unwrap(),
+        b"keep me",
+        "the unrelated staging replacement must be preserved"
+    );
+}
+
+#[test]
+fn audit_swap_verifies_both_sides_when_destination_changes_after_exchange() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = audit_app(directory.path());
+    fs::write(destination.join("marker"), b"old app").unwrap();
+    let staging = directory.path().join("staged.app");
+    fs::create_dir(&staging).unwrap();
+    fs::write(staging.join("marker"), b"new app").unwrap();
+    let backup = directory.path().join("backup");
+    let destination_identity = path_identity(&destination).unwrap();
+    let staging_identity = path_identity(&staging).unwrap();
+
+    let result = replace_app_with_expected(
+        &staging,
+        &destination,
+        &backup,
+        Some(destination_identity),
+        staging_identity,
+        |staging, destination| {
+            atomic_swap(staging, destination)?;
+            if fs::read(destination.join("marker")).ok().as_deref() == Some(b"new app") {
+                fs::remove_dir_all(destination)?;
+                fs::create_dir(destination)?;
+                fs::write(destination.join("important"), b"keep me").unwrap();
+            }
+            Ok(())
+        },
+    );
+
+    assert!(result.is_err(), "a destination-side race must be reported");
+    assert_eq!(fs::read(destination.join("marker")).unwrap(), b"old app");
+    assert_eq!(fs::read(staging.join("important")).unwrap(), b"keep me");
 }
 
 #[test]
@@ -242,7 +361,7 @@ impl Drop for AuditHttpsServer {
 
 fn audit_fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../audit/fixtures")
+        .join("macos/rust/audit/fixtures")
         .join(name)
         .canonicalize()
         .unwrap()
@@ -256,7 +375,7 @@ fn audit_start_https_server(mode: &str, payload: Option<&Path>) -> AuditHttpsSer
     let portfile = directory.path().join("port");
     let mut command = Command::new("/usr/bin/python3");
     command
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../audit/https_fixture.py"))
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("macos/rust/audit/https_fixture.py"))
         .arg(mode)
         .arg(&portfile)
         .arg(payload.unwrap_or_else(|| Path::new("")))
@@ -283,19 +402,8 @@ fn audit_start_https_server(mode: &str, payload: Option<&Path>) -> AuditHttpsSer
     }
 }
 
-fn audit_tree_size(path: &Path) -> u64 {
-    let metadata = fs::symlink_metadata(path).unwrap();
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return metadata.len();
-    }
-    let mut total = 0;
-    for entry in fs::read_dir(path).unwrap() {
-        total += audit_tree_size(&entry.unwrap().path());
-    }
-    total
-}
-
 #[test]
+#[ignore = "loopback HTTPS fixture; run explicitly via fsk/macos/check.sh"]
 fn audit_download_rejects_an_announced_oversized_archive() {
     const CHILD: &str = "audit-download-limit-child";
     if env::var_os("FSK_AUDIT_CHILD").as_deref() == Some(std::ffi::OsStr::new(CHILD)) {
@@ -329,17 +437,21 @@ fn audit_download_rejects_an_announced_oversized_archive() {
 }
 
 #[test]
+#[ignore = "loopback HTTPS fixture; run explicitly via fsk/macos/check.sh"]
 fn audit_extraction_rejects_an_archive_above_the_expanded_size_limit() {
     const CHILD: &str = "audit-expansion-limit-child";
     if env::var_os("FSK_AUDIT_CHILD").as_deref() == Some(std::ffi::OsStr::new(CHILD)) {
         let temporary = tempfile::tempdir().unwrap();
         let destination = temporary.path().join("destination/FSK.app");
         let result = install_from_release(temporary.path(), &destination, &mut |_| {});
-        assert!(result.is_err(), "the fixture is not a signed FSK.app");
-        let expanded = audit_tree_size(&temporary.path().join("extracted"));
+        let error = result.unwrap_err();
         assert!(
-            expanded <= 256 * 1024 * 1024,
-            "ditto expanded {expanded} bytes before signature verification"
+            error.to_string().contains("exceeds extraction limits"),
+            "expected the archive expansion limit, got {error}"
+        );
+        assert!(
+            !temporary.path().join("extracted").exists(),
+            "a rejected archive must not leave an extracted tree"
         );
         return;
     }
@@ -364,14 +476,12 @@ fn audit_extraction_rejects_an_archive_above_the_expanded_size_limit() {
     );
 }
 
-#[test]
-fn audit_uninstall_terminates_a_running_companion_process() {
-    let directory = tempfile::tempdir().unwrap();
-    let app = audit_app(directory.path());
+fn audit_start_companion(directory: &Path) -> (PathBuf, std::process::Child) {
+    let app = audit_app(directory);
     let executable = app.join(APP_EXECUTABLE);
     fs::copy(audit_fixture_path("audit-sleeper"), &executable).unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-    let ready = directory.path().join("ready");
+    let ready = directory.join("ready");
     let mut child = Command::new(&executable).arg(&ready).spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     while !ready.exists() {
@@ -385,18 +495,27 @@ fn audit_uninstall_terminates_a_running_companion_process() {
         );
         thread::sleep(Duration::from_millis(10));
     }
+    (app, child)
+}
 
-    let removed = uninstall_app_at(&app).unwrap();
+fn audit_wait_for_companion_exit(child: &mut std::process::Child) -> bool {
     let deadline = Instant::now() + Duration::from_secs(2);
-    let exited = loop {
+    while Instant::now() < deadline {
         if child.try_wait().unwrap().is_some() {
-            break true;
-        }
-        if Instant::now() >= deadline {
-            break false;
+            return true;
         }
         thread::sleep(Duration::from_millis(25));
-    };
+    }
+    child.try_wait().unwrap().is_some()
+}
+
+#[test]
+fn audit_uninstall_terminates_a_running_companion_process() {
+    let directory = tempfile::tempdir().unwrap();
+    let (app, mut child) = audit_start_companion(directory.path());
+
+    let removed = uninstall_app_at(&app).unwrap();
+    let exited = audit_wait_for_companion_exit(&mut child);
     if !exited {
         let _ = child.kill();
     }
@@ -406,6 +525,77 @@ fn audit_uninstall_terminates_a_running_companion_process() {
         exited,
         "uninstall left the companion process running after deleting its bundle"
     );
+}
+
+#[test]
+fn audit_symlinked_parent_uninstall_terminates_the_running_companion() {
+    let directory = tempfile::tempdir().unwrap();
+    let real_parent = directory.path().join("real");
+    let linked_parent = directory.path().join("linked");
+    fs::create_dir(&real_parent).unwrap();
+    symlink(&real_parent, &linked_parent).unwrap();
+    let (app, mut child) = audit_start_companion(&linked_parent);
+
+    assert!(uninstall_app_at(&app).unwrap());
+
+    assert!(
+        audit_wait_for_companion_exit(&mut child),
+        "canonical process matching did not stop the companion through a symlinked parent"
+    );
+    let _ = child.wait();
+}
+
+#[test]
+fn audit_symlinked_parent_update_terminates_the_running_companion() {
+    let directory = tempfile::tempdir().unwrap();
+    let real_parent = directory.path().join("real");
+    let linked_parent = directory.path().join("linked");
+    fs::create_dir(&real_parent).unwrap();
+    symlink(&real_parent, &linked_parent).unwrap();
+    let (app, mut child) = audit_start_companion(&linked_parent);
+    let staging = directory.path().join("staged.app");
+    fs::create_dir(&staging).unwrap();
+    fs::write(staging.join("marker"), b"new app").unwrap();
+    let backup = directory.path().join("backup");
+    let destination_identity = path_identity(&app).unwrap();
+    let staging_identity = path_identity(&staging).unwrap();
+
+    replace_app_with_expected(
+        &staging,
+        &app,
+        &backup,
+        Some(destination_identity),
+        staging_identity,
+        atomic_swap,
+    )
+    .unwrap();
+
+    assert!(
+        audit_wait_for_companion_exit(&mut child),
+        "update left the old companion running through a symlinked parent"
+    );
+    let _ = child.wait();
+    assert_eq!(fs::read(app.join("marker")).unwrap(), b"new app");
+}
+
+#[test]
+fn audit_final_app_symlink_uninstall_never_stops_its_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let target_parent = directory.path().join("target");
+    fs::create_dir(&target_parent).unwrap();
+    let (target_app, mut child) = audit_start_companion(&target_parent);
+    let linked_app = directory.path().join("FSK.app");
+    symlink(&target_app, &linked_app).unwrap();
+
+    assert!(uninstall_app_at(&linked_app).unwrap());
+
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "uninstall followed the final app symlink and stopped its target"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(target_app.exists());
 }
 
 #[test]
@@ -451,5 +641,26 @@ fn audit_authorization_status_has_a_bounded_execution_time() {
         result.unwrap_err().kind(),
         io::ErrorKind::TimedOut,
         "a hung companion must produce a timeout, not block wait_for_authorization forever"
+    );
+}
+
+#[test]
+fn audit_validation_commands_share_the_bounded_output_helper() {
+    let started = Instant::now();
+    let mut command = Command::new("/bin/sleep");
+    command.arg("30");
+    let error = output_with_timeout(
+        &mut command,
+        Duration::from_millis(50),
+        1024,
+        "validation fixture",
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(error.to_string().contains("validation fixture"));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "bounded command cleanup blocked after the deadline"
     );
 }

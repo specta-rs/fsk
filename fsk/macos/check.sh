@@ -8,6 +8,9 @@ cd "$repo_root"
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
+# Normal tests skip the loopback HTTPS fixtures; run them explicitly so CI
+# still covers download and extraction limits without external network access.
+cargo test -p fsk macos_authorization::audit_tests --offline -- --ignored --nocapture
 cd "$macos_root"
 xcodegen generate
 
