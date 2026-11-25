@@ -497,6 +497,8 @@ struct AuditRegressionTests {
             .init(opcode: 15, behavior: .respond(body: openBody(7))),
             .init(opcode: 15, behavior: .respond(body: openBody(8))),
             .init(opcode: 16, behavior: .respond(status: EIO)),
+        ], [
+            auditHello(), .init(opcode: 14),
         ]]) { backend in
             let volume = FSKVolume(backend: backend)
             let item = FSKItem(inode: 2, kind: .file)
@@ -506,7 +508,142 @@ struct AuditRegressionTests {
             error = nil
             volume.openItem(item, modes: [.read]) { error = $0 }
             #expect(auditPOSIX(error) == EIO)
+            try backend.synchronize()
         }
+    }
+
+    @Test("successful open acknowledges the installed lease exactly once")
+    func openAcknowledgesInstalledLease() throws {
+        let opened = auditOpenBody(lease: 7)
+        let acknowledgement = auditLeaseAcknowledgement(lease: 7)
+        try withAuditBackend([[
+            auditHello(minor: 2), auditNetworkConfiguration(),
+            .init(opcode: 15, behavior: .respond(body: opened)),
+            .init(opcode: 17, behavior: .respond(body: Data()), expectedRequestBody: acknowledgement),
+        ]]) { backend in
+            let volume = FSKVolume(backend: backend)
+            let item = FSKItem(inode: 2, kind: .file)
+            var error: Error?
+            volume.openItem(item, modes: [.read]) { error = $0 }
+            #expect(error == nil)
+            #expect(item.releaseOpenState() == 7)
+        }
+    }
+
+    @Test("open retains its connection through lease acknowledgement")
+    func openAcknowledgesOnCreatingConnection() throws {
+        let opened = auditOpenBody(lease: 7)
+        let acknowledgement = auditLeaseAcknowledgement(lease: 7)
+        let statfs = AuditIPCScript(opcode: 2, behavior: .respond(body: Data(count: 52)))
+        let server = try AuditIPCServer(scripts: [
+            [
+                auditHello(minor: 2), auditNetworkConfiguration(),
+                .init(opcode: 15, behavior: .respond(body: opened)),
+                .init(opcode: 17, behavior: .respond(body: Data()), expectedRequestBody: acknowledgement),
+            ],
+            [auditHello(minor: 2), statfs],
+        ])
+        server.start()
+        defer { server.stop() }
+        let backend = try RustBackend(resourceURL: server.resourceURL, requestTimeout: auditIPCRequestTimeout)
+        let handle = try backend.open(inode: 2, writable: false)
+        #expect(handle.file.lease == 7)
+        _ = try backend.statfs()
+        try handle.acknowledgeLease()
+        handle.finish()
+        try server.wait()
+    }
+
+    @Test("legacy open peers receive no lease acknowledgement")
+    func legacyOpenDoesNotAcknowledge() throws {
+        for minor: UInt16 in [0, 1] {
+            try withAuditBackend([[
+                auditHello(minor: minor), auditNetworkConfiguration(),
+                .init(opcode: 15, behavior: .respond(body: auditOpenBody(lease: 7))),
+            ]]) { backend in
+                let volume = FSKVolume(backend: backend)
+                let item = FSKItem(inode: 2, kind: .file)
+                var error: Error?
+                volume.openItem(item, modes: [.read]) { error = $0 }
+                #expect(error == nil)
+                #expect(item.releaseOpenState() == 7)
+            }
+        }
+    }
+
+    @Test("failed lease acknowledgement rolls back install and discards the connection")
+    func failedAcknowledgementDiscardsConnection() throws {
+        let opened = auditOpenBody(lease: 7)
+        let acknowledgement = auditLeaseAcknowledgement(lease: 7)
+        try withAuditBackend([[
+            auditHello(minor: 2), auditNetworkConfiguration(),
+            .init(opcode: 15, behavior: .respond(body: opened)),
+            .init(opcode: 17, behavior: .respond(status: EIO), expectedRequestBody: acknowledgement),
+            .init(opcode: 16, behavior: .respond(body: Data()), expectedRequestBody: acknowledgement),
+        ], [
+            auditHello(minor: 2), .init(opcode: 14),
+        ]]) { backend in
+            let volume = FSKVolume(backend: backend)
+            let item = FSKItem(inode: 2, kind: .file)
+            var error: Error?
+            volume.openItem(item, modes: [.read]) { error = $0 }
+            #expect(auditPOSIX(error) == EIO)
+            #expect(item.releaseOpenState() == nil)
+            try backend.synchronize()
+        }
+    }
+
+    @Test("acknowledgement timeout discards the pending lease connection")
+    func acknowledgementTimeoutDiscardsConnection() throws {
+        try withAuditBackend([[
+            auditHello(minor: 2), auditNetworkConfiguration(),
+            .init(opcode: 15, behavior: .respond(body: auditOpenBody(lease: 7))),
+            .init(opcode: 17, behavior: .hang),
+        ], [
+            auditHello(minor: 2), .init(opcode: 14),
+        ]], requireComplete: false) { backend in
+            let volume = FSKVolume(backend: backend)
+            let item = FSKItem(inode: 2, kind: .file)
+            var error: Error?
+            volume.openItem(item, modes: [.read]) { error = $0 }
+            #expect(auditPOSIX(error) == ETIMEDOUT)
+            #expect(item.releaseOpenState() == nil)
+            try backend.synchronize()
+        }
+    }
+
+    @Test("lease acknowledgement from another connection is rejected")
+    func wrongConnectionAcknowledgementIsRejected() throws {
+        let lease: UInt64 = 91
+        let server = try AuditIPCServer(scripts: [
+            [auditHello(minor: 2), .init(opcode: 15, behavior: .respond(body: auditOpenBody(lease: lease)))],
+            [
+                auditHello(minor: 2),
+                .init(opcode: 17, behavior: .respond(status: EINVAL), expectedRequestBody: auditLeaseAcknowledgement(lease: lease)),
+            ],
+        ])
+        server.start()
+        defer { server.stop() }
+
+        let opener = try auditConnect(to: server)
+        defer { Darwin.close(opener) }
+        try auditSendRequest(opener, opcode: 0, minor: 2, body: Data(repeating: 0, count: 32))
+        _ = try auditReadResponse(opener)
+        var openRequest = Data()
+        auditAppend(UInt64(2), to: &openRequest)
+        auditAppend(UInt8(0), to: &openRequest)
+        try auditSendRequest(opener, opcode: 15, minor: 2, body: openRequest)
+        let opened = try auditReadResponse(opener)
+        #expect(opened.status == 0)
+
+        let other = try auditConnect(to: server)
+        defer { Darwin.close(other) }
+        try auditSendRequest(other, opcode: 0, minor: 2, body: Data(repeating: 0, count: 32))
+        _ = try auditReadResponse(other)
+        try auditSendRequest(other, opcode: 17, minor: 2, body: auditLeaseAcknowledgement(lease: lease))
+        let rejected = try auditReadResponse(other)
+        #expect(rejected.status == EINVAL)
+        try server.wait()
     }
 
     @Test("concurrent requests use independent authenticated connections")
@@ -714,6 +851,90 @@ private func auditResource(socketPath: String) throws -> FSGenericURLResource {
         URLQueryItem(name: "token", value: String(repeating: "00", count: 32)),
     ]
     return FSGenericURLResource(url: try #require(components.url))
+}
+
+private func auditOpenBody(lease: UInt64) -> Data {
+    var body = Data()
+    auditAppend(lease, to: &body)
+    auditAppend(UInt8(0), to: &body)
+    auditAppend(UInt64(0), to: &body)
+    return body
+}
+
+private func auditLeaseAcknowledgement(lease: UInt64) -> Data {
+    var body = Data()
+    auditAppend(lease, to: &body)
+    return body
+}
+
+private func auditConnect(to server: AuditIPCServer) throws -> Int32 {
+    var (address, length) = try unixSocketAddress(path: server.socketPathForTesting)
+    let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+    try #require(descriptor >= 0)
+    let status = withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            Darwin.connect(descriptor, $0, length)
+        }
+    }
+    guard status == 0 else {
+        let error = errno
+        Darwin.close(descriptor)
+        throw POSIXError(POSIXErrorCode(rawValue: error) ?? .EIO)
+    }
+    return descriptor
+}
+
+private func auditSendRequest(
+    _ descriptor: Int32,
+    opcode: UInt16,
+    minor: UInt16,
+    body: Data,
+    requestID: UInt64 = 1
+) throws {
+    var frame = Data()
+    auditAppend(UInt32(0x4653_4249), to: &frame)
+    auditAppend(ipcProtocolMajor, to: &frame)
+    auditAppend(opcode, to: &frame)
+    auditAppend(requestID, to: &frame)
+    auditAppend(UInt32(body.count), to: &frame)
+    auditAppend(minor, to: &frame)
+    auditAppend(UInt16(0), to: &frame)
+    frame.append(body)
+    try frame.withUnsafeBytes { bytes in
+        var offset = 0
+        while offset < bytes.count {
+            let sent = Darwin.write(descriptor, bytes.baseAddress! + offset, bytes.count - offset)
+            if sent < 0 && errno == EINTR { continue }
+            try #require(sent > 0)
+            offset += sent
+        }
+    }
+}
+
+private func auditReadResponse(_ descriptor: Int32) throws -> (status: Int32, body: Data) {
+    let header = try auditReadExactBytes(24, from: descriptor)
+    let magic = header.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self)) }
+    let major = header.withUnsafeBytes { UInt16(littleEndian: $0.loadUnaligned(fromByteOffset: 4, as: UInt16.self)) }
+    try #require(magic == 0x4653_4249)
+    try #require(major == ipcProtocolMajor)
+    let status = header.withUnsafeBytes { Int32(littleEndian: $0.loadUnaligned(fromByteOffset: 16, as: Int32.self)) }
+    let length = header.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 20, as: UInt32.self)) }
+    try #require(length <= 16 * 1024 * 1024)
+    return (status, try auditReadExactBytes(Int(length), from: descriptor))
+}
+
+private func auditReadExactBytes(_ count: Int, from descriptor: Int32) throws -> Data {
+    var data = Data(count: count)
+    try data.withUnsafeMutableBytes { bytes in
+        var offset = 0
+        while offset < bytes.count {
+            let received = Darwin.read(descriptor, bytes.baseAddress! + offset, bytes.count - offset)
+            if received < 0 && errno == EINTR { continue }
+            try #require(received > 0)
+            offset += received
+        }
+    }
+    return data
 }
 
 private func auditDirectoryBody(entries: [(inode: UInt64, next: UInt64, name: String)], next: UInt64, eof: Bool) -> Data {

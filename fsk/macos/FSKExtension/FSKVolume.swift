@@ -514,25 +514,35 @@ final class FSKVolume: FSVolume,
             replyHandler(nil)
             return
         }
+        let opened: RustOpenHandle
         do {
-            let opened = try backend.open(inode: item.inode, writable: modes.contains(.write))
-            guard item.install(opened) else {
-                // A second open of the same file shares the lease the first
-                // one created. Reads and writes go through the backend, so
-                // this open needs no extra state; only the duplicate lease
-                // has to be released.
-                do {
-                    try backend.close(lease: opened.lease)
-                    replyHandler(nil)
-                } catch {
-                    replyHandler(posix(error))
-                }
-                return
-            }
-            replyHandler(nil)
+            opened = try backend.open(inode: item.inode, writable: modes.contains(.write))
         } catch {
             replyHandler(posix(error))
+            return
         }
+        guard item.install(opened.file) else {
+            // A second open shares the first lease. Release the duplicate on
+            // its creating connection, then discard that connection even if
+            // the close fails so pending-lease cleanup can run.
+            do {
+                try opened.reject()
+                replyHandler(nil)
+            } catch {
+                replyHandler(posix(error))
+            }
+            return
+        }
+        do {
+            try opened.acknowledgeLease()
+        } catch {
+            item.removeOpenState(lease: opened.file.lease)
+            try? opened.reject()
+            replyHandler(posix(error))
+            return
+        }
+        opened.finish()
+        replyHandler(nil)
     }
 
     func closeItem(

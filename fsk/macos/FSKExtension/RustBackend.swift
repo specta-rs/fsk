@@ -6,7 +6,7 @@ private let ipcMagic: UInt32 = 0x4653_4249
 // Keep these in sync with `PROTOCOL_MAJOR` and `PROTOCOL_MINOR` in
 // `fsk/macos/rust/ipc.rs`; the Rust tests check the declaration text.
 let ipcProtocolMajor: UInt16 = 1
-let ipcProtocolMinor: UInt16 = 1
+let ipcProtocolMinor: UInt16 = 2
 private let ipcHeaderLength = 24
 private let ipcMaximumFrame = 16 * 1024 * 1024
 // Two UInt64s, one UInt32, one UInt16, and one UInt8 on the wire.
@@ -31,6 +31,7 @@ private enum IPCOperation: UInt16 {
     case sync = 14
     case open = 15
     case close = 16
+    case acknowledgeLease = 17
 }
 
 enum RustBackendError: Error, Equatable, CustomStringConvertible {
@@ -161,6 +162,74 @@ struct RustOpenFile: Sendable {
     let lease: UInt64
     let generation: UInt64
     let localPath: Data?
+}
+
+final class RustOpenHandle: @unchecked Sendable {
+    let file: RustOpenFile
+    private let pool: IPCConnectionPool
+    private let lock = NSLock()
+    private var connection: IPCConnection?
+    private var failed = false
+
+    fileprivate init(file: RustOpenFile, pool: IPCConnectionPool, connection: IPCConnection) {
+        self.file = file
+        self.pool = pool
+        self.connection = connection
+    }
+
+    func acknowledgeLease() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let connection else { throw RustBackendError.invalidProtocol }
+        guard connection.negotiatedMinor >= 2 else { return }
+        var request = IPCEncoder(capacity: 8)
+        request.append(file.lease)
+        do {
+            let response = try connection.request(.acknowledgeLease, request.data).get()
+            guard response.isEmpty else { throw RustBackendError.invalidProtocol }
+        } catch {
+            failed = true
+            throw error
+        }
+    }
+
+    func reject() throws {
+        lock.lock()
+        let connection = takeConnectionLocked()
+        lock.unlock()
+        guard let connection else { return }
+        defer { pool.checkin(connection, reusable: false) }
+        var request = IPCEncoder(capacity: 8)
+        request.append(file.lease)
+        _ = try connection.request(.close, request.data).get()
+    }
+
+    func finish() {
+        lock.lock()
+        let connection = takeConnectionLocked()
+        let reusable = !failed
+        lock.unlock()
+        if let connection {
+            pool.checkin(connection, reusable: reusable)
+        }
+    }
+
+    func invalidate() {
+        lock.lock()
+        let connection = takeConnectionLocked()
+        lock.unlock()
+        if let connection {
+            pool.checkin(connection, reusable: false)
+        }
+    }
+
+    deinit { invalidate() }
+
+    private func takeConnectionLocked() -> IPCConnection? {
+        let connection = connection
+        self.connection = nil
+        return connection
+    }
 }
 
 /// A pooled client for one Rust process. Each checked-out connection processes
@@ -400,16 +469,8 @@ final class RustBackend: @unchecked Sendable {
         _ = try pool.request(.sync)
     }
 
-    func open(inode: UInt64, writable: Bool) throws -> RustOpenFile {
-        var request = IPCEncoder(capacity: 9)
-        request.append(inode)
-        request.append(writable ? UInt8(1) : UInt8(0))
-        var decoder = IPCDecoder(try pool.request(.open, request.data))
-        let lease = try decoder.uint64()
-        let source = try decoder.uint8()
-        let generation = try decoder.uint64()
-        let localPath = source == 1 ? decoder.remainingData() : nil
-        return RustOpenFile(lease: lease, generation: generation, localPath: localPath)
+    func open(inode: UInt64, writable: Bool) throws -> RustOpenHandle {
+        try pool.open(inode: inode, writable: writable)
     }
 
     func close(lease: UInt64) throws {
@@ -499,7 +560,7 @@ private final class IPCConnectionPool: @unchecked Sendable {
         }
     }
 
-    private func checkin(_ connection: IPCConnection, reusable: Bool) {
+    fileprivate func checkin(_ connection: IPCConnection, reusable: Bool) {
         condition.lock()
         if reusable {
             idle.append(connection)
@@ -508,6 +569,28 @@ private final class IPCConnectionPool: @unchecked Sendable {
         }
         condition.signal()
         condition.unlock()
+    }
+
+    func open(inode: UInt64, writable: Bool) throws -> RustOpenHandle {
+        let connection = try checkout()
+        do {
+            var request = IPCEncoder(capacity: 9)
+            request.append(inode)
+            request.append(writable ? UInt8(1) : UInt8(0))
+            var decoder = IPCDecoder(try connection.request(.open, request.data).get())
+            let lease = try decoder.uint64()
+            let source = try decoder.uint8()
+            let generation = try decoder.uint64()
+            let localPath = source == 1 ? decoder.remainingData() : nil
+            return RustOpenHandle(
+                file: RustOpenFile(lease: lease, generation: generation, localPath: localPath),
+                pool: self,
+                connection: connection
+            )
+        } catch {
+            checkin(connection, reusable: false)
+            throw error
+        }
     }
 }
 

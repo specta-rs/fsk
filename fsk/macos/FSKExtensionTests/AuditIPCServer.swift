@@ -16,6 +16,7 @@ struct AuditIPCScript: Sendable {
     let opcode: UInt16
     var behavior: AuditIPCBehavior = .respond()
     var expectedRequestBody: Data? = nil
+    var replyMinor: UInt16 = ipcProtocolMinor
 }
 
 let auditIPCRequestTimeout: TimeInterval = 0.25
@@ -112,6 +113,7 @@ final class AuditIPCServer: @unchecked Sendable {
     private var peers = Set<Int32>()
     private var failures: [String] = []
     private var completedConnections = 0
+    private var leaseConnections: [UInt64: Int32] = [:]
 
     private init(mode: ServerMode) throws {
         self.mode = mode
@@ -163,6 +165,8 @@ final class AuditIPCServer: @unchecked Sendable {
             return url
         }
     }
+
+    var socketPathForTesting: String { socketPath }
 
     func start() {
         DispatchQueue.global(qos: .userInitiated).async { [self] in run() }
@@ -347,6 +351,7 @@ final class AuditIPCServer: @unchecked Sendable {
     }
 
     private func serve(_ peer: Int32, script: [AuditIPCScript]) throws {
+        var negotiatedMinor = ipcProtocolMinor
         var timeout = timeval(tv_sec: 2, tv_usec: 0)
         guard setsockopt(peer, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
@@ -361,28 +366,56 @@ final class AuditIPCServer: @unchecked Sendable {
             guard opcode == expected.opcode else {
                 throw AuditIPCPeerError(description: "expected opcode \(expected.opcode), got \(opcode)")
             }
+            if opcode == 0 { negotiatedMinor = expected.replyMinor }
             let length = header.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 16, as: UInt32.self)) }
             guard length <= 16 * 1024 * 1024 else { throw AuditIPCPeerError(description: "oversized request") }
             let requestBody = try auditReadExactly(Int(length), from: peer)
             if let expectedBody = expected.expectedRequestBody, requestBody != expectedBody {
                 throw AuditIPCPeerError(description: "unexpected request body for opcode \(opcode)")
             }
+            if opcode == 17 {
+                guard negotiatedMinor >= 2 else {
+                    try writeAuditResponse(header, to: peer, status: EOPNOTSUPP, body: Data(), minor: negotiatedMinor)
+                    return
+                }
+                guard requestBody.count == 8 else {
+                    try writeAuditResponse(header, to: peer, status: EINVAL, body: Data(), minor: negotiatedMinor)
+                    return
+                }
+                let lease = requestBody.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(fromByteOffset: 0, as: UInt64.self)) }
+                lock.lock()
+                let owner = leaseConnections[lease]
+                lock.unlock()
+                guard owner == peer else {
+                    try writeAuditResponse(header, to: peer, status: EINVAL, body: Data(), minor: negotiatedMinor)
+                    return
+                }
+            }
             switch expected.behavior {
             case let .respond(status, body):
-                var response = Data()
-                auditAppend(UInt32(0x4653_4249), to: &response)
-                auditAppend(ipcProtocolMajor, to: &response)
-                auditAppend(ipcProtocolMinor, to: &response)
-                response.append(header[8..<16])
-                auditAppend(status, to: &response)
-                auditAppend(UInt32(body.count), to: &response)
-                response.append(body)
-                try auditWriteAll(response, to: peer)
+                try writeAuditResponse(header, to: peer, status: status, body: body, minor: negotiatedMinor)
+                if status == 0 {
+                    lock.lock()
+                    switch opcode {
+                    case 15 where body.count >= 8:
+                        let lease = body.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(fromByteOffset: 0, as: UInt64.self)) }
+                        if lease != 0 { leaseConnections[lease] = peer }
+                    case 16 where requestBody.count >= 8:
+                        let lease = requestBody.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(fromByteOffset: 0, as: UInt64.self)) }
+                        leaseConnections.removeValue(forKey: lease)
+                    case 17:
+                        let lease = requestBody.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(fromByteOffset: 0, as: UInt64.self)) }
+                        leaseConnections.removeValue(forKey: lease)
+                    default:
+                        break
+                    }
+                    lock.unlock()
+                }
             case let .trickle(body):
                 var response = Data()
                 auditAppend(UInt32(0x4653_4249), to: &response)
                 auditAppend(ipcProtocolMajor, to: &response)
-                auditAppend(ipcProtocolMinor, to: &response)
+                auditAppend(negotiatedMinor, to: &response)
                 response.append(header[8..<16])
                 auditAppend(Int32(0), to: &response)
                 auditAppend(UInt32(body.count), to: &response)
@@ -420,7 +453,7 @@ final class AuditIPCServer: @unchecked Sendable {
         barrier: AuditIPCBarrier,
         includeConfiguration: Bool
     ) throws {
-        var handshake = [auditHello()]
+        var handshake = [auditHello(minor: ipcProtocolMinor)]
         if includeConfiguration { handshake.append(auditLocalConfiguration()) }
         try serve(peer, script: handshake)
         var timeout = timeval(tv_sec: 10, tv_usec: 0)
@@ -460,6 +493,24 @@ final class AuditIPCServer: @unchecked Sendable {
     private func record(_ message: String) {
         lock.lock(); failures.append(message); lock.unlock()
     }
+
+    private func writeAuditResponse(
+        _ requestHeader: Data,
+        to peer: Int32,
+        status: Int32,
+        body: Data,
+        minor: UInt16
+    ) throws {
+        var response = Data()
+        auditAppend(UInt32(0x4653_4249), to: &response)
+        auditAppend(ipcProtocolMajor, to: &response)
+        auditAppend(minor, to: &response)
+        response.append(requestHeader[8..<16])
+        auditAppend(status, to: &response)
+        auditAppend(UInt32(body.count), to: &response)
+        response.append(body)
+        try auditWriteAll(response, to: peer)
+    }
 }
 
 func auditTemporaryDirectory() -> URL {
@@ -488,8 +539,8 @@ func withAuditBackend(
     if requireComplete { try server.wait() }
 }
 
-func auditHello() -> AuditIPCScript {
-    .init(opcode: 0, expectedRequestBody: Data(repeating: 0, count: 32))
+func auditHello(minor: UInt16 = 1) -> AuditIPCScript {
+    .init(opcode: 0, expectedRequestBody: Data(repeating: 0, count: 32), replyMinor: minor)
 }
 func auditLocalConfiguration() -> AuditIPCScript { .init(opcode: 1, behavior: .respond(body: Data([0, 0, 0, 0]))) }
 func auditNetworkConfiguration() -> AuditIPCScript { .init(opcode: 1, behavior: .respond(body: Data([1, 1, 1, 1]))) }

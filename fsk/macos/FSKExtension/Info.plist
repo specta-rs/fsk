@@ -28,7 +28,7 @@
     <key>FSKProtocolMajor</key>
     <integer>1</integer>
     <key>FSKProtocolMinor</key>
-    <integer>1</integer>
+    <integer>2</integer>
     <key>EXAppExtensionAttributes</key>
     <dict>
         <key>EXExtensionPointIdentifier</key>

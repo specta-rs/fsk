@@ -112,4 +112,15 @@ final class FSKItem: FSItem, @unchecked Sendable {
         }
         return state?.lease
     }
+
+    func removeOpenState(lease: UInt64) {
+        let descriptor = openState.withLockUnchecked { state -> Int32? in
+            guard let current = state, current.lease == lease else { return nil }
+            state = nil
+            return current.localDescriptor
+        }
+        if let descriptor {
+            Darwin.close(descriptor)
+        }
+    }
 }
