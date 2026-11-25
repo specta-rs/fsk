@@ -169,7 +169,9 @@ an app that speaks the same protocol major version is reused. When the major
 version differs, `fsk::install()` replaces the installed app, even if that copy
 came from a newer SDK. `fsk::uninstall()`
 removes the current user's copy; on the default path, install and uninstall also
-remove a legacy machine-wide `/Applications/FSK.app`.
+remove a legacy machine-wide `/Applications/FSK.app`. Explicit uninstall also
+removes dedicated rollback recoveries so a later install cannot restore the old
+app.
 
 Copying the app into place does not register its extension: it must be launched
 once. After that, the user enables the extension under **System Settings →
@@ -198,10 +200,14 @@ Replacing the legacy machine-wide `/Applications/FSK.app` also asks a running
 copy to quit and always needs a new approval in System Settings, because macOS
 authorises the extension per installed location.
 
-Set `FSK_APP_PATH` to the full path of an `.app` bundle, such as
-`/Applications/FSK.app`, to test a build outside the default location. It must
-name the bundle itself, not the directory that contains it; with an override, no
-legacy `/Applications` copy is touched. See
+Set `FSK_APP_PATH` to the full path of an `.app` bundle under a private,
+owner-only parent, such as
+`$HOME/Library/Application Support/dev.specta.fsk/Development/FSK.app`. Do not
+use `/Applications`, `/tmp`, or a shared directory. A machine-wide
+`/Applications` installation requires a separate privileged installer and is
+not supported by this helper's staging path. The parent must also have
+restrictive ACLs; permission-mode checks do not enumerate POSIX ACLs. With an
+override, no legacy `/Applications` copy is touched. See
 [`fsk/macos/README.md`](fsk/macos/README.md) for the setup flow, or
 [CONTRIBUTING.md](CONTRIBUTING.md) for the full helper and environment-variable
 reference.

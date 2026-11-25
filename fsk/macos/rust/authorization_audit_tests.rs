@@ -68,6 +68,7 @@ fn audit_run_self(name: &str, envs: &[(&str, &std::ffi::OsStr)]) -> std::process
         "FSK_AUDIT_PARENT",
         "FSK_AUDIT_EXEC_MARKER",
         "FSK_AUDIT_HTTPS_BASE",
+        "FSK_AUDIT_RECOVERY",
     ] {
         command.env_remove(key);
     }
@@ -181,6 +182,27 @@ fn audit_validate_staging_marker(staging: &Path) -> io::Result<()> {
             "staging marker changed",
         ))
     }
+}
+
+fn audit_age_recovery_name(recovery: &Path) -> PathBuf {
+    let file_name = recovery.file_name().unwrap().to_str().unwrap().to_owned();
+    let suffix = file_name
+        .strip_prefix(".FSK.app.recovery-")
+        .and_then(|rest| rest.split_once('-'))
+        .map(|(_, suffix)| suffix)
+        .expect("recovery name should contain a timestamp");
+    let old_timestamp = SystemTime::now()
+        .checked_sub(Duration::from_secs(48 * 60 * 60))
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let aged = recovery
+        .parent()
+        .unwrap()
+        .join(format!(".FSK.app.recovery-{old_timestamp}-{suffix}"));
+    fs::rename(recovery, &aged).unwrap();
+    aged
 }
 
 #[test]
@@ -444,7 +466,7 @@ fn audit_failed_swap_back_preserves_a_non_expiring_recovery_path() {
     );
 
     let error = result.unwrap_err();
-    let recovery = fs::read_dir(directory.path())
+    let mut recovery = fs::read_dir(directory.path())
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .find(|path| {
@@ -461,6 +483,8 @@ fn audit_failed_swap_back_preserves_a_non_expiring_recovery_path() {
     );
     assert_eq!(fs::read(recovery.join("marker")).unwrap(), b"old app");
     assert_eq!(fs::read(destination.join("marker")).unwrap(), b"invalid");
+
+    recovery = audit_age_recovery_name(&recovery);
 
     fs::File::open(&recovery)
         .unwrap()
@@ -498,6 +522,82 @@ fn audit_failed_swap_back_preserves_a_non_expiring_recovery_path() {
     .unwrap();
     assert_eq!(fs::read(destination.join("marker")).unwrap(), b"old app");
     assert!(!recovery.exists(), "restored recovery should be consumed");
+}
+
+#[test]
+fn audit_failed_swap_back_preserves_the_previous_app_from_staging() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = audit_app(directory.path());
+    fs::write(destination.join("marker"), b"old app").unwrap();
+    let staging = directory.path().join("staged.app");
+    fs::create_dir(&staging).unwrap();
+    fs::write(staging.join("marker"), b"new app").unwrap();
+    let backup = directory.path().join("backup");
+    let destination_identity = path_identity(&destination).unwrap();
+    let staging_identity = path_identity(&staging).unwrap();
+    let swaps = Cell::new(0_usize);
+    let noop = |_: &Path, _: &Path| {};
+
+    let result = replace_app_with_expected_hooks(
+        &staging,
+        &destination,
+        &backup,
+        Some(destination_identity),
+        StagingExpectation::unchecked(staging_identity),
+        |staging, destination| {
+            if swaps.get() == 0 {
+                swaps.set(1);
+                atomic_swap(staging, destination)?;
+                fs::remove_dir_all(destination)?;
+                fs::create_dir(destination)?;
+                fs::write(destination.join("important"), b"keep me").unwrap();
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+            }
+        },
+        ReplacementHooks {
+            before_mutation: &noop,
+            after_fallback_move: &noop,
+            after_swap: &noop,
+        },
+    );
+
+    let error = result.unwrap_err();
+    let mut recovery = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".FSK.app.recovery-"))
+        })
+        .expect("the previous app should use a dedicated recovery entry");
+    assert!(
+        error
+            .to_string()
+            .contains(recovery.to_string_lossy().as_ref()),
+        "the exact recovery path must be reported: {error}"
+    );
+    assert_eq!(fs::read(recovery.join("marker")).unwrap(), b"old app");
+    assert_eq!(fs::read(destination.join("important")).unwrap(), b"keep me");
+    assert!(
+        !staging.exists(),
+        "the previous app must leave install staging"
+    );
+    assert!(
+        !backup.exists(),
+        "normal backups must not be used for recovery"
+    );
+
+    recovery = audit_age_recovery_name(&recovery);
+    for kind in ["install", "backup", "race"] {
+        cleanup_stale_entries(directory.path(), "FSK.app", kind).unwrap();
+    }
+    assert!(
+        recovery.exists(),
+        "aged recovery must survive stale cleanup"
+    );
 }
 
 #[test]
@@ -977,6 +1077,49 @@ fn audit_uninstall_terminates_a_running_companion_process() {
     assert!(
         exited,
         "uninstall left the companion process running after deleting its bundle"
+    );
+}
+
+#[test]
+fn audit_uninstall_removes_dedicated_recoveries_when_present_or_absent() {
+    const CHILD: &str = "audit-uninstall-recovery-child";
+    if env::var_os("FSK_AUDIT_CHILD").as_deref() == Some(std::ffi::OsStr::new(CHILD)) {
+        let app = PathBuf::from(env::var_os("FSK_APP_PATH").unwrap());
+        let recovery = PathBuf::from(env::var_os("FSK_AUDIT_RECOVERY").unwrap());
+        fs::create_dir(&recovery).unwrap();
+        fs::write(recovery.join("marker"), b"old app").unwrap();
+
+        assert!(uninstall().unwrap(), "the installed app should be removed");
+        assert!(!app.exists());
+        assert!(
+            !recovery.exists(),
+            "successful uninstall must remove recovery"
+        );
+
+        fs::create_dir(&recovery).unwrap();
+        fs::write(recovery.join("marker"), b"old app").unwrap();
+        assert!(!uninstall().unwrap(), "the app is already absent");
+        assert!(
+            !recovery.exists(),
+            "absent explicit uninstall must also remove recovery"
+        );
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let app = audit_app(directory.path());
+    let recovery = new_entry_path(directory.path(), "FSK.app", "recovery");
+    let output = audit_run_self(
+        "macos_authorization::audit_tests::audit_uninstall_removes_dedicated_recoveries_when_present_or_absent",
+        &[
+            ("FSK_AUDIT_CHILD", std::ffi::OsStr::new(CHILD)),
+            ("FSK_APP_PATH", app.as_os_str()),
+            ("FSK_AUDIT_RECOVERY", recovery.as_os_str()),
+        ],
+    );
+    audit_assert_child_success(
+        "audit_uninstall_removes_dedicated_recoveries_when_present_or_absent",
+        &output,
     );
 }
 

@@ -176,7 +176,7 @@ Signing & Capabilities, and run. Xcode launches the build product from its
 DerivedData directory; launching it once is enough for FSKit to register the
 embedded extension. To exercise the normal lifecycle path, copy the built
 `FSK.app` to `~/Library/Application Support/dev.specta.fsk/FSK.app`, or set
-[FSK_APP_PATH](#fsk_app_path) to any other location for the lifecycle helpers.
+[FSK_APP_PATH](#fsk_app_path) to another private, owner-only location for the lifecycle helpers.
 
 Launch `FSK.app` once, then enable the extension under **System Settings →
 General → Login Items & Extensions → File System Extensions**. Enabling the
@@ -298,14 +298,19 @@ lifecycle helpers. It is mainly for development builds that should not replace
 the normal per-user installation.
 
 ```sh
-export FSK_APP_PATH="/abs/path/to/FSK.app"
+export FSK_APP_PATH="$HOME/Library/Application Support/dev.specta.fsk/Development/FSK.app"
 ```
 
 Rules:
 
 - The value must be an **absolute** path.
 - It must name the `.app` bundle itself, not the directory that contains it:
-  `/Applications/FSK.app`, not `/Applications`.
+  `$HOME/.../Development/FSK.app`, not its parent directory.
+- The destination parent must be private and owner-only. Do not use
+  `/Applications`, `/tmp`, or a shared directory. A machine-wide
+  `/Applications` installation requires a separate privileged installer and is
+  not supported by this helper's staging path. Permission-mode checks do not
+  enumerate POSIX ACLs, so the parent must also have restrictive ACLs.
 - `..` components are rejected. Trailing separators and `.` components are
   normalized.
 - An empty value is an error.

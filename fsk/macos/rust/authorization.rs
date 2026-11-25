@@ -120,10 +120,11 @@ pub enum InstallPhase {
 /// `.app`; it is not a directory that contains the bundle. The value is
 /// normalized before use, and relative paths or paths containing `..` are
 /// rejected. With an override, no legacy `/Applications` copy is touched.
-/// The destination parent must not be group- or world-writable. A bundle
-/// directly in `/tmp` is rejected because `/tmp` is world-writable; use a
-/// private subdirectory instead. Mode checks do not enumerate POSIX ACLs, so
-/// the parent must also have restrictive ACLs.
+/// The destination parent must be private and owner-only. Do not use
+/// `/Applications`, `/tmp`, or a shared directory. A machine-wide
+/// `/Applications` installation requires a separate privileged installer and
+/// is not supported by this helper's staging path. Mode checks do not enumerate
+/// POSIX ACLs, so the parent must also have restrictive ACLs.
 /// A symlinked default install parent is resolved to its target directory; that
 /// target is validated and made private. A symlink at the final `FSK.app` path
 /// is still treated as a link and is never followed by destructive operations.
@@ -151,7 +152,7 @@ pub enum InstallPhase {
 /// Returns an error if the release cannot be downloaded, unpacked, validated,
 /// or installed. Installing in the chosen destination may require permission.
 /// Returns [`io::ErrorKind::PermissionDenied`] if the destination parent is
-/// group- or world-writable.
+/// not private and owner-only.
 /// Returns [`io::ErrorKind::InvalidInput`] if `FSK_APP_PATH` is relative,
 /// contains `..`, or does not name a folder ending in `.app`.
 pub fn install() -> io::Result<AppInstallOutcome> {
@@ -246,6 +247,9 @@ fn install_inner(progress: &mut dyn FnMut(InstallPhase)) -> io::Result<AppInstal
 /// removed best-effort. Every destination backup is removed so a later install
 /// cannot restore an app that was just uninstalled; a crash between removing the
 /// app and its backups can still leave one behind.
+/// Dedicated non-expiring rollback recoveries are removed as well after a
+/// successful or absent explicit uninstall; normal stale cleanup never expires
+/// them automatically.
 ///
 /// This operation is synchronous and is serialized with installation calls in
 /// the same process and, through an exclusive lock on the destination's parent
@@ -278,10 +282,9 @@ pub fn uninstall() -> io::Result<bool> {
         removed = uninstall_app_at(&app)?;
         let _ = cleanup_stale_entries(parent, name, "install");
         let _ = cleanup_stale_entries(parent, name, "race");
-        // Remove every backup for this destination, not just stale ones. A
-        // recent backup would otherwise be restored by a later install, making
-        // the uninstall non-durable. The parent lock means no cooperating
-        // process can own one right now.
+        // Remove every backup and dedicated recovery for this destination, not
+        // just stale ones. Otherwise a later install could restore an app that
+        // was just uninstalled. The parent lock excludes cooperating processes.
         let _ = remove_matching_entries(parent, name, "backup");
         // Explicit uninstall is durable, so dedicated rollback recoveries are
         // removed only after the destination itself was removed successfully.
@@ -664,11 +667,11 @@ fn create_staging_directory(staging: &Path) -> io::Result<PathIdentity> {
     let parent_metadata = parent
         .metadata()
         .map_err(|error| fs_error("inspect staging parent", parent_path, &error))?;
-    if parent_metadata.permissions().mode() & 0o022 != 0 {
+    if parent_metadata.permissions().mode() & 0o077 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "refusing to stage FSK.app in group- or world-writable directory {}",
+                "refusing to stage FSK.app in non-private directory {}",
                 parent_path.display()
             ),
         ));
@@ -1402,7 +1405,7 @@ fn accept_swapped_app(
                 remove_owned_path(staging, staging_expectation.identity);
                 return Err(error);
             }
-            let recovery_path = preserve_previous_in_backup(staging, destination).map_err(
+            let recovery_path = preserve_previous_in_recovery(staging, destination).map_err(
                 |preserve_error| {
                     io::Error::new(
                         preserve_error.kind(),
@@ -1426,7 +1429,7 @@ fn accept_swapped_app(
                 Ok(()) => return Err(error),
                 Err(restore_error) => {
                     let recovery_path =
-                        preserve_previous_in_backup(staging, destination).map_err(
+                        preserve_previous_in_recovery(staging, destination).map_err(
                             |preserve_error| {
                                 io::Error::new(
                                     preserve_error.kind(),
@@ -1474,7 +1477,7 @@ fn restore_previous_from_staging(
     Ok(())
 }
 
-fn preserve_previous_in_backup(staging: &Path, destination: &Path) -> io::Result<PathBuf> {
+fn preserve_previous_in_recovery(staging: &Path, destination: &Path) -> io::Result<PathBuf> {
     let parent = destination_parent(destination)?;
     let name = app_name(destination)?;
     let recovery = new_entry_path(parent, name, "recovery");
@@ -1570,6 +1573,26 @@ fn swap_existing_app(
                         Err(destination_race_error(destination))
                     }
                     Err(rollback_error) => {
+                        if path_identity(staging).ok() == Some(destination_identity) {
+                            let recovery_path = preserve_previous_in_recovery(staging, destination)
+                                .map_err(|preserve_error| {
+                                    io::Error::new(
+                                        preserve_error.kind(),
+                                        format!(
+                                            "could not roll back {} ({rollback_error}) or preserve the previous app ({preserve_error})",
+                                            destination.display()
+                                        ),
+                                    )
+                                })?;
+                            return Err(io::Error::new(
+                                rollback_error.kind(),
+                                format!(
+                                    "could not roll back {} after its destination changed ({rollback_error}); the previous app was preserved at {}",
+                                    destination.display(),
+                                    recovery_path.display()
+                                ),
+                            ));
+                        }
                         if let Err(preserve_error) = rename_exclusive(staging, backup) {
                             return Err(io::Error::new(
                                 preserve_error.kind(),
@@ -2328,8 +2351,8 @@ fn temporary_directory() -> io::Result<PathBuf> {
 /// An exclusive advisory lock held for the duration of an install or uninstall.
 ///
 /// The destination's parent directory is locked rather than a lock file beside
-/// the app: no lock file is created, so a read-only parent such as
-/// `/Applications` is enough, and dropping the guard releases the kernel lock.
+/// the app: no lock file is created, so a private parent is enough, and dropping
+/// the guard releases the kernel lock.
 /// The lock serializes cooperating processes that mutate the same directory.
 struct AppLock {
     directory: fs::File,
@@ -3173,6 +3196,7 @@ TeamIdentifier=68994Z5PT3
     #[test]
     fn staging_directory_is_created_exclusively() {
         let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let staging = directory.path().join(".FSK.app.install-test");
         fs::write(&staging, b"pre-existing file").unwrap();
 
@@ -3187,6 +3211,7 @@ TeamIdentifier=68994Z5PT3
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let target = directory.path().join("target");
         let staging = directory.path().join(".FSK.app.install-test");
         fs::create_dir(&target).unwrap();
@@ -3201,6 +3226,7 @@ TeamIdentifier=68994Z5PT3
     #[test]
     fn staging_directory_is_private() {
         let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let staging = directory.path().join(".FSK.app.install-test");
 
         create_staging_directory(&staging).unwrap();
@@ -3210,15 +3236,17 @@ TeamIdentifier=68994Z5PT3
 
     #[cfg(unix)]
     #[test]
-    fn staging_directory_refuses_a_writable_parent() {
+    fn staging_directory_refuses_a_non_private_parent() {
         let directory = tempfile::tempdir().unwrap();
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o777)).unwrap();
         let staging = directory.path().join("staging");
 
-        let error = create_staging_directory(&staging).unwrap_err();
+        for mode in [0o777, 0o755] {
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(mode)).unwrap();
+            let error = create_staging_directory(&staging).unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(!staging.exists());
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(!staging.exists());
+        }
     }
 
     #[test]

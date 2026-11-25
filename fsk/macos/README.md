@@ -58,8 +58,12 @@ each user gets their own copy without needing administrator permission.
 `FSK.app` also sets `LSUIElement`, so it does not appear in the Dock or App
 Switcher; it only shows its setup window when launched.
 
-If a future macOS refuses to register an extension outside Applications, set
-`FSK_APP_PATH=/Applications/FSK.app` before calling the lifecycle helpers.
+Use `FSK_APP_PATH` only for a bundle under a private, owner-only parent, such as
+`$HOME/Library/Application Support/dev.specta.fsk/Development/FSK.app`. Do not
+use `/Applications`, `/tmp`, or a shared directory. A machine-wide
+`/Applications` installation requires a separate privileged installer and is
+not supported by this helper's staging path. The parent must also have
+restrictive ACLs; permission-mode checks do not enumerate POSIX ACLs.
 
 ## FSKit identifier mapping
 

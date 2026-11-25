@@ -75,7 +75,7 @@ fn install_app() -> std::io::Result<()> {
 installation phases.
 `uninstall()` returns `io::Result<bool>`, where `true` means a copy was removed. With the default
 destination, both also remove a legacy machine-wide `/Applications/FSK.app`; with
-`FSK_APP_PATH`, they leave it alone.
+`FSK_APP_PATH`, they leave it alone. Explicit uninstall also removes dedicated rollback recoveries.
 
 Copying the bundle into place does not register the extension. It must be launched once, which
 is what `launch_app()` does. `ensure_authorization()` performs both steps: it installs the
@@ -118,8 +118,10 @@ released version, so pin your dependency version if several tools share one mach
 `FSK_APP_PATH` is for development builds. It must be absolute, name the `.app` bundle itself,
 contain no `..`, and end in `.app` with a name longer than that suffix. It does not change which
 extension FSKit has registered: launch the app from that location once and enable it in System
-Settings. If a future macOS refuses to register extensions outside Applications, set
-`FSK_APP_PATH=/Applications/FSK.app`.
+Settings. Its parent must be private and owner-only: do not use `/Applications`, `/tmp`, or a
+shared directory. A machine-wide `/Applications` installation requires a separate privileged
+installer and is not supported by this helper's staging path. The parent must also have restrictive
+ACLs; permission-mode checks do not enumerate POSIX ACLs.
 
 `install()` is synchronous and shows no UI. Run it on a background executor. Installs are
 serialised in-process and across processes, and an interrupted install is recovered from its
