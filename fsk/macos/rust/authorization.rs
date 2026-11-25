@@ -7,7 +7,7 @@ use std::{
     io::{self, Read},
     os::unix::{
         ffi::OsStrExt,
-        fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         io::AsRawFd,
         process::CommandExt,
     },
@@ -270,6 +270,7 @@ pub fn uninstall() -> io::Result<bool> {
         let _lock = AppLock::acquire(parent)?;
         removed = uninstall_app_at(&app)?;
         let _ = cleanup_stale_entries(parent, name, "install");
+        let _ = cleanup_stale_entries(parent, name, "race");
         // Remove every backup for this destination, not just stale ones. A
         // recent backup would otherwise be restored by a later install, making
         // the uninstall non-durable. The parent lock means no cooperating
@@ -533,7 +534,11 @@ fn install_from_release_inner(
     let staging = new_entry_path(parent, name, "install");
     progress(InstallPhase::Installing);
     create_staging_directory(&staging)?;
-    let staging_container_identity = path_identity(&staging)?;
+    // macOS cannot return a descriptor from mkdir. Open the new directory
+    // immediately with no-follow semantics and use that descriptor's identity.
+    // A same-principal racer can still win this create/open window; every later
+    // cleanup and mutation treats an identity mismatch as preserve-and-fail.
+    let staging_container_identity = directory_identity(&staging)?;
     let remove_staging = || {
         let _ = remove_path_if_identity(&staging, staging_container_identity);
     };
@@ -567,7 +572,11 @@ fn install_from_release_inner(
         destination,
         &backup,
         destination_identity,
-        staged_app_identity,
+        StagingExpectation {
+            identity: staged_app_identity,
+            container_identity: Some(staging_container_identity),
+            validate: validate_app,
+        },
         atomic_swap,
     );
     // replace_app consumes the staged app on success. On a failed race
@@ -928,7 +937,7 @@ fn replace_app(staging: &Path, destination: &Path, backup: &Path) -> io::Result<
         destination,
         backup,
         destination_identity,
-        staging_identity,
+        StagingExpectation::unchecked(staging_identity),
         atomic_swap,
     )
 }
@@ -938,6 +947,76 @@ type PathIdentity = (u64, u64);
 fn path_identity(path: &Path) -> io::Result<PathIdentity> {
     let metadata = fs::symlink_metadata(path)?;
     Ok((metadata.dev(), metadata.ino()))
+}
+
+fn directory_identity(path: &Path) -> io::Result<PathIdentity> {
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = directory.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[derive(Clone, Copy)]
+struct StagingExpectation {
+    identity: PathIdentity,
+    container_identity: Option<PathIdentity>,
+    validate: fn(&Path) -> io::Result<()>,
+}
+
+impl StagingExpectation {
+    #[cfg(test)]
+    fn unchecked(identity: PathIdentity) -> Self {
+        Self {
+            identity,
+            container_identity: None,
+            validate: |_| Ok(()),
+        }
+    }
+
+    fn verify_identity(&self, staging: &Path) -> io::Result<()> {
+        self.verify_container(staging)?;
+        if path_identity(staging).ok() != Some(self.identity) {
+            return Err(destination_race_error(staging));
+        }
+        Ok(())
+    }
+
+    fn verify_container(&self, staging: &Path) -> io::Result<()> {
+        if let Some(identity) = self.container_identity {
+            let parent = destination_parent(staging)?;
+            if directory_identity(parent).ok() != Some(identity) {
+                return Err(destination_race_error(parent));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_validated(&self, staging: &Path) -> io::Result<()> {
+        self.verify_identity(staging)?;
+        (self.validate)(staging)?;
+        self.verify_identity(staging)
+    }
+
+    fn verify_accepted_destination(&self, staging: &Path, destination: &Path) -> io::Result<()> {
+        self.verify_container(staging)?;
+        if path_identity(destination).ok() != Some(self.identity) {
+            return Err(destination_race_error(destination));
+        }
+        (self.validate)(destination)?;
+        self.verify_container(staging)?;
+        if path_identity(destination).ok() != Some(self.identity) {
+            return Err(destination_race_error(destination));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ReplacementHooks<'a> {
+    before_mutation: &'a dyn Fn(&Path, &Path),
+    after_fallback_move: &'a dyn Fn(&Path, &Path),
 }
 
 fn capture_destination_expectation(destination: &Path) -> io::Result<Option<PathIdentity>> {
@@ -996,7 +1075,7 @@ fn replace_app_with(
         destination,
         backup,
         destination_identity,
-        staging_identity,
+        StagingExpectation::unchecked(staging_identity),
         swap,
     )
 }
@@ -1006,17 +1085,21 @@ fn replace_app_with_expected(
     destination: &Path,
     backup: &Path,
     destination_identity: Option<PathIdentity>,
-    staging_identity: PathIdentity,
+    staging_expectation: StagingExpectation,
     swap: impl Fn(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
+    let noop = |_: &Path, _: &Path| {};
     replace_app_with_expected_hooks(
         staging,
         destination,
         backup,
         destination_identity,
-        staging_identity,
+        staging_expectation,
         swap,
-        |_, _| {},
+        ReplacementHooks {
+            before_mutation: &noop,
+            after_fallback_move: &noop,
+        },
     )
 }
 
@@ -1025,20 +1108,18 @@ fn replace_app_with_expected_hooks(
     destination: &Path,
     backup: &Path,
     destination_identity: Option<PathIdentity>,
-    staging_identity: PathIdentity,
+    staging_expectation: StagingExpectation,
     swap: impl Fn(&Path, &Path) -> io::Result<()>,
-    after_fallback_move: impl Fn(&Path, &Path),
+    hooks: ReplacementHooks<'_>,
 ) -> io::Result<()> {
     let remove_staging = || {
-        remove_owned_path(staging, staging_identity);
+        remove_owned_path(staging, staging_expectation.identity);
     };
     if let Err(error) = verify_destination_expectation(destination, destination_identity) {
         remove_staging();
         return Err(error);
     }
-    if path_identity(staging).ok().as_ref() != Some(&staging_identity) {
-        return Err(destination_race_error(staging));
-    }
+    staging_expectation.verify_identity(staging)?;
     let destination_present = destination_identity.is_some();
     if destination_present {
         let Some(identity) = destination_identity else {
@@ -1054,18 +1135,26 @@ fn replace_app_with_expected_hooks(
             remove_staging();
             return Err(error);
         }
-        if path_identity(staging).ok().as_ref() != Some(&staging_identity) {
-            return Err(destination_race_error(staging));
-        }
+        staging_expectation.verify_validated(staging)?;
+        (hooks.before_mutation)(staging, destination);
+        staging_expectation.verify_validated(staging)?;
         match swap_existing_app(
             staging,
             destination,
             backup,
             identity,
-            staging_identity,
-            swap,
+            staging_expectation,
+            &swap,
         ) {
-            Ok(AppSwap::Completed) => return Ok(()),
+            Ok(AppSwap::Completed) => {
+                return accept_swapped_app(
+                    staging,
+                    destination,
+                    identity,
+                    staging_expectation,
+                    &swap,
+                );
+            }
             Ok(AppSwap::Unsupported) => {
                 if let Err(error) =
                     verify_destination_expectation(destination, destination_identity)
@@ -1073,9 +1162,9 @@ fn replace_app_with_expected_hooks(
                     remove_staging();
                     return Err(error);
                 }
-                if path_identity(staging).ok().as_ref() != Some(&staging_identity) {
-                    return Err(destination_race_error(staging));
-                }
+                staging_expectation.verify_validated(staging)?;
+                (hooks.before_mutation)(staging, destination);
+                staging_expectation.verify_validated(staging)?;
             }
             Err(error) => return Err(error),
         }
@@ -1096,8 +1185,8 @@ fn replace_app_with_expected_hooks(
         backup,
         destination_present,
         destination_identity,
-        staging_identity,
-        &after_fallback_move,
+        staging_expectation,
+        &hooks,
     )
 }
 
@@ -1107,17 +1196,20 @@ fn finish_fallback_install(
     backup: &Path,
     destination_present: bool,
     destination_identity: Option<PathIdentity>,
-    staging_identity: PathIdentity,
-    after_fallback_move: &impl Fn(&Path, &Path),
+    staging_expectation: StagingExpectation,
+    hooks: &ReplacementHooks<'_>,
 ) -> io::Result<()> {
-    if path_identity(staging).ok().as_ref() != Some(&staging_identity) {
+    if let Err(error) = staging_expectation.verify_identity(staging) {
         if destination_present {
             let _ = restore_backup(backup, destination, destination_identity);
         }
-        return Err(destination_race_error(staging));
+        return Err(error);
     }
+    staging_expectation.verify_validated(staging)?;
+    (hooks.before_mutation)(staging, destination);
+    staging_expectation.verify_validated(staging)?;
     if let Err(error) = rename_exclusive(staging, destination) {
-        remove_owned_path(staging, staging_identity);
+        remove_owned_path(staging, staging_expectation.identity);
         if destination_present {
             let restored = if path_identity(backup).ok().as_ref() == destination_identity.as_ref() {
                 rename_exclusive(backup, destination)
@@ -1144,21 +1236,26 @@ fn finish_fallback_install(
         }
         return Err(fs_error("install FSK.app at", destination, &error));
     }
-    after_fallback_move(staging, destination);
-    if path_identity(destination).ok().as_ref() != Some(&staging_identity) {
-        if destination_present {
-            if let Err(recovery_error) =
-                recover_fallback_destination(destination, backup, destination_identity)
-            {
-                return Err(io::Error::new(
-                    recovery_error.kind(),
-                    format!(
-                        "could not restore {} after its destination changed ({recovery_error}); the backup remains at {} for recovery or inspection",
-                        destination.display(),
-                        backup.display()
-                    ),
-                ));
-            }
+    (hooks.after_fallback_move)(staging, destination);
+    if let Err(error) = staging_expectation.verify_accepted_destination(staging, destination) {
+        if let Err(recovery_error) =
+            recover_fallback_destination(destination, backup, destination_identity)
+        {
+            let recovery_context = if destination_present {
+                format!(
+                    "the backup remains at {} for recovery or inspection",
+                    backup.display()
+                )
+            } else {
+                "there was no previous app to restore".to_owned()
+            };
+            return Err(io::Error::new(
+                recovery_error.kind(),
+                format!(
+                    "could not restore {} after its destination changed ({error}; {recovery_error}); {recovery_context}",
+                    destination.display()
+                ),
+            ));
         }
         return Err(destination_race_error(destination));
     }
@@ -1170,6 +1267,26 @@ fn finish_fallback_install(
             let _ = remove_path_if_identity(backup, identity);
         }
     }
+    Ok(())
+}
+
+fn accept_swapped_app(
+    staging: &Path,
+    destination: &Path,
+    previous_identity: PathIdentity,
+    staging_expectation: StagingExpectation,
+    swap: &impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    if let Err(error) = staging_expectation.verify_accepted_destination(staging, destination) {
+        if path_identity(staging).ok() == Some(previous_identity)
+            && path_identity(destination).ok() == Some(staging_expectation.identity)
+            && swap(staging, destination).is_ok()
+        {
+            remove_owned_path(staging, staging_expectation.identity);
+        }
+        return Err(error);
+    }
+    let _ = remove_path_if_identity(staging, previous_identity);
     Ok(())
 }
 
@@ -1204,21 +1321,27 @@ fn recover_fallback_destination(
     backup: &Path,
     destination_identity: Option<PathIdentity>,
 ) -> io::Result<()> {
-    if path_present(destination)? {
-        let parent = destination_parent(destination)?;
-        let name = app_name(destination)?;
-        let preserved = new_entry_path(parent, name, "race");
-        rename_exclusive(destination, &preserved).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "could not preserve the unexpected destination at {} ({error})",
-                    preserved.display()
-                ),
-            )
-        })?;
-    }
+    preserve_unexpected_destination(destination)?;
     restore_backup(backup, destination, destination_identity)
+}
+
+fn preserve_unexpected_destination(destination: &Path) -> io::Result<Option<PathBuf>> {
+    if !path_present(destination)? {
+        return Ok(None);
+    }
+    let parent = destination_parent(destination)?;
+    let name = app_name(destination)?;
+    let preserved = new_entry_path(parent, name, "race");
+    rename_exclusive(destination, &preserved).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "could not preserve the unexpected destination at {} ({error})",
+                preserved.display()
+            ),
+        )
+    })?;
+    Ok(Some(preserved))
 }
 
 fn swap_existing_app(
@@ -1226,7 +1349,7 @@ fn swap_existing_app(
     destination: &Path,
     backup: &Path,
     destination_identity: PathIdentity,
-    staging_identity: PathIdentity,
+    staging_expectation: StagingExpectation,
     swap: impl Fn(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<AppSwap> {
     match swap(staging, destination) {
@@ -1236,13 +1359,14 @@ fn swap_existing_app(
             // non-cooperating process raced us; swap back rather than
             // recursively deleting either unexpected path.
             if path_identity(staging).ok().as_ref() != Some(&destination_identity)
-                || path_identity(destination).ok().as_ref() != Some(&staging_identity)
+                || path_identity(destination).ok().as_ref() != Some(&staging_expectation.identity)
             {
+                staging_expectation.verify_container(staging)?;
                 return match swap(staging, destination) {
                     Ok(()) => {
                         // The second exchange should restore our original
                         // staging directory. Verify it before removing it.
-                        remove_owned_path(staging, staging_identity);
+                        remove_owned_path(staging, staging_expectation.identity);
                         Err(destination_race_error(destination))
                     }
                     Err(rollback_error) => {
@@ -1267,14 +1391,12 @@ fn swap_existing_app(
                     }
                 };
             }
-            // The previous app is now at staging. The backup path was not used
-            // by the atomic exchange and may belong to someone else.
-            let _ = remove_path_if_identity(staging, destination_identity);
+            // Final validation happens before the previous app is removed.
             Ok(AppSwap::Completed)
         }
         Err(error) if swap_unsupported(&error) => Ok(AppSwap::Unsupported),
         Err(error) => {
-            remove_owned_path(staging, staging_identity);
+            remove_owned_path(staging, staging_expectation.identity);
             Err(fs_error("install FSK.app at", destination, &error))
         }
     }
@@ -1356,21 +1478,48 @@ fn recover_interrupted_install_with(
     // the global mutex and the parent-directory lock held by callers, so
     // remove it best-effort.
     let _ = cleanup_stale_entries(parent, name, "install");
+    let _ = cleanup_stale_entries(parent, name, "race");
 
     if !path_present(destination)? {
         // A corrupt newest backup must not hide an older recoverable app.
         // Invalid backups remain available for manual inspection while young.
         for (_, backup) in newest_entries(parent, name, "backup")? {
-            if validate(&backup).is_ok() {
-                rename_exclusive(&backup, destination).map_err(|error| {
-                    fs_error("restore the interrupted FSK.app from", &backup, &error)
-                })?;
-                break;
+            let backup_identity = match path_identity(&backup) {
+                Ok(identity) => identity,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if validate(&backup).is_err() {
+                continue;
             }
+            if path_identity(&backup).ok() != Some(backup_identity) {
+                continue;
+            }
+            if path_present(destination)? {
+                return Err(destination_race_error(destination));
+            }
+            if path_identity(&backup).ok() != Some(backup_identity) {
+                continue;
+            }
+            rename_exclusive(&backup, destination).map_err(|error| {
+                fs_error("restore the interrupted FSK.app from", &backup, &error)
+            })?;
+            if path_identity(destination)? != backup_identity {
+                preserve_unexpected_destination(destination)?;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "restored FSK.app at {} changed during recovery",
+                        destination.display()
+                    ),
+                ));
+            }
+            break;
         }
     }
 
     let _ = cleanup_stale_entries(parent, name, "backup");
+    let _ = cleanup_stale_entries(parent, name, "race");
     Ok(())
 }
 
@@ -1717,6 +1866,7 @@ fn remove_legacy_install() -> bool {
         (app.parent(), app.file_name().and_then(|name| name.to_str()))
     {
         let _ = cleanup_stale_entries(parent, name, "install");
+        let _ = cleanup_stale_entries(parent, name, "race");
         let _ = remove_matching_entries(parent, name, "backup");
     }
     removed
@@ -2952,6 +3102,30 @@ TeamIdentifier=68994Z5PT3
             .unwrap();
 
         cleanup_stale_entries(parent, "FSK.app", "install").unwrap();
+
+        assert!(!old.exists());
+        assert!(young.exists());
+    }
+
+    #[test]
+    fn stale_race_entries_are_removed_after_the_retention_period() {
+        use std::fs::FileTimes;
+
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path();
+        let old = parent.join(".FSK.app.race-old");
+        let young = parent.join(".FSK.app.race-young");
+        fs::create_dir(&old).unwrap();
+        fs::create_dir(&young).unwrap();
+        fs::File::open(&old)
+            .unwrap()
+            .set_times(
+                FileTimes::new()
+                    .set_modified(SystemTime::now() - Duration::from_secs(48 * 60 * 60)),
+            )
+            .unwrap();
+
+        cleanup_stale_entries(parent, "FSK.app", "race").unwrap();
 
         assert!(!old.exists());
         assert!(young.exists());

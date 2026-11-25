@@ -98,7 +98,7 @@ fn audit_replacement_preserves_an_unrelated_directory_that_races_the_swap() {
     let backup = directory.path().join("backup");
     audit_app(directory.path());
     fs::write(destination.join("marker"), b"old app").unwrap();
-    fs::create_dir(&staging).unwrap();
+    fs::create_dir_all(&staging).unwrap();
     fs::write(staging.join("marker"), b"new app").unwrap();
 
     let result = replace_app_with(&staging, &destination, &backup, |staging, destination| {
@@ -171,6 +171,72 @@ fn audit_staging_cleanup_preserves_a_replaced_container() {
     );
 }
 
+fn audit_validate_staging_marker(staging: &Path) -> io::Result<()> {
+    if fs::read(staging.join("marker"))? == b"new app" {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staging marker changed",
+        ))
+    }
+}
+
+#[test]
+fn audit_install_replacement_revalidates_the_staging_container() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = audit_app(directory.path());
+    fs::write(destination.join("marker"), b"old app").unwrap();
+    let container = directory.path().join("staging");
+    let staging = container.join("FSK.app");
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("marker"), b"new app").unwrap();
+    let backup = directory.path().join("backup");
+    let destination_identity = path_identity(&destination).unwrap();
+    let staging_identity = path_identity(&staging).unwrap();
+    let container_identity = directory_identity(&container).unwrap();
+    let noop = |_: &Path, _: &Path| {};
+
+    let result = replace_app_with_expected_hooks(
+        &staging,
+        &destination,
+        &backup,
+        Some(destination_identity),
+        StagingExpectation {
+            identity: staging_identity,
+            container_identity: Some(container_identity),
+            validate: audit_validate_staging_marker,
+        },
+        atomic_swap,
+        ReplacementHooks {
+            before_mutation: &|staging, _| {
+                if fs::read(staging.join("marker")).ok().as_deref() == Some(b"new app") {
+                    let container = staging.parent().unwrap();
+                    fs::remove_dir_all(container).unwrap();
+                    audit_app(container);
+                    fs::write(container.join("important"), b"keep me").unwrap();
+                }
+            },
+            after_fallback_move: &noop,
+        },
+    );
+
+    assert!(
+        result.is_err(),
+        "a replaced staging container must fail install"
+    );
+    assert_eq!(fs::read(destination.join("marker")).unwrap(), b"old app");
+    assert!(
+        !backup.exists(),
+        "the old app must not be backed up or deleted"
+    );
+    assert_eq!(
+        fs::read(container.join("important")).unwrap(),
+        b"keep me",
+        "the unrelated FSK.app-like staging container must survive"
+    );
+}
+
 #[test]
 fn audit_slow_download_refuses_a_destination_replaced_during_download() {
     let directory = tempfile::tempdir().unwrap();
@@ -216,7 +282,7 @@ fn audit_swap_verifies_the_destination_contains_the_exact_staged_app() {
         &destination,
         &backup,
         Some(destination_identity),
-        staging_identity,
+        StagingExpectation::unchecked(staging_identity),
         |staging, destination| {
             if fs::read(staging.join("marker")).ok().as_deref() == Some(b"new app") {
                 fs::remove_dir_all(staging)?;
@@ -253,7 +319,7 @@ fn audit_swap_verifies_both_sides_when_destination_changes_after_exchange() {
         &destination,
         &backup,
         Some(destination_identity),
-        staging_identity,
+        StagingExpectation::unchecked(staging_identity),
         |staging, destination| {
             atomic_swap(staging, destination)?;
             if fs::read(destination.join("marker")).ok().as_deref() == Some(b"new app") {
@@ -281,19 +347,23 @@ fn audit_fallback_final_race_preserves_the_destination_and_restores_the_backup()
     let backup = directory.path().join("backup");
     let destination_identity = path_identity(&destination).unwrap();
     let staging_identity = path_identity(&staging).unwrap();
+    let noop = |_: &Path, _: &Path| {};
 
     let result = replace_app_with_expected_hooks(
         &staging,
         &destination,
         &backup,
         Some(destination_identity),
-        staging_identity,
+        StagingExpectation::unchecked(staging_identity),
         |_, _| Err(io::Error::from_raw_os_error(libc::ENOTSUP)),
-        |_, destination| {
-            assert_eq!(fs::read(destination.join("marker")).unwrap(), b"new app");
-            fs::remove_dir_all(destination).unwrap();
-            fs::create_dir(destination).unwrap();
-            fs::write(destination.join("important"), b"keep me").unwrap();
+        ReplacementHooks {
+            before_mutation: &noop,
+            after_fallback_move: &|_, destination| {
+                assert_eq!(fs::read(destination.join("marker")).unwrap(), b"new app");
+                fs::remove_dir_all(destination).unwrap();
+                fs::create_dir(destination).unwrap();
+                fs::write(destination.join("important"), b"keep me").unwrap();
+            },
         },
     );
 
@@ -307,6 +377,52 @@ fn audit_fallback_final_race_preserves_the_destination_and_restores_the_backup()
         "the previous app was not restored from the backup"
     );
     assert!(!backup.exists(), "the restored backup should be consumed");
+    let preserved = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".FSK.app.race-"))
+        })
+        .expect("the unexpected destination should be preserved");
+    assert_eq!(fs::read(preserved.join("important")).unwrap(), b"keep me");
+}
+
+#[test]
+fn audit_fallback_final_race_without_a_previous_app_leaves_destination_absent() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("FSK.app");
+    let staging = directory.path().join("staged.app");
+    fs::create_dir(&staging).unwrap();
+    fs::write(staging.join("marker"), b"new app").unwrap();
+    let backup = directory.path().join("backup");
+    let staging_identity = path_identity(&staging).unwrap();
+    let noop = |_: &Path, _: &Path| {};
+
+    let result = replace_app_with_expected_hooks(
+        &staging,
+        &destination,
+        &backup,
+        None,
+        StagingExpectation::unchecked(staging_identity),
+        atomic_swap,
+        ReplacementHooks {
+            before_mutation: &noop,
+            after_fallback_move: &|_, destination| {
+                fs::remove_dir_all(destination).unwrap();
+                fs::create_dir(destination).unwrap();
+                fs::write(destination.join("important"), b"keep me").unwrap();
+            },
+        },
+    );
+
+    assert!(
+        result.is_err(),
+        "the final destination race must be reported"
+    );
+    assert!(!destination.exists(), "no previous app exists to restore");
+    assert!(!backup.exists());
     let preserved = fs::read_dir(directory.path())
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -426,6 +542,45 @@ fn audit_recovery_tries_an_older_valid_backup_when_the_newest_is_corrupt() {
         b"valid previous app",
         "a corrupt newest backup must not hide an older recoverable app"
     );
+}
+
+#[test]
+fn audit_recovery_rechecks_backup_identity_after_validation() {
+    let directory = tempfile::tempdir().unwrap();
+    let parent = directory.path();
+    let destination = parent.join("FSK.app");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let valid = parent.join(format!(".FSK.app.backup-{}-1-0", now - 2_000));
+    let raced = parent.join(format!(".FSK.app.backup-{}-1-0", now - 1_000));
+    fs::create_dir(&valid).unwrap();
+    fs::write(valid.join("marker"), b"valid previous app").unwrap();
+    fs::create_dir(&raced).unwrap();
+    fs::write(raced.join("marker"), b"newer app").unwrap();
+
+    recover_interrupted_install_with(&destination, |candidate| {
+        if candidate == raced {
+            fs::remove_dir_all(candidate)?;
+            fs::create_dir(candidate)?;
+            fs::write(candidate.join("important"), b"keep me").unwrap();
+        }
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        fs::read(destination.join("marker")).unwrap(),
+        b"valid previous app",
+        "an unrelated replacement backup must not be installed"
+    );
+    assert_eq!(
+        fs::read(raced.join("important")).unwrap(),
+        b"keep me",
+        "the unrelated replacement backup must be preserved"
+    );
+    assert!(!valid.exists(), "the valid older backup should be restored");
 }
 
 struct AuditHttpsServer {
@@ -647,7 +802,7 @@ fn audit_symlinked_parent_update_terminates_the_running_companion() {
         &app,
         &backup,
         Some(destination_identity),
-        staging_identity,
+        StagingExpectation::unchecked(staging_identity),
         atomic_swap,
     )
     .unwrap();
